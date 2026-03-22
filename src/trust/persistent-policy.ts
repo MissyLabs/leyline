@@ -80,6 +80,17 @@ export class PersistentTrustPolicy {
       const record: AgentPolicyRecord = JSON.parse(raw) as AgentPolicyRecord;
       this.#rehydrateAgent(pubkeyHex, record);
     }
+
+    // Rehydrate open tags
+    try {
+      const openRaw = await this.#db.get('meta:openTags');
+      const openTags: string[] = JSON.parse(openRaw);
+      for (const tag of openTags) {
+        this.#policy.allowTagOpen(tag);
+      }
+    } catch {
+      // No open tags stored yet — that's fine
+    }
   }
 
   /**
@@ -147,6 +158,41 @@ export class PersistentTrustPolicy {
     shadow.allowedTags.delete(tag);
     shadow.blockedTags.add(tag);
     await this.#persistAgent(pubkeyHex);
+  }
+
+  // -------------------------------------------------------------------------
+  // Open tag methods — delegate then persist
+  // -------------------------------------------------------------------------
+
+  /**
+   * Open a tag to all senders. Any agent can send messages on this tag
+   * without being individually whitelisted. Blocked agents are still denied.
+   *
+   * @param tag - Tag string to open.
+   */
+  async allowTagOpen(tag: string): Promise<void> {
+    this.#policy.allowTagOpen(tag);
+    await this.#persistOpenTags();
+  }
+
+  /**
+   * Close a previously opened tag. Reverts to deny-first for this tag.
+   *
+   * @param tag - Tag string to close.
+   */
+  async closeTag(tag: string): Promise<void> {
+    this.#policy.closeTag(tag);
+    await this.#persistOpenTags();
+  }
+
+  /** Returns true if the given tag is open to all senders. */
+  isTagOpen(tag: string): boolean {
+    return this.#policy.isTagOpen(tag);
+  }
+
+  /** Return a snapshot of all open tags. */
+  getOpenTags(): string[] {
+    return this.#policy.getOpenTags();
   }
 
   // -------------------------------------------------------------------------
@@ -290,6 +336,14 @@ export class PersistentTrustPolicy {
       shadow.allowedTags.delete(tag);
       shadow.blockedTags.add(tag);
     }
+  }
+
+  /**
+   * Persist the current set of open tags to LevelDB.
+   */
+  async #persistOpenTags(): Promise<void> {
+    const tags = this.#policy.getOpenTags();
+    await this.#assertDb().put('meta:openTags', JSON.stringify(tags));
   }
 }
 

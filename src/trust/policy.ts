@@ -36,6 +36,8 @@ interface AgentPolicy {
  */
 export class TrustPolicy {
   readonly #agents: Map<string, AgentPolicy> = new Map();
+  /** Tags open to ANY sender (unknown agents pass if message matches an open tag). */
+  readonly #openTags: Set<string> = new Set();
 
   #getOrCreate(pubkeyHex: string): AgentPolicy {
     let policy = this.#agents.get(pubkeyHex);
@@ -84,40 +86,82 @@ export class TrustPolicy {
   }
 
   /**
+   * Open a tag to ALL senders. Any agent — even unknown ones — can send
+   * messages carrying this tag without being individually whitelisted.
+   *
+   * Agent-level blocks still override: a blocked agent cannot send on open
+   * tags. This enables open discovery and marketplace patterns while
+   * preserving the ability to ban bad actors.
+   */
+  allowTagOpen(tag: string): void {
+    this.#openTags.add(tag);
+  }
+
+  /**
+   * Close a previously opened tag. Messages on this tag revert to
+   * deny-first (require per-agent allowAgent).
+   */
+  closeTag(tag: string): void {
+    this.#openTags.delete(tag);
+  }
+
+  /** Returns true if the given tag is open to all senders. */
+  isTagOpen(tag: string): boolean {
+    return this.#openTags.has(tag);
+  }
+
+  /** Return a snapshot of all open tags. */
+  getOpenTags(): string[] {
+    return [...this.#openTags];
+  }
+
+  /**
    * Determine whether a message from `pubkeyHex` bearing `tags` is allowed.
    *
-   * Agent-level checks run first. When `tags` is non-empty, each tag must
-   * individually pass the tag-level policy for this agent.
+   * Evaluation order:
+   * 1. Agent-level block — immediately denied (overrides everything including open tags).
+   * 2. Agent-level allow — if the agent is whitelisted, check tag rules as before.
+   * 3. Open tag check — if ANY of the message's tags are open, the message is allowed
+   *    even from unknown senders (unless the sender is explicitly blocked).
+   * 4. Otherwise — denied (deny-first default).
    *
    * @returns `true` only when all checks pass.
    */
   isAllowed(pubkeyHex: string, tags: string[]): boolean {
     const policy = this.#agents.get(pubkeyHex);
 
-    // Unknown sender — deny by default.
-    if (policy === undefined) return false;
+    // Agent-level block overrides everything — even open tags.
+    if (policy?.blocked) return false;
 
-    // Agent-level block overrides everything.
-    if (policy.blocked) return false;
+    // If agent is explicitly allowed, use the per-agent tag rules
+    if (policy?.allowed) {
+      // No tags to check — agent-level pass is sufficient.
+      if (tags.length === 0) return true;
 
-    // Agent must be explicitly allowed.
-    if (!policy.allowed) return false;
+      const hasTagRules =
+        policy.allowedTags.size > 0 || policy.blockedTags.size > 0;
 
-    // No tags to check — agent-level pass is sufficient.
-    if (tags.length === 0) return true;
+      for (const tag of tags) {
+        // Tag-level block denies immediately.
+        if (policy.blockedTags.has(tag)) return false;
 
-    const hasTagRules =
-      policy.allowedTags.size > 0 || policy.blockedTags.size > 0;
+        // If tag rules exist, every tag must be explicitly allowed.
+        if (hasTagRules && !policy.allowedTags.has(tag)) return false;
+      }
 
-    for (const tag of tags) {
-      // Tag-level block denies immediately.
-      if (policy.blockedTags.has(tag)) return false;
-
-      // If tag rules exist, every tag must be explicitly allowed.
-      if (hasTagRules && !policy.allowedTags.has(tag)) return false;
+      return true;
     }
 
-    return true;
+    // Agent is not explicitly allowed — check if any message tag is open.
+    // This allows unknown senders to participate on open tags.
+    if (this.#openTags.size > 0 && tags.length > 0) {
+      for (const tag of tags) {
+        if (this.#openTags.has(tag)) return true;
+      }
+    }
+
+    // Deny-first default.
+    return false;
   }
 
   /** Return a snapshot of all explicitly blocked agent public keys. */

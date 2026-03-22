@@ -424,6 +424,42 @@ export class MagicNode {
     await this.trustPolicy.blockTag(pubkeyHex, tag);
   }
 
+  /**
+   * Open a tag to ALL senders. Any agent on the network can send you
+   * messages on this tag without being individually whitelisted.
+   * Blocked agents are still denied.
+   *
+   * This is essential for open discovery — without it, a bot must know
+   * every sender's pubkey before it can hear from them.
+   *
+   * @example
+   * ```ts
+   * await node.allowTagOpen('skill:code');    // Anyone can reach me on skill:code
+   * await node.allowTagOpen('bounty:open');   // Anyone can post bounties to me
+   * await node.blockAgent(badActorHex);       // ...except this guy
+   * ```
+   */
+  async allowTagOpen(tag: string): Promise<void> {
+    await this.trustPolicy.allowTagOpen(tag);
+  }
+
+  /**
+   * Close a previously opened tag. Reverts to deny-first for this tag.
+   */
+  async closeTag(tag: string): Promise<void> {
+    await this.trustPolicy.closeTag(tag);
+  }
+
+  /** Returns true if the given tag is open to all senders. */
+  isTagOpen(tag: string): boolean {
+    return this.trustPolicy.isTagOpen(tag);
+  }
+
+  /** Return a snapshot of all open tags. */
+  getOpenTags(): string[] {
+    return this.trustPolicy.getOpenTags();
+  }
+
   /** Send a direct (encrypted) message to a specific peer. */
   async sendDirect(targetPeerId: string, payload: Uint8Array, recipientPubkeyHex?: string): Promise<boolean> {
     if (!this.directMessage) return false;
