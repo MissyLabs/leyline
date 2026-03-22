@@ -582,6 +582,40 @@ export class MagicNode {
     return this.paused;
   }
 
+  /**
+   * Wait until the node has at least `minPeers` connected peers, or until
+   * `timeoutMs` elapses. This ensures the GossipSub mesh is formed before
+   * broadcasting.
+   *
+   * **Bots MUST call this after start() and before broadcasting.**
+   * Without it, messages are sent into a mesh that doesn't exist yet
+   * and are silently dropped.
+   *
+   * @param minPeers  - Minimum peers to wait for. Default: 1.
+   * @param timeoutMs - Max wait time in ms. Default: 15000 (15s).
+   * @returns The number of connected peers when the wait completed.
+   *
+   * @example
+   * ```ts
+   * await node.start();
+   * await node.waitForPeers(); // Wait for at least 1 peer
+   * await node.broadcast(...); // Now safe to send
+   * ```
+   */
+  async waitForPeers(minPeers: number = 1, timeoutMs: number = 15_000): Promise<number> {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const count = this.getPeerCount();
+      if (count >= minPeers) {
+        // Extra 2s for GossipSub mesh heartbeat to propagate subscriptions
+        await new Promise((r) => setTimeout(r, 2000));
+        return this.getPeerCount();
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return this.getPeerCount();
+  }
+
   /** Get this node's public key hex. */
   getPublicKeyHex(): string {
     return publicKeyToHex(this.publicKey);

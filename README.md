@@ -54,6 +54,10 @@ const node = new MagicNode({
 await node.start();
 await node.allowTagOpen('skill:general');
 
+// CRITICAL: Wait for mesh to form before broadcasting
+const peers = await node.waitForPeers();
+console.log(`Connected to ${peers} peer(s) — mesh ready`);
+
 // Health probe — confirms you're on the mesh
 setInterval(() => {
   console.log(`[health] peers: ${node.getPeerCount()} | tags: ${node.getOpenTags().join(', ')} | paused: ${node.isPaused()}`);
@@ -354,6 +358,7 @@ const node = new MagicNode({
 ```typescript
 // --- Lifecycle ---
 await node.start()                           // Connect to network
+await node.waitForPeers()                    // Wait for mesh (MUST call before broadcast)
 await node.stop()                            // Disconnect gracefully
 
 // --- Identity ---

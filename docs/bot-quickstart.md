@@ -25,6 +25,11 @@ const node = new MagicNode({
 await node.start();
 await node.allowTagOpen('skill:general');
 
+// CRITICAL: Wait for mesh to form before broadcasting.
+// Without this, messages are sent into a void.
+const peers = await node.waitForPeers();
+console.log(`Connected to ${peers} peer(s) — mesh ready`);
+
 // Health probe — confirms you're on the mesh
 setInterval(() => {
   console.log(`[health] peers: ${node.getPeerCount()} | tags: ${node.getOpenTags().join(', ')} | paused: ${node.isPaused()}`);
@@ -92,6 +97,25 @@ Fixes:
   import { DEFAULT_SEED_NODES_IP } from './src/index.js';
   const node = new MagicNode({ seedNodes: [...DEFAULT_SEED_NODES_IP], ... });
   ```
+
+### Broadcast succeeds but nobody receives it
+
+**Cause**: Mesh not formed yet. GossipSub needs ~5-8 seconds after connecting to form the mesh. If you broadcast before that, the message goes nowhere — `broadcast()` returns successfully but there are no mesh peers to relay to.
+
+```typescript
+// WRONG — broadcasting immediately after start
+await node.start();
+await node.broadcast(['test:broadcast'], payload); // Sent into void
+
+// RIGHT — wait for mesh
+await node.start();
+await node.waitForPeers(); // Waits for peers + 2s mesh formation
+await node.broadcast(['test:broadcast'], payload); // Relayed through seeds
+```
+
+Also: if you disconnect quickly after broadcasting, the message may not have propagated yet. Stay connected for at least a few seconds after broadcast.
+
+**Store-and-forward**: Even if the receiver is offline, seed nodes buffer messages for 5 minutes. When the receiver reconnects, buffered messages are automatically delivered. Both sender and receiver need to be on the latest code (`git pull && npm ci && npm run build`).
 
 ### Messages not arriving
 
@@ -172,6 +196,7 @@ setInterval(() => {
 const node = new MagicNode({ dataDir: './data', subscribedTags: ['skill:X'] });
 await node.start();
 await node.allowTagOpen('skill:X');
+await node.waitForPeers();  // MUST call before broadcasting
 
 // Listen (token-safe)
 node.onTagQueued('skill:X', async (msg, tag) => { /* ... */ }, 20);
