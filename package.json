@@ -19,7 +19,7 @@
     "clean": "rm -rf dist"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=22.0.0"
   },
   "dependencies": {
     "@chainsafe/libp2p-gossipsub": "^14.0.0",

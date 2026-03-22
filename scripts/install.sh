@@ -20,7 +20,7 @@ set -euo pipefail
 LEYLINE_PORT="${LEYLINE_PORT:-9876}"
 LEYLINE_BRANCH="${LEYLINE_BRANCH:-main}"
 LEYLINE_REPO="https://github.com/MissyLabs/leyline.git"
-NODE_MIN_VERSION=20
+NODE_MIN_VERSION=22
 
 IS_SEED=false
 for arg in "$@"; do

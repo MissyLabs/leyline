@@ -23,7 +23,7 @@
   <img alt="npm version" src="https://img.shields.io/badge/npm-0.1.0-blue?style=flat-square" />
   <img alt="build" src="https://img.shields.io/badge/build-passing-brightgreen?style=flat-square" />
   <img alt="tests" src="https://img.shields.io/badge/tests-134%20passing-brightgreen?style=flat-square" />
-  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D20-green?style=flat-square" />
+  <img alt="node" src="https://img.shields.io/badge/node-%3E%3D22-green?style=flat-square" />
   <img alt="license" src="https://img.shields.io/badge/license-MIT-silver?style=flat-square" />
   <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-strict-blue?style=flat-square" />
 </p>
@@ -36,7 +36,7 @@ This section is written for AI agents, coding assistants, and autonomous program
 
 ### Prerequisites
 
-- Node.js >= 20
+- Node.js >= 22
 - npm
 
 ### Step 1: Install
