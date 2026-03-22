@@ -21,35 +21,41 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROTO_PATH = path.resolve(__dirname, "../../proto/message.proto");
 
 // ---------------------------------------------------------------------------
-// Proto enum name tables
+// Proto enum name tables (lazy-initialized to avoid circular dependency)
 // ---------------------------------------------------------------------------
+//
+// message.ts imports from proto.ts and proto.ts imports MessageType from
+// message.ts. In ESM, this circular reference means MessageType can be
+// undefined at module-load time. We defer table construction to first use.
 
-/**
- * Maps the TypeScript {@link MessageType} numeric values to the proto enum
- * names (which carry the `MESSAGE_TYPE_` prefix).
- */
-const TS_TO_PROTO_TYPE: Readonly<Record<MessageType, string>> = {
-  [MessageType.BROADCAST]: "MESSAGE_TYPE_BROADCAST",
-  [MessageType.DIRECT]: "MESSAGE_TYPE_DIRECT",
-  [MessageType.ADVERTISE]: "MESSAGE_TYPE_ADVERTISE",
-  [MessageType.DISCOVER]: "MESSAGE_TYPE_DISCOVER",
-  [MessageType.DISCOVER_RESPONSE]: "MESSAGE_TYPE_DISCOVER_RESPONSE",
-};
+let _tsToProto: Record<number, string> | null = null;
+let _protoNameToTs: Record<string, number> | null = null;
 
-/**
- * Maps proto MessageType enum string names back to the TypeScript
- * {@link MessageType} numeric values.
- *
- * The proto numeric values happen to be identical (1–5), but we build this
- * table explicitly so the mapping is resilient to any future proto renumbering.
- */
-const PROTO_NAME_TO_TS_TYPE: Readonly<Record<string, MessageType>> = {
-  MESSAGE_TYPE_BROADCAST: MessageType.BROADCAST,
-  MESSAGE_TYPE_DIRECT: MessageType.DIRECT,
-  MESSAGE_TYPE_ADVERTISE: MessageType.ADVERTISE,
-  MESSAGE_TYPE_DISCOVER: MessageType.DISCOVER,
-  MESSAGE_TYPE_DISCOVER_RESPONSE: MessageType.DISCOVER_RESPONSE,
-};
+function getTsToProto(): Record<number, string> {
+  if (_tsToProto === null) {
+    _tsToProto = {
+      [MessageType.BROADCAST]: "MESSAGE_TYPE_BROADCAST",
+      [MessageType.DIRECT]: "MESSAGE_TYPE_DIRECT",
+      [MessageType.ADVERTISE]: "MESSAGE_TYPE_ADVERTISE",
+      [MessageType.DISCOVER]: "MESSAGE_TYPE_DISCOVER",
+      [MessageType.DISCOVER_RESPONSE]: "MESSAGE_TYPE_DISCOVER_RESPONSE",
+    };
+  }
+  return _tsToProto;
+}
+
+function getProtoNameToTs(): Record<string, number> {
+  if (_protoNameToTs === null) {
+    _protoNameToTs = {
+      MESSAGE_TYPE_BROADCAST: MessageType.BROADCAST,
+      MESSAGE_TYPE_DIRECT: MessageType.DIRECT,
+      MESSAGE_TYPE_ADVERTISE: MessageType.ADVERTISE,
+      MESSAGE_TYPE_DISCOVER: MessageType.DISCOVER,
+      MESSAGE_TYPE_DISCOVER_RESPONSE: MessageType.DISCOVER_RESPONSE,
+    };
+  }
+  return _protoNameToTs;
+}
 
 // ---------------------------------------------------------------------------
 // Module-level cache
@@ -171,7 +177,7 @@ export function decodeMessage(data: Uint8Array): MagicMessage {
   const rawType = obj["type"];
   let tsType: MessageType;
   if (typeof rawType === 'string') {
-    tsType = PROTO_NAME_TO_TS_TYPE[rawType] ??
+    tsType = getProtoNameToTs()[rawType] ??
       (() => { throw new Error(`Unknown proto MessageType string: "${rawType}"`); })();
   } else if (typeof rawType === 'number') {
     tsType = rawType as MessageType;
