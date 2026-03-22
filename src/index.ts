@@ -34,14 +34,41 @@ export { TagPubSub } from './pubsub/tag-pubsub.js';
 
 // Trust
 export { TrustPolicy, SpamFilter } from './trust/policy.js';
+export { PersistentTrustPolicy, PersistentSpamFilter } from './trust/persistent-policy.js';
 
 // Ledgers
 export { LocalLedger } from './ledger/local-log.js';
 export { SharedLedger } from './ledger/shared-ledger.js';
 export { LedgerSync } from './ledger/ledger-sync.js';
+export {
+  LedgerConsensus,
+  type ConsensusConfig,
+  type EntryProposal,
+} from './ledger/consensus.js';
 
 // Peer Exchange
 export { PeerExchange, type PeerRecord } from './node/peer-exchange.js';
 
+// Direct Messaging
+export {
+  DirectMessageProtocol,
+  type DirectEnvelope,
+  type DirectMessageOptions,
+  DIRECT_MESSAGE_PROTOCOL,
+} from './node/direct-message.js';
+
 // Config
 export { type MagicConfig, DEFAULT_CONFIG, mergeConfig } from './config/config.js';
+
+// Discovery
+export {
+  ServiceRegistry,
+  type ServiceDescriptor,
+  type DiscoveryQuery,
+  type DiscoveryResult,
+  DEFAULT_SERVICE_TTL,
+} from './discovery/service-registry.js';
+export {
+  DiscoveryProtocol,
+  DISCOVERY_PROTOCOL,
+} from './discovery/discovery-protocol.js';

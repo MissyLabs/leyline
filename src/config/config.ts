@@ -31,11 +31,20 @@ export interface MagicConfig {
 
   /** Tags this node advertises */
   advertisedTags: string[];
+
+  /** Enable WebSocket transport */
+  enableWebSocket: boolean;
+
+  /** Enable circuit relay transport (NAT traversal) */
+  enableRelay: boolean;
+
+  /** Port for the WebSocket listener */
+  webSocketPort: number;
 }
 
 export const DEFAULT_CONFIG: MagicConfig = {
   listenPort: 9876,
-  listenAddresses: ['/ip4/0.0.0.0/tcp/9876'],
+  listenAddresses: ['/ip4/0.0.0.0/tcp/9876', '/ip4/0.0.0.0/tcp/9877/ws'],
   seedNodes: [],
   isSeedNode: false,
   dataDir: './data',
@@ -45,6 +54,9 @@ export const DEFAULT_CONFIG: MagicConfig = {
   maxSeenMessages: 100000,
   subscribedTags: [],
   advertisedTags: [],
+  enableWebSocket: true,
+  enableRelay: true,
+  webSocketPort: 9877,
 };
 
 export function mergeConfig(partial: Partial<MagicConfig>): MagicConfig {
