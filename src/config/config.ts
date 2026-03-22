@@ -126,8 +126,10 @@ export function mergeConfig(partial: Partial<MagicConfig>): MagicConfig {
     }
   }
 
-  // Seed nodes themselves don't bootstrap to the default seeds (they ARE the seeds)
-  if (partial.isSeedNode && !partial.seedNodes) {
+  // Seed nodes bootstrap to the OTHER default seeds so they form a mesh.
+  // libp2p ignores its own addresses, so including yourself is harmless.
+  // Only clear seeds if the user explicitly passed an empty array.
+  if (partial.isSeedNode && partial.seedNodes !== undefined && partial.seedNodes.length === 0) {
     merged.seedNodes = [];
   }
 
