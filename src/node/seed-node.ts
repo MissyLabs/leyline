@@ -19,7 +19,6 @@ interface StoredPeer {
 export class SeedNode extends MagicNode {
   private knownPeers = new Map<string, { multiaddrs: string[]; lastSeen: number }>();
   private peerExchangeTimer: ReturnType<typeof setInterval> | null = null;
-  private topicMirrorTimer: ReturnType<typeof setInterval> | null = null;
   private mirroredTopics = new Set<string>();
   private peerDb: Level<string, string> | null = null;
 
@@ -70,10 +69,6 @@ export class SeedNode extends MagicNode {
     if (this.peerExchangeTimer) {
       clearInterval(this.peerExchangeTimer);
       this.peerExchangeTimer = null;
-    }
-    if (this.topicMirrorTimer) {
-      clearInterval(this.topicMirrorTimer);
-      this.topicMirrorTimer = null;
     }
     await this.peerDb?.close();
     this.peerDb = null;
@@ -166,38 +161,37 @@ export class SeedNode extends MagicNode {
   }
 
   /**
-   * Topic mirroring: periodically check what GossipSub topics exist in the
-   * mesh and subscribe to any we haven't seen yet. This ensures seed nodes
-   * relay messages between bots that aren't directly connected.
+   * Topic mirroring: when a peer subscribes to a GossipSub topic, the seed
+   * automatically subscribes too so it can relay messages between bots that
+   * aren't directly connected.
    *
-   * Without this, two bots both connected to seeds but not to each other
-   * can't communicate — the seeds aren't subscribed to their topics, so
-   * GossipSub has no relay path.
+   * Uses the 'subscription-change' event which fires whenever a connected
+   * peer changes their topic subscriptions, giving us real-time visibility
+   * into what topics the network needs relayed.
    */
   private startTopicMirroring(): void {
     if (!this.libp2p) return;
 
     const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
 
-    // Check every 2 seconds for new topics from peers
-    this.topicMirrorTimer = setInterval(() => {
-      // Get all topics that any of our peers are subscribed to
-      const peerTopics = new Set<string>();
-      for (const topic of gs.getTopics()) {
-        const subscribers = gs.getSubscribers(topic);
-        if (subscribers.length > 0) {
-          peerTopics.add(topic);
-        }
-      }
+    // Listen for peer subscription changes in real-time
+    gs.addEventListener('subscription-change', (evt: CustomEvent) => {
+      const { subscriptions } = evt.detail;
+      if (!Array.isArray(subscriptions)) return;
 
-      // Subscribe to any topic we haven't mirrored yet
-      for (const topic of peerTopics) {
-        if (!this.mirroredTopics.has(topic)) {
+      for (const sub of subscriptions) {
+        // sub has { topic: string, subscribe: boolean }
+        const topic = (sub as { topic: string; subscribe: boolean }).topic;
+        const subscribing = (sub as { topic: string; subscribe: boolean }).subscribe;
+
+        if (subscribing && !this.mirroredTopics.has(topic)) {
           gs.subscribe(topic);
           this.mirroredTopics.add(topic);
           console.log(`[Seed] Mirroring topic: ${topic} (${this.mirroredTopics.size} total)`);
         }
       }
-    }, 2_000);
+    });
+
+    console.log('[Seed] Topic mirroring active — will relay all peer topics');
   }
 }
