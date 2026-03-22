@@ -2,26 +2,41 @@
 export const DEFAULT_SEED_PORT = 9876;
 
 /**
+ * Stable PeerIds for the default seed nodes.
+ * These are derived from each node's persistent Ed25519 identity and
+ * will not change unless the node's identity.json is deleted.
+ */
+const SEED_PEER_IDS = {
+  node1: '12D3KooWLWdsbESqd6KH153Lr3WiSaQJ8Y8YVbSihuh7fqHczwFe',
+  node2: '12D3KooWFtHDt1cMdBDT61mHJfXsWcz8rVugRowzN4RwJqqExch4',
+  node3: '12D3KooWFaNRpkuReQKnoiT4AQ8y6zs4sHBYZ6mSWbWapYa92XeU',
+  node4: '12D3KooWCUfkcULbQpypdm8qsDU8dmhgV7Sa3pY7HghTbnzUKwTp',
+} as const;
+
+/**
  * Hardcoded bootstrap seed nodes for the Leyline network.
  * These are operator-run nodes at missylabs.com that serve as initial
  * entry points for peer discovery. Users can override with `seedNodes`
  * in their config or `--seeds` on the CLI.
+ *
+ * Each multiaddr includes the node's stable PeerId — required by
+ * libp2p's bootstrap module to establish connections.
  */
 export const DEFAULT_SEED_NODES: readonly string[] = [
-  `/dns4/node1.missylabs.com/tcp/${DEFAULT_SEED_PORT}`,
-  `/dns4/node2.missylabs.com/tcp/${DEFAULT_SEED_PORT}`,
-  `/dns4/node3.missylabs.com/tcp/${DEFAULT_SEED_PORT}`,
-  `/dns4/node4.missylabs.com/tcp/${DEFAULT_SEED_PORT}`,
+  `/dns4/node1.missylabs.com/tcp/${DEFAULT_SEED_PORT}/p2p/${SEED_PEER_IDS.node1}`,
+  `/dns4/node2.missylabs.com/tcp/${DEFAULT_SEED_PORT}/p2p/${SEED_PEER_IDS.node2}`,
+  `/dns4/node3.missylabs.com/tcp/${DEFAULT_SEED_PORT}/p2p/${SEED_PEER_IDS.node3}`,
+  `/dns4/node4.missylabs.com/tcp/${DEFAULT_SEED_PORT}/p2p/${SEED_PEER_IDS.node4}`,
 ];
 
 /**
  * Fallback seed nodes using raw IP addresses, in case DNS resolution fails.
  */
 export const DEFAULT_SEED_NODES_IP: readonly string[] = [
-  `/ip4/107.152.39.241/tcp/${DEFAULT_SEED_PORT}`,
-  `/ip4/162.212.158.73/tcp/${DEFAULT_SEED_PORT}`,
-  `/ip4/107.152.33.193/tcp/${DEFAULT_SEED_PORT}`,
-  `/ip4/130.51.20.39/tcp/${DEFAULT_SEED_PORT}`,
+  `/ip4/107.152.39.241/tcp/${DEFAULT_SEED_PORT}/p2p/${SEED_PEER_IDS.node1}`,
+  `/ip4/162.212.158.73/tcp/${DEFAULT_SEED_PORT}/p2p/${SEED_PEER_IDS.node2}`,
+  `/ip4/107.152.33.193/tcp/${DEFAULT_SEED_PORT}/p2p/${SEED_PEER_IDS.node3}`,
+  `/ip4/130.51.20.39/tcp/${DEFAULT_SEED_PORT}/p2p/${SEED_PEER_IDS.node4}`,
 ];
 
 export interface MagicConfig {
