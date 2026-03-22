@@ -2,39 +2,21 @@
 #
 # Leyline node installer — curl-installable bootstrap script.
 #
-# Runs as root (systemd service) or as a regular user (user service / foreground).
-#
 # Usage:
-#   # As root — installs systemd system service:
-#   curl -fsSL https://raw.githubusercontent.com/MissyLabs/leyline/main/scripts/install.sh | sudo bash
-#
-#   # As regular user — installs to ~/leyline with a user systemd service:
 #   curl -fsSL https://raw.githubusercontent.com/MissyLabs/leyline/main/scripts/install.sh | bash
 #
-#   # Seed node (either root or user):
-#   curl ... | bash -s -- --seed
+#   # Seed node:
+#   curl -fsSL https://raw.githubusercontent.com/MissyLabs/leyline/main/scripts/install.sh | bash -s -- --seed
 #
-#   # Custom directory:
-#   curl ... | LEYLINE_DIR=/srv/leyline bash
-#
-#   # Custom port:
-#   curl ... | LEYLINE_PORT=9900 bash
+#   # Skip prompts (CI / automation):
+#   curl ... | LEYLINE_MODE=system bash          # force root/system install
+#   curl ... | LEYLINE_MODE=user bash             # force user install
 #
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Config (override via environment)
 # ---------------------------------------------------------------------------
-IS_ROOT=$([ "$(id -u)" -eq 0 ] && echo true || echo false)
-
-if [ "$IS_ROOT" = true ]; then
-  LEYLINE_DIR="${LEYLINE_DIR:-/opt/leyline}"
-  LEYLINE_USER="${LEYLINE_USER:-leyline}"
-else
-  LEYLINE_DIR="${LEYLINE_DIR:-$HOME/leyline}"
-  LEYLINE_USER="$(whoami)"
-fi
-
 LEYLINE_PORT="${LEYLINE_PORT:-9876}"
 LEYLINE_BRANCH="${LEYLINE_BRANCH:-main}"
 LEYLINE_REPO="https://github.com/MissyLabs/leyline.git"
@@ -61,15 +43,68 @@ need_cmd() {
 }
 
 # ---------------------------------------------------------------------------
-# Pre-flight checks
+# Determine install mode
 # ---------------------------------------------------------------------------
-info "Leyline node installer"
-if [ "$IS_ROOT" = true ]; then
-  info "Running as root — will install system-wide with a dedicated service user"
+# LEYLINE_MODE can be set to "system" or "user" to skip the prompt.
+# If unset, we ask interactively (falling back to system if not a tty).
+
+pick_mode() {
+  # Already set by env — respect it
+  if [ "${LEYLINE_MODE:-}" = "system" ] || [ "${LEYLINE_MODE:-}" = "user" ]; then
+    return
+  fi
+
+  # Non-interactive (piped) — default to system
+  if [ ! -t 0 ]; then
+    LEYLINE_MODE="system"
+    return
+  fi
+
+  echo ""
+  info "How would you like to install Leyline?"
+  echo ""
+  echo "  1) System install  (recommended)"
+  echo "     Runs as a dedicated 'leyline' user with a system-level systemd service."
+  echo "     Requires root/sudo. Survives reboots automatically."
+  echo "     Installs to /opt/leyline."
+  echo ""
+  echo "  2) User install"
+  echo "     Runs under your current account ($USER) with a user-level systemd service."
+  echo "     No root required — just needs Node.js >= $NODE_MIN_VERSION already installed."
+  echo "     Installs to ~/leyline. Uses loginctl linger to persist after logout."
+  echo ""
+
+  while true; do
+    read -rp "  Choose [1/2] (default: 1): " choice </dev/tty
+    case "${choice:-1}" in
+      1) LEYLINE_MODE="system"; return ;;
+      2) LEYLINE_MODE="user"; return ;;
+      *) echo "  Please enter 1 or 2." ;;
+    esac
+  done
+}
+
+pick_mode
+
+if [ "$LEYLINE_MODE" = "system" ]; then
+  LEYLINE_DIR="${LEYLINE_DIR:-/opt/leyline}"
+  LEYLINE_USER="${LEYLINE_USER:-leyline}"
+
+  if [ "$(id -u)" -ne 0 ]; then
+    die "System install requires root. Run with sudo, or re-run and choose user install."
+  fi
 else
-  info "Running as $LEYLINE_USER — will install to $LEYLINE_DIR with a user systemd service"
+  LEYLINE_DIR="${LEYLINE_DIR:-$HOME/leyline}"
+  LEYLINE_USER="$(whoami)"
 fi
 
+info "Install mode: $LEYLINE_MODE"
+info "Install dir:  $LEYLINE_DIR"
+info "Port:         $LEYLINE_PORT"
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks
+# ---------------------------------------------------------------------------
 need_cmd git
 
 # ---------------------------------------------------------------------------
@@ -82,12 +117,12 @@ check_node() {
       info "Node.js $(node -v) found"
       return 0
     fi
-    info "Node.js $(node -v) is too old (need >= $NODE_MIN_VERSION)"
+    warn "Node.js $(node -v) is too old (need >= $NODE_MIN_VERSION)"
   fi
   return 1
 }
 
-install_node_root() {
+install_node() {
   need_cmd curl
   info "Installing Node.js 22.x via NodeSource..."
   if command -v apt-get >/dev/null 2>&1; then
@@ -106,19 +141,19 @@ install_node_root() {
 }
 
 if ! check_node; then
-  if [ "$IS_ROOT" = true ]; then
-    install_node_root
+  if [ "$LEYLINE_MODE" = "system" ]; then
+    install_node
   else
-    die "Node.js >= $NODE_MIN_VERSION not found. Install it first, or run this script as root to auto-install."
+    die "Node.js >= $NODE_MIN_VERSION not found. Install it first, or re-run with sudo for system install (auto-installs Node)."
   fi
 fi
 
 need_cmd npm
 
 # ---------------------------------------------------------------------------
-# Create system user (root only)
+# Create system user (system mode only)
 # ---------------------------------------------------------------------------
-if [ "$IS_ROOT" = true ]; then
+if [ "$LEYLINE_MODE" = "system" ]; then
   if ! id "$LEYLINE_USER" >/dev/null 2>&1; then
     info "Creating system user: $LEYLINE_USER"
     useradd --system --home-dir "$LEYLINE_DIR" --shell /usr/sbin/nologin "$LEYLINE_USER"
@@ -154,12 +189,12 @@ npm run build 2>&1 | tail -1
 DATA_DIR="$LEYLINE_DIR/data"
 mkdir -p "$DATA_DIR"
 
-if [ "$IS_ROOT" = true ]; then
+if [ "$LEYLINE_MODE" = "system" ]; then
   chown -R "$LEYLINE_USER:$LEYLINE_USER" "$LEYLINE_DIR"
 fi
 
 # ---------------------------------------------------------------------------
-# Determine service name and args
+# Service name and args
 # ---------------------------------------------------------------------------
 if [ "$IS_SEED" = true ]; then
   SERVICE_NAME="leyline-seed"
@@ -241,36 +276,40 @@ UNIT
   systemctl --user enable "$SERVICE_NAME"
   systemctl --user restart "$SERVICE_NAME"
 
-  # Enable lingering so the service runs even when the user is not logged in
+  # Enable lingering so the service stays running after logout
   if command -v loginctl >/dev/null 2>&1; then
-    loginctl enable-linger "$LEYLINE_USER" 2>/dev/null || true
+    loginctl enable-linger "$LEYLINE_USER" 2>/dev/null || warn "Could not enable linger — service may stop when you log out"
   fi
 }
 
-if [ "$IS_ROOT" = true ]; then
+if [ "$LEYLINE_MODE" = "system" ]; then
   install_system_service
   CTL="systemctl"
+  JOURNAL="journalctl"
 else
   install_user_service
   CTL="systemctl --user"
+  JOURNAL="journalctl --user"
 fi
 
 # ---------------------------------------------------------------------------
 # Done
 # ---------------------------------------------------------------------------
-ok ""
-ok "Leyline installed successfully!"
-ok ""
+echo ""
+ok "======================================"
+ok "  Leyline installed successfully!"
+ok "======================================"
+echo ""
 ok "  Service:  $SERVICE_NAME"
 ok "  Dir:      $LEYLINE_DIR"
 ok "  Data:     $DATA_DIR"
-ok "  Port:     $LEYLINE_PORT (TCP)"
+ok "  Port:     $LEYLINE_PORT/tcp"
 ok "  Mode:     $([ "$IS_SEED" = true ] && echo "SEED NODE" || echo "regular node")"
 ok "  User:     $LEYLINE_USER"
-ok ""
-ok "Commands:"
+ok "  Install:  $LEYLINE_MODE"
+echo ""
 ok "  $CTL status $SERVICE_NAME    # check status"
-ok "  journalctl $( [ "$IS_ROOT" = false ] && echo "--user " )-u $SERVICE_NAME -f    # tail logs"
+ok "  $JOURNAL -u $SERVICE_NAME -f    # tail logs"
 ok "  $CTL restart $SERVICE_NAME   # restart"
 ok "  $CTL stop $SERVICE_NAME      # stop"
-ok ""
+echo ""
