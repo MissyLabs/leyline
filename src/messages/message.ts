@@ -3,8 +3,16 @@
  *
  * Message creation, signing, and validation for the Magic P2P network.
  *
- * Works with plain TypeScript interfaces and manual binary serialization.
- * Protobuf integration is deferred to a later milestone.
+ * Works with plain TypeScript interfaces. Binary serialization is available in
+ * two formats:
+ *
+ *   - **protobuf** (default) — compact binary encoding via `./proto.js`.
+ *     {@link initProto} must be called once before using the default format.
+ *   - **json** — legacy JSON-hex format retained for debugging and backwards
+ *     compatibility. Available via the `format` parameter on the new
+ *     {@link serializeMessage} / {@link deserializeMessage} overloads, or
+ *     directly through the explicit {@link serializeMessageJson} /
+ *     {@link deserializeMessageJson} functions.
  *
  * Cryptographic operations delegate to:
  *   - Node.js built-in `crypto` module for SHA-256 and random bytes
@@ -13,6 +21,7 @@
 
 import { randomBytes, createHash } from "node:crypto";
 import { sign, verify } from "../identity/keypair.js";
+import { encodeMessage as protoEncode, decodeMessage as protoDecode } from "./proto.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -256,18 +265,16 @@ export async function createMessage(
 }
 
 /**
- * Serializes a {@link MagicMessage} to a flat binary representation suitable
- * for network transport.
+ * Serializes a {@link MagicMessage} to UTF-8-encoded JSON bytes (legacy
+ * JSON-hex wire format).
  *
- * Encoding strategy: all `Uint8Array` fields are hex-encoded, then the
- * resulting plain object is JSON-stringified and UTF-8 encoded into bytes.
- * This keeps the format human-inspectable and simple to debug until the
- * protobuf layer is introduced.
+ * All `Uint8Array` fields are hex-encoded before JSON stringification, keeping
+ * the output human-inspectable and easy to debug.
  *
  * @param msg - The message to serialize.
  * @returns UTF-8 encoded JSON bytes.
  */
-export function serializeMessage(msg: MagicMessage): Uint8Array {
+export function serializeMessageJson(msg: MagicMessage): Uint8Array {
   const wire: WireMessage = {
     id: Buffer.from(msg.id).toString("hex"),
     senderPubkey: Buffer.from(msg.senderPubkey).toString("hex"),
@@ -284,7 +291,7 @@ export function serializeMessage(msg: MagicMessage): Uint8Array {
 }
 
 /**
- * Deserializes bytes produced by {@link serializeMessage} back into a
+ * Deserializes bytes produced by {@link serializeMessageJson} back into a
  * {@link MagicMessage}.
  *
  * @param data - UTF-8 encoded JSON bytes.
@@ -292,7 +299,7 @@ export function serializeMessage(msg: MagicMessage): Uint8Array {
  * @throws {SyntaxError}  If `data` is not valid JSON.
  * @throws {TypeError}    If a required field is missing or has the wrong shape.
  */
-export function deserializeMessage(data: Uint8Array): MagicMessage {
+export function deserializeMessageJson(data: Uint8Array): MagicMessage {
   const json = new TextDecoder().decode(data);
   const wire = JSON.parse(json) as WireMessage;
 
@@ -321,6 +328,73 @@ export function deserializeMessage(data: Uint8Array): MagicMessage {
     type: wire.type as MessageType,
     ttl: wire.ttl,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Unified serialize / deserialize (protobuf default, JSON-hex fallback)
+// ---------------------------------------------------------------------------
+
+/**
+ * The wire encoding format accepted by {@link serializeMessage} and
+ * {@link deserializeMessage}.
+ *
+ * - `"protobuf"` — compact binary protobuf encoding (default).
+ *   Requires {@link initProto} to have been called beforehand.
+ * - `"json"` — legacy UTF-8 JSON-hex encoding, fully self-contained.
+ */
+export type SerializationFormat = "protobuf" | "json";
+
+/**
+ * Serializes a {@link MagicMessage} to binary for network transport.
+ *
+ * @param msg    - The message to serialize.
+ * @param format - Wire format to use. Defaults to `"protobuf"`.
+ * @returns Serialized bytes in the requested format.
+ *
+ * @example Protobuf (default)
+ * ```ts
+ * await initProto();
+ * const bytes = serializeMessage(msg);
+ * ```
+ *
+ * @example Explicit JSON-hex fallback
+ * ```ts
+ * const bytes = serializeMessage(msg, 'json');
+ * ```
+ */
+export function serializeMessage(
+  msg: MagicMessage,
+  format: SerializationFormat = "protobuf",
+): Uint8Array {
+  if (format === "json") {
+    return serializeMessageJson(msg);
+  }
+  return protoEncode(msg);
+}
+
+/**
+ * Deserializes bytes back into a {@link MagicMessage}.
+ *
+ * The `format` parameter **must** match the format used when serializing — the
+ * two wire formats are not auto-detected.
+ *
+ * @param data   - The serialized bytes.
+ * @param format - Wire format of `data`. Defaults to `"protobuf"`.
+ * @returns The reconstructed {@link MagicMessage}.
+ *
+ * @throws {Error}      If `format` is `"protobuf"` and {@link initProto} has
+ *                      not been called.
+ * @throws {SyntaxError} If `format` is `"json"` and `data` is not valid JSON.
+ * @throws {TypeError}   If a required field is missing or malformed.
+ */
+export function deserializeMessage(
+  data: Uint8Array,
+  format: SerializationFormat = "protobuf",
+): MagicMessage {
+  if (format === "json") {
+    return deserializeMessageJson(data);
+  }
+  return protoDecode(data);
 }
 
 /**

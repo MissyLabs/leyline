@@ -100,7 +100,8 @@ export class LocalLedger {
     // We store a dedicated count key so this is O(1) after the first open.
     try {
       const rawCount = await this.db.get("__count__");
-      this.entryCount = parseInt(rawCount, 10);
+      const parsed = parseInt(rawCount, 10);
+      this.entryCount = Number.isNaN(parsed) ? 0 : parsed;
     } catch {
       this.entryCount = 0;
     }

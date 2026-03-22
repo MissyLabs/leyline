@@ -5,13 +5,15 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { gossipsub, type GossipSub } from '@chainsafe/libp2p-gossipsub';
 import { bootstrap } from '@libp2p/bootstrap';
 import { identify } from '@libp2p/identify';
-import { generateKeyPair, privateKeyFromRaw } from '@libp2p/crypto/keys';
+import { privateKeyFromRaw } from '@libp2p/crypto/keys';
 
 import { type MagicConfig, mergeConfig } from '../config/config.js';
 import { TagPubSub } from '../pubsub/tag-pubsub.js';
 import { TrustPolicy, SpamFilter } from '../trust/policy.js';
 import { LocalLedger } from '../ledger/local-log.js';
 import { SharedLedger } from '../ledger/shared-ledger.js';
+import { LedgerSync } from '../ledger/ledger-sync.js';
+import { PeerExchange } from './peer-exchange.js';
 import {
   type MagicMessage,
   MessageType,
@@ -21,11 +23,12 @@ import {
   validateMessage,
   verifyMessageSignature,
 } from '../messages/message.js';
+import { initProto } from '../messages/proto.js';
 import {
-  generateKeypair,
   publicKeyToHex,
   getFingerprint,
 } from '../identity/keypair.js';
+import { IdentityStore } from '../identity/store.js';
 
 export interface MagicNodeEvents {
   onMessage?: (msg: MagicMessage, tag: string) => void;
@@ -41,6 +44,8 @@ export class MagicNode {
   protected spamFilter: SpamFilter;
   protected localLedger: LocalLedger;
   protected sharedLedger: SharedLedger;
+  protected peerExchange: PeerExchange | null = null;
+  protected ledgerSync: LedgerSync | null = null;
   protected publicKey: Uint8Array = new Uint8Array(0);
   protected privateKey: Uint8Array = new Uint8Array(0);
   protected events: MagicNodeEvents;
@@ -55,8 +60,12 @@ export class MagicNode {
   }
 
   async start(): Promise<void> {
-    // Generate or load identity
-    const keypair = await generateKeypair();
+    // Initialize protobuf schema
+    await initProto();
+
+    // Load persistent identity (generates and saves one on first start)
+    const identityStore = new IdentityStore(this.config.dataDir);
+    const keypair = await identityStore.load();
     this.publicKey = keypair.publicKey;
     this.privateKey = keypair.privateKey;
 
@@ -119,6 +128,19 @@ export class MagicNode {
     await this.localLedger.open();
     await this.sharedLedger.open();
 
+    // Start peer exchange protocol
+    this.peerExchange = new PeerExchange(this.libp2p);
+    await this.peerExchange.start();
+
+    // Start ledger sync protocol
+    this.ledgerSync = new LedgerSync(
+      this.libp2p,
+      this.sharedLedger,
+      this.publicKey,
+      this.privateKey,
+    );
+    await this.ledgerSync.start();
+
     const fingerprint = getFingerprint(this.publicKey);
     const addrs = this.libp2p.getMultiaddrs().map((a) => a.toString());
     console.log(`[Magic] Node started: ${fingerprint}`);
@@ -127,6 +149,8 @@ export class MagicNode {
   }
 
   async stop(): Promise<void> {
+    await this.peerExchange?.stop();
+    await this.ledgerSync?.stop();
     await this.localLedger.close();
     await this.sharedLedger.close();
     await this.libp2p?.stop();
@@ -230,6 +254,16 @@ export class MagicNode {
   /** Get the shared ledger instance. */
   getSharedLedger(): SharedLedger {
     return this.sharedLedger;
+  }
+
+  /** Get the peer exchange instance. */
+  getPeerExchange(): PeerExchange | null {
+    return this.peerExchange;
+  }
+
+  /** Get the ledger sync instance. */
+  getLedgerSync(): LedgerSync | null {
+    return this.ledgerSync;
   }
 
   protected async handleIncomingMessage(topic: string, data: Uint8Array): Promise<void> {
