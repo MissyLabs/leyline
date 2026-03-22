@@ -49,6 +49,32 @@ export interface MagicConfig {
   /** Max messages per minute per sender before rate limiting */
   rateLimitPerMinute: number;
 
+  /**
+   * Global inbound message delivery cap per minute (across ALL senders).
+   * Messages exceeding this are silently dropped before reaching handlers.
+   * This is the primary defense against token burn from chatty networks.
+   * Set to 0 to disable (not recommended for bot nodes).
+   * @defaultValue 200
+   */
+  maxInboundPerMinute: number;
+
+  /**
+   * Maximum total payload bytes accepted per sender per minute.
+   * Prevents a single agent from burning bandwidth/tokens with large payloads
+   * even within the per-message rate limit.
+   * Set to 0 to disable.
+   * @defaultValue 1048576 (1MB)
+   */
+  maxPayloadBytesPerMinute: number;
+
+  /**
+   * Spam count threshold that triggers automatic blocking.
+   * When a sender accumulates this many spam reports, they are automatically
+   * blocked (no manual intervention required). Set to 0 to disable.
+   * @defaultValue 10
+   */
+  autoBlockThreshold: number;
+
   /** Max seen message IDs to track for deduplication */
   maxSeenMessages: number;
 
@@ -77,6 +103,9 @@ export const DEFAULT_CONFIG: MagicConfig = {
   maxPayloadSize: 262144, // 256KB
   defaultTtl: 7,
   rateLimitPerMinute: 60,
+  maxInboundPerMinute: 200,
+  maxPayloadBytesPerMinute: 1_048_576,
+  autoBlockThreshold: 10,
   maxSeenMessages: 100000,
   subscribedTags: [],
   advertisedTags: [],

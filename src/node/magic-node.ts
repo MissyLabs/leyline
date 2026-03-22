@@ -70,6 +70,14 @@ export class MagicNode {
   /** Timer for periodic service re-advertisement. */
   private reAdvertiseTimer: ReturnType<typeof setInterval> | null = null;
 
+  // --- Global inbound rate limiting (token burn protection) ---
+  /** Timestamps of messages delivered to handlers in the current window. */
+  private inboundTimestamps: number[] = [];
+  /** Per-sender payload byte counters: pubkeyHex -> { bytes, windowStart } */
+  private payloadBudgets = new Map<string, { bytes: number; windowStart: number }>();
+  /** When true, all inbound message delivery is paused (messages are silently dropped). */
+  private paused = false;
+
   constructor(config: Partial<MagicConfig>, events: MagicNodeEvents = {}) {
     this.config = mergeConfig(config);
     this.trustPolicy = new PersistentTrustPolicy(`${this.config.dataDir}/trust`);
@@ -348,6 +356,54 @@ export class MagicNode {
     });
   }
 
+  /**
+   * Register a queued handler for messages on a specific tag.
+   *
+   * Unlike `onTag`, this processes messages sequentially — only one handler
+   * invocation runs at a time. If messages arrive faster than the handler
+   * processes them, excess messages are queued up to `maxQueueSize`, after
+   * which the oldest are dropped.
+   *
+   * **This is the recommended handler for AI bots** that call LLM APIs
+   * per-message, since it prevents concurrent API calls from burning tokens
+   * during traffic spikes.
+   *
+   * @param tag          - Tag to listen on.
+   * @param handler      - Async handler; next message waits until this resolves.
+   * @param maxQueueSize - Max pending messages in the queue (default: 50). Oldest dropped when full.
+   */
+  onTagQueued(
+    tag: string,
+    handler: (msg: MagicMessage, tag: string) => Promise<void>,
+    maxQueueSize: number = 50,
+  ): void {
+    const queue: Array<{ msg: MagicMessage; tag: string }> = [];
+    let processing = false;
+
+    const drain = async () => {
+      if (processing) return;
+      processing = true;
+      while (queue.length > 0) {
+        const item = queue.shift()!;
+        try {
+          await handler(item.msg, item.tag);
+        } catch (err) {
+          console.error(`[Magic] onTagQueued handler error on tag "${tag}":`, err);
+        }
+      }
+      processing = false;
+    };
+
+    this.tagPubSub?.onTag(tag, (data: Uint8Array, t: string) => {
+      const msg = deserializeMessage(data);
+      if (queue.length >= maxQueueSize) {
+        queue.shift(); // Drop oldest
+      }
+      queue.push({ msg, tag: t });
+      drain();
+    });
+  }
+
   /** Allow a specific agent (by public key hex). */
   async allowAgent(pubkeyHex: string): Promise<void> {
     await this.trustPolicy.allowAgent(pubkeyHex);
@@ -441,6 +497,28 @@ export class MagicNode {
     }
   }
 
+  /**
+   * Pause all inbound message delivery. Messages are silently dropped at the
+   * network layer — handlers will not fire and no tokens will be consumed.
+   * The node stays connected and continues participating in peer exchange.
+   * Call `resume()` to start receiving again.
+   */
+  pause(): void {
+    this.paused = true;
+    console.log('[Magic] Inbound message delivery PAUSED');
+  }
+
+  /** Resume inbound message delivery after a `pause()`. */
+  resume(): void {
+    this.paused = false;
+    console.log('[Magic] Inbound message delivery RESUMED');
+  }
+
+  /** Returns true if inbound delivery is currently paused. */
+  isPaused(): boolean {
+    return this.paused;
+  }
+
   /** Get this node's public key hex. */
   getPublicKeyHex(): string {
     return publicKeyToHex(this.publicKey);
@@ -502,6 +580,9 @@ export class MagicNode {
   }
 
   protected async handleIncomingMessage(topic: string, data: Uint8Array): Promise<void> {
+    // If paused, drop all inbound messages silently
+    if (this.paused) return;
+
     let msg: MagicMessage;
     try {
       msg = deserializeMessage(data);
@@ -525,11 +606,48 @@ export class MagicNode {
       return; // Already seen — recorded as blocked for audit
     }
 
-    // Check rate limiting
+    // Check rate limiting (per-sender)
     if (this.spamFilter.isRateLimited(senderHex, this.config.rateLimitPerMinute)) {
       await this.spamFilter.reportSpam(senderHex);
       await this.localLedger.append(data, 'blocked');
+      // Auto-block agents that repeatedly hit rate limits
+      if (this.config.autoBlockThreshold > 0 &&
+          this.spamFilter.getSpamCount(senderHex) >= this.config.autoBlockThreshold) {
+        await this.trustPolicy.blockAgent(senderHex);
+        console.warn(`[Magic] Auto-blocked agent ${senderHex.slice(0, 16)}... (spam count: ${this.spamFilter.getSpamCount(senderHex)})`);
+      }
       return;
+    }
+
+    // Global inbound rate limit (token burn protection)
+    if (this.config.maxInboundPerMinute > 0) {
+      const now = Date.now();
+      const cutoff = now - 60_000;
+      // Prune old timestamps
+      while (this.inboundTimestamps.length > 0 && this.inboundTimestamps[0] < cutoff) {
+        this.inboundTimestamps.shift();
+      }
+      if (this.inboundTimestamps.length >= this.config.maxInboundPerMinute) {
+        // Global cap reached — drop silently (not the sender's fault, just backpressure)
+        return;
+      }
+      this.inboundTimestamps.push(now);
+    }
+
+    // Per-sender payload byte budget (prevents large-payload token burn)
+    if (this.config.maxPayloadBytesPerMinute > 0) {
+      const now = Date.now();
+      let budget = this.payloadBudgets.get(senderHex);
+      if (!budget || now - budget.windowStart > 60_000) {
+        budget = { bytes: 0, windowStart: now };
+        this.payloadBudgets.set(senderHex, budget);
+      }
+      budget.bytes += msg.payload.length;
+      if (budget.bytes > this.config.maxPayloadBytesPerMinute) {
+        await this.spamFilter.reportSpam(senderHex);
+        await this.localLedger.append(data, 'blocked');
+        return;
+      }
     }
 
     // Check trust policy (deny-first)
