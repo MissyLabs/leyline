@@ -1,4 +1,5 @@
 import { Level } from 'level';
+import type { GossipSub } from '@chainsafe/libp2p-gossipsub';
 import { MagicNode } from './magic-node.js';
 import type { MagicConfig } from '../config/config.js';
 
@@ -18,6 +19,8 @@ interface StoredPeer {
 export class SeedNode extends MagicNode {
   private knownPeers = new Map<string, { multiaddrs: string[]; lastSeen: number }>();
   private peerExchangeTimer: ReturnType<typeof setInterval> | null = null;
+  private topicMirrorTimer: ReturnType<typeof setInterval> | null = null;
+  private mirroredTopics = new Set<string>();
   private peerDb: Level<string, string> | null = null;
 
   constructor(config: Partial<MagicConfig>) {
@@ -56,12 +59,21 @@ export class SeedNode extends MagicNode {
 
     // Periodically broadcast known peer list
     this.startPeerExchange();
+
+    // Topic mirroring: seed nodes subscribe to any topic their peers use
+    // so they can relay GossipSub messages between bots that aren't directly connected.
+    // Without this, messages have no relay path through seeds.
+    this.startTopicMirroring();
   }
 
   async stop(): Promise<void> {
     if (this.peerExchangeTimer) {
       clearInterval(this.peerExchangeTimer);
       this.peerExchangeTimer = null;
+    }
+    if (this.topicMirrorTimer) {
+      clearInterval(this.topicMirrorTimer);
+      this.topicMirrorTimer = null;
     }
     await this.peerDb?.close();
     this.peerDb = null;
@@ -151,5 +163,41 @@ export class SeedNode extends MagicNode {
         });
       }
     }, 30_000);
+  }
+
+  /**
+   * Topic mirroring: periodically check what GossipSub topics exist in the
+   * mesh and subscribe to any we haven't seen yet. This ensures seed nodes
+   * relay messages between bots that aren't directly connected.
+   *
+   * Without this, two bots both connected to seeds but not to each other
+   * can't communicate — the seeds aren't subscribed to their topics, so
+   * GossipSub has no relay path.
+   */
+  private startTopicMirroring(): void {
+    if (!this.libp2p) return;
+
+    const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
+
+    // Check every 2 seconds for new topics from peers
+    this.topicMirrorTimer = setInterval(() => {
+      // Get all topics that any of our peers are subscribed to
+      const peerTopics = new Set<string>();
+      for (const topic of gs.getTopics()) {
+        const subscribers = gs.getSubscribers(topic);
+        if (subscribers.length > 0) {
+          peerTopics.add(topic);
+        }
+      }
+
+      // Subscribe to any topic we haven't mirrored yet
+      for (const topic of peerTopics) {
+        if (!this.mirroredTopics.has(topic)) {
+          gs.subscribe(topic);
+          this.mirroredTopics.add(topic);
+          console.log(`[Seed] Mirroring topic: ${topic} (${this.mirroredTopics.size} total)`);
+        }
+      }
+    }, 2_000);
   }
 }
