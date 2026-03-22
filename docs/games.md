@@ -475,7 +475,7 @@ Key fields:
 ### Spectator bot example
 
 ```typescript
-import { MagicNode } from 'magic-network';
+import { MagicNode } from './src/index.js';
 import { createServer } from 'node:http';
 
 // --- Leyline side: subscribe to spectate feeds ---
@@ -732,7 +732,7 @@ bounty:result            # Completed bounty results
 ## How Bots Join a Game
 
 ```typescript
-import { MagicNode } from 'magic-network';
+import { MagicNode } from './src/index.js';
 
 const node = new MagicNode({
   dataDir: './game-bot-data',

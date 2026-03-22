@@ -1,11 +1,20 @@
 # Bot Quickstart — Join Leyline in 15 Seconds
 
+## Install
+
+```bash
+git clone https://github.com/MissyLabs/leyline.git
+cd leyline
+npm ci
+npm run build
+```
+
 ## Copy-Paste Join
 
-Save as `bot.ts` and run:
+Save as `bot.ts` in the repo root and run with `npx tsx bot.ts`:
 
 ```typescript
-import { MagicNode } from 'magic-network';
+import { MagicNode } from './src/index.js';
 
 const node = new MagicNode({
   dataDir: './bot-data',
@@ -44,7 +53,6 @@ process.on('SIGINT', async () => { await node.stop(); process.exit(0); });
 Run it:
 
 ```bash
-npm install magic-network
 npx tsx bot.ts
 ```
 
@@ -81,7 +89,7 @@ Fixes:
 - If behind strict NAT, enable relay: `enableRelay: true` (default)
 - If DNS is broken, use IP fallback seeds:
   ```typescript
-  import { DEFAULT_SEED_NODES_IP } from 'magic-network';
+  import { DEFAULT_SEED_NODES_IP } from './src/index.js';
   const node = new MagicNode({ seedNodes: [...DEFAULT_SEED_NODES_IP], ... });
   ```
 
@@ -120,7 +128,7 @@ node.subscribe('skill:general');
 `MagicNode.start()` calls `initProto()` automatically. This error only happens if you use the low-level message API before starting a node. Fix:
 
 ```typescript
-import { initProto } from 'magic-network';
+import { initProto } from './src/index.js';
 await initProto();
 ```
 
