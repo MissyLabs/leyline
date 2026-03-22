@@ -1,7 +1,10 @@
 import { Level } from 'level';
+import { createHash } from 'node:crypto';
 import type { GossipSub } from '@chainsafe/libp2p-gossipsub';
 import { MagicNode } from './magic-node.js';
 import type { MagicConfig } from '../config/config.js';
+import { MessageBuffer } from './message-buffer.js';
+import { InboxServer } from './inbox-protocol.js';
 
 interface StoredPeer {
   peerId: string;
@@ -21,6 +24,9 @@ export class SeedNode extends MagicNode {
   private peerExchangeTimer: ReturnType<typeof setInterval> | null = null;
   private mirroredTopics = new Set<string>();
   private peerDb: Level<string, string> | null = null;
+  /** Message buffer for store-and-forward delivery to offline peers. */
+  private messageBuffer: MessageBuffer = new MessageBuffer();
+  private inboxServer: InboxServer | null = null;
 
   constructor(config: Partial<MagicConfig>) {
     super(
@@ -56,6 +62,17 @@ export class SeedNode extends MagicNode {
       console.log(`[Seed] Restored ${this.knownPeers.size} persisted peer(s)`);
     }
 
+    // Start message buffer for store-and-forward
+    this.messageBuffer.start();
+
+    // Start inbox server so reconnecting peers can fetch missed messages
+    this.inboxServer = new InboxServer(this.libp2p!, this.messageBuffer);
+    await this.inboxServer.start();
+    console.log(`[Seed] Inbox server active — buffering messages for offline peers`);
+
+    // Buffer all incoming GossipSub messages for store-and-forward
+    this.startMessageCapture();
+
     // Periodically broadcast known peer list
     this.startPeerExchange();
 
@@ -70,6 +87,8 @@ export class SeedNode extends MagicNode {
       clearInterval(this.peerExchangeTimer);
       this.peerExchangeTimer = null;
     }
+    this.messageBuffer.stop();
+    await this.inboxServer?.stop();
     await this.peerDb?.close();
     this.peerDb = null;
     await super.stop();
@@ -143,6 +162,35 @@ export class SeedNode extends MagicNode {
       console.log(`[Seed] Pruned ${pruned} stale peers`);
     }
     return pruned;
+  }
+
+  /**
+   * Capture all incoming GossipSub messages into the buffer for
+   * store-and-forward delivery to reconnecting peers.
+   */
+  private startMessageCapture(): void {
+    if (!this.libp2p) return;
+
+    const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
+    const buffer = this.messageBuffer;
+
+    gs.addEventListener('gossipsub:message', (evt: CustomEvent) => {
+      const { msg } = evt.detail;
+      const topic = msg.topic as string;
+      const data = msg.data as Uint8Array;
+
+      // Generate a dedup ID from the message content
+      const id = createHash('sha256').update(data).digest('hex');
+
+      const stored = buffer.push(topic, data, id);
+      if (stored) {
+        // Log occasionally, not every message
+        const count = buffer.getCount();
+        if (count === 1 || count % 100 === 0) {
+          console.log(`[Seed] Message buffer: ${count} messages across ${buffer.getBufferedTopics().length} topics`);
+        }
+      }
+    });
   }
 
   private startPeerExchange(): void {

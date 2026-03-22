@@ -82,6 +82,10 @@ export {
   DISCOVERY_PROTOCOL,
 } from './discovery/discovery-protocol.js';
 
+// Store-and-Forward
+export { MessageBuffer, type BufferedMessage, type MessageBufferConfig } from './node/message-buffer.js';
+export { InboxServer, InboxClient, INBOX_PROTOCOL } from './node/inbox-protocol.js';
+
 // Crypto
 export {
   encryptPayload,

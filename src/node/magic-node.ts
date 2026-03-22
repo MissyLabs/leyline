@@ -17,6 +17,7 @@ import { LocalLedger } from '../ledger/local-log.js';
 import { SharedLedger } from '../ledger/shared-ledger.js';
 import { LedgerSync } from '../ledger/ledger-sync.js';
 import { PeerExchange } from './peer-exchange.js';
+import { InboxClient } from './inbox-protocol.js';
 import { DirectMessageProtocol, type DirectEnvelope, type DirectMessageTrustChecker } from './direct-message.js';
 import { ServiceRegistry, type ServiceDescriptor } from '../discovery/service-registry.js';
 import { DiscoveryProtocol } from '../discovery/discovery-protocol.js';
@@ -58,6 +59,7 @@ export class MagicNode {
   protected directMessage: DirectMessageProtocol | null = null;
   protected serviceRegistry: ServiceRegistry;
   protected discoveryProtocol: DiscoveryProtocol | null = null;
+  protected inboxClient: InboxClient | null = null;
   protected ledgerConsensus: LedgerConsensus;
   protected publicKey: Uint8Array = new Uint8Array(0);
   protected privateKey: Uint8Array = new Uint8Array(0);
@@ -160,10 +162,35 @@ export class MagicNode {
     };
     gs.addEventListener('gossipsub:message', this.gossipHandler);
 
-    // Track peer connections (store handlers for cleanup in stop())
+    // Initialize inbox client for store-and-forward message retrieval
+    this.inboxClient = new InboxClient(this.libp2p);
+
+    // Track peer connections — auto-fetch missed messages from seeds on connect
     this.peerConnectHandler = (evt: CustomEvent) => {
       const peerId = evt.detail.toString();
       this.events.onPeerConnected?.(peerId);
+
+      // When we connect to a peer, try to fetch any messages we missed while offline.
+      // Small delay to let the connection stabilize before making protocol requests.
+      if (this.inboxClient && this.tagPubSub) {
+        const topics = this.tagPubSub.getSubscribedTags().map(
+          (tag) => `magic/tag/${tag}`,
+        );
+        if (topics.length > 0) {
+          setTimeout(() => {
+            this.inboxClient?.fetch(peerId, topics).then((messages) => {
+              if (messages.length > 0) {
+                console.log(`[Magic] Inbox: fetched ${messages.length} missed message(s) from ${peerId.slice(0, 16)}...`);
+                for (const msg of messages) {
+                  this.handleIncomingMessage(msg.topic, msg.data);
+                }
+              }
+            }).catch(() => {
+              // Peer doesn't support inbox protocol (not a seed) — that's fine
+            });
+          }, 2000);
+        }
+      }
     };
     this.libp2p.addEventListener('peer:connect', this.peerConnectHandler);
 
@@ -707,6 +734,9 @@ export class MagicNode {
 
     // Message passed all checks — record and deliver
     await this.localLedger.append(data, 'received');
+
+    // Track last-received timestamp for inbox sync
+    this.inboxClient?.markReceived(msg.timestamp);
 
     // Deliver to tag-specific handlers (registered via onTag()).
     // These are distinct from the global onMessage event — a consumer may
