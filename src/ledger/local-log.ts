@@ -102,7 +102,15 @@ export class LocalLedger {
       const rawCount = await this.db.get("__count__");
       const parsed = parseInt(rawCount, 10);
       this.entryCount = Number.isNaN(parsed) ? 0 : parsed;
-    } catch {
+    } catch (err: unknown) {
+      const isNotFound = err instanceof Error && (
+        err.message.includes('LEVEL_NOT_FOUND') ||
+        err.message.includes('NotFound') ||
+        (err as { code?: string }).code === 'LEVEL_NOT_FOUND'
+      );
+      if (!isNotFound) {
+        console.warn('[LocalLedger] Failed to load entry count — resetting to empty state. This may indicate data corruption:', err);
+      }
       this.entryCount = 0;
     }
 

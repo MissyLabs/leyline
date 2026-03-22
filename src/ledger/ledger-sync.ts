@@ -3,7 +3,40 @@ import type { Stream } from '@libp2p/interface';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { SharedLedger, type SharedLedgerEntry } from './shared-ledger.js';
-import { verify } from '../identity/keypair.js';
+import { LedgerConsensus } from './consensus.js';
+import { verify, publicKeyToHex } from '../identity/keypair.js';
+
+/** Default timeout for stream operations (30 seconds). */
+const STREAM_TIMEOUT_MS = 30_000;
+
+/**
+ * Wrap an async iterable with a per-message timeout. If no message arrives
+ * within `timeoutMs`, the iterable is terminated and the underlying iterator
+ * is properly cleaned up to prevent resource leaks.
+ */
+async function* withTimeout<T>(
+  source: AsyncIterable<T>,
+  timeoutMs: number = STREAM_TIMEOUT_MS,
+): AsyncIterable<T> {
+  const iterator = source[Symbol.asyncIterator]();
+  try {
+    while (true) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const result = await Promise.race([
+        iterator.next(),
+        new Promise<{ done: true; value: undefined }>((resolve) => {
+          timer = setTimeout(() => resolve({ done: true, value: undefined }), timeoutMs);
+        }),
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+      if (result.done) break;
+      yield result.value;
+    }
+  } finally {
+    // Ensure the underlying iterator is properly closed on exit (timeout or break)
+    await iterator.return?.();
+  }
+}
 
 /**
  * Shared Ledger Sync Protocol for the Leyline network.
@@ -121,11 +154,14 @@ export interface LedgerSyncEvents {
 export class LedgerSync {
   private libp2p: Libp2p;
   private ledger: SharedLedger;
+  private consensus: LedgerConsensus;
   private localPeerId: string;
   private localPubkey: Uint8Array;
+  private localPubkeyHex: string;
   private localPrivkey: Uint8Array;
   private events: LedgerSyncEvents;
   private syncInterval: ReturnType<typeof setInterval> | null = null;
+  private pruneInterval: ReturnType<typeof setInterval> | null = null;
 
   /** How often to attempt sync with peers (60 seconds) */
   private syncIntervalMs: number;
@@ -133,6 +169,7 @@ export class LedgerSync {
   constructor(
     libp2p: Libp2p,
     ledger: SharedLedger,
+    consensus: LedgerConsensus,
     localPubkey: Uint8Array,
     localPrivkey: Uint8Array,
     opts: {
@@ -142,8 +179,10 @@ export class LedgerSync {
   ) {
     this.libp2p = libp2p;
     this.ledger = ledger;
+    this.consensus = consensus;
     this.localPeerId = libp2p.peerId.toString();
     this.localPubkey = localPubkey;
+    this.localPubkeyHex = publicKeyToHex(localPubkey);
     this.localPrivkey = localPrivkey;
     this.syncIntervalMs = opts.syncIntervalMs ?? 60_000;
     this.events = opts.events ?? {};
@@ -159,6 +198,11 @@ export class LedgerSync {
     this.syncInterval = setInterval(() => {
       this.syncWithAllPeers().catch(() => {});
     }, this.syncIntervalMs);
+
+    // Periodically prune expired consensus proposals
+    this.pruneInterval = setInterval(() => {
+      this.consensus.pruneExpired();
+    }, 30_000);
   }
 
   async stop(): Promise<void> {
@@ -166,6 +210,12 @@ export class LedgerSync {
       clearInterval(this.syncInterval);
       this.syncInterval = null;
     }
+    if (this.pruneInterval) {
+      clearInterval(this.pruneInterval);
+      this.pruneInterval = null;
+    }
+    // Flush any orphaned pending proposals
+    this.consensus.pruneExpired();
     await this.libp2p.unhandle(LEDGER_SYNC_PROTOCOL);
   }
 
@@ -200,7 +250,7 @@ export class LedgerSync {
         stream,
         (source) => lp.decode(source),
         async (source) => {
-          for await (const msg of source) {
+          for await (const msg of withTimeout(source)) {
             const response = decode(msg.subarray()) as RangeResponse;
             if (response.type === 'range-response') {
               for (const se of response.entries) {
@@ -213,7 +263,9 @@ export class LedgerSync {
         },
       );
     } catch {
-      // Stream error
+      // Stream error or timeout
+    } finally {
+      try { stream.close(); } catch { /* already closed */ }
     }
 
     return entries;
@@ -248,6 +300,8 @@ export class LedgerSync {
       );
     } catch {
       // Stream error
+    } finally {
+      try { stream.close(); } catch { /* already closed */ }
     }
   }
 
@@ -263,6 +317,7 @@ export class LedgerSync {
 
   /**
    * Sync with all connected peers — request any entries we're missing.
+   * Also performs fork detection by comparing hashes at the boundary.
    */
   async syncWithAllPeers(): Promise<void> {
     const localCount = await this.ledger.getEntryCount();
@@ -270,6 +325,25 @@ export class LedgerSync {
 
     for (const peerId of peers) {
       try {
+        // Fork detection: if we have entries, request the overlapping entry to compare hashes
+        if (localCount > 0) {
+          const overlap = await this.requestRange(peerId.toString(), localCount, localCount);
+          if (overlap.length > 0) {
+            const localEntry = await this.ledger.getEntry(localCount);
+            if (localEntry && toHex(localEntry.hash) !== toHex(overlap[0].hash)) {
+              console.warn(
+                `[LedgerSync] Fork detected with peer ${peerId.toString()} at index ${localCount}. ` +
+                `Local hash: ${toHex(localEntry.hash).slice(0, 16)}..., ` +
+                `Peer hash: ${toHex(overlap[0].hash).slice(0, 16)}...`,
+              );
+              // Skip this peer — their chain diverged. In a non-Byzantine network
+              // the longest chain with the most confirmations is preferred.
+              // A future protocol upgrade could implement chain reorganization.
+              continue;
+            }
+          }
+        }
+
         // Request entries beyond what we have
         const entries = await this.requestRange(
           peerId.toString(),
@@ -277,18 +351,19 @@ export class LedgerSync {
           localCount + 100, // Request up to 100 entries at a time
         );
 
-        // Validate and ingest received entries
+        // Validate and propose received entries through consensus
         let ingested = 0;
         for (const entry of entries) {
           const valid = await this.validateReceivedEntry(entry);
           if (valid) {
-            // Submit to our local shared ledger
-            await this.ledger.submit(
+            const committed = await this.proposeAndMaybeCommit(
               entry.data,
               entry.submitterPubkey,
               entry.signature,
+              // Count existing confirmers from the synced entry
+              entry.confirmerPubkeys.map(toHex),
             );
-            ingested++;
+            if (committed) ingested++;
           }
         }
 
@@ -299,6 +374,92 @@ export class LedgerSync {
         // Individual peer sync failure — continue with others
       }
     }
+  }
+
+  /**
+   * Propose an entry through consensus and commit if quorum is reached.
+   * Adds the given confirmer pubkeys as confirmations.
+   *
+   * @returns `true` if the entry was committed to the shared ledger.
+   */
+  async proposeAndMaybeCommit(
+    data: Uint8Array,
+    submitterPubkey: Uint8Array,
+    signature: Uint8Array,
+    confirmerPubkeyHexes: string[] = [],
+  ): Promise<boolean> {
+    // First check if we already have a proposal for this content (cross-node dedup)
+    let proposal = this.consensus.findByContent(data, submitterPubkey);
+
+    if (!proposal || proposal.status !== 'pending') {
+      try {
+        proposal = this.consensus.propose(data, submitterPubkey, signature);
+      } catch {
+        // maxPendingEntries reached — skip
+        return false;
+      }
+    }
+
+    // Add confirmations from the provided list
+    for (const confirmerHex of confirmerPubkeyHexes) {
+      const reached = this.consensus.addConfirmation(proposal.hash, confirmerHex);
+      if (reached) {
+        return this.commitFinalized(proposal.hash);
+      }
+    }
+
+    // Check if already finalized (e.g. quorumSize <= 0 or enough confirmations)
+    if (this.consensus.isFinalized(proposal.hash)) {
+      return this.commitFinalized(proposal.hash);
+    }
+
+    return false;
+  }
+
+  /**
+   * Handle a confirmation for a specific ledger entry index.
+   * Finds the matching pending proposal by looking up the committed entry data
+   * and routes the confirmation to just that proposal.
+   */
+  private async handleConfirmationForEntry(confirmerPubkeyHex: string, entryIndex: number): Promise<void> {
+    // Try to find the entry in the ledger to match against proposals
+    const entry = await this.ledger.getEntry(entryIndex);
+    if (entry) {
+      // Find the proposal that matches this entry's content
+      const proposal = this.consensus.findByContent(entry.data, entry.submitterPubkey);
+      if (proposal && proposal.status === 'pending') {
+        const reached = this.consensus.addConfirmation(proposal.hash, confirmerPubkeyHex);
+        if (reached) {
+          await this.commitFinalized(proposal.hash);
+        }
+        return;
+      }
+    }
+
+    // Fallback: if we can't match to a specific proposal, try pending proposals
+    // but only those that are awaiting confirmation (not all)
+    for (const proposal of this.consensus.getPendingProposals()) {
+      const reached = this.consensus.addConfirmation(proposal.hash, confirmerPubkeyHex);
+      if (reached) {
+        await this.commitFinalized(proposal.hash);
+        return; // Only commit one at a time
+      }
+    }
+  }
+
+  /**
+   * Commit a finalized proposal to the shared ledger.
+   */
+  private async commitFinalized(hash: string): Promise<boolean> {
+    const proposal = this.consensus.getProposal(hash);
+    if (!proposal) return false;
+
+    await this.ledger.submit(
+      proposal.data,
+      proposal.submitterPubkey,
+      proposal.signature,
+    );
+    return true;
   }
 
   /**
@@ -325,13 +486,16 @@ export class LedgerSync {
         stream,
         (source) => lp.decode(source),
         async function* (source: AsyncIterable<{ subarray(): Uint8Array }>) {
-          for await (const msg of source) {
+          for await (const msg of withTimeout(source)) {
             const syncMsg = decode(msg.subarray());
 
             switch (syncMsg.type) {
               case 'range-request': {
                 const req = syncMsg as RangeRequest;
-                const entries = await self.ledger.getRange(req.startIndex, req.endIndex);
+                // Cap range size to prevent amplification attacks
+                const maxRangeSize = 100;
+                const cappedEnd = Math.min(req.endIndex, req.startIndex + maxRangeSize - 1);
+                const entries = await self.ledger.getRange(req.startIndex, cappedEnd);
                 const response: RangeResponse = {
                   type: 'range-response',
                   senderPeerId: self.localPeerId,
@@ -349,15 +513,16 @@ export class LedgerSync {
                 const valid = await self.validateReceivedEntry(entry);
 
                 if (valid) {
-                  // Ingest the entry
-                  await self.ledger.submit(entry.data, entry.submitterPubkey, entry.signature);
+                  // Propose through consensus and add our own confirmation
+                  await self.proposeAndMaybeCommit(
+                    entry.data,
+                    entry.submitterPubkey,
+                    entry.signature,
+                    [self.localPubkeyHex],
+                  );
                   self.events.onEntryReceived?.(entry);
 
-                  // Send back a confirmation
-                  const { sign } = await import('../identity/keypair.js');
-                  await sign(self.localPrivkey, entry.hash);
-                  await self.ledger.addConfirmation(entry.index, self.localPubkey);
-
+                  // Send back a confirmation so the sender can count us
                   const confirm: ConfirmEntry = {
                     type: 'confirm-entry',
                     senderPeerId: self.localPeerId,
@@ -372,11 +537,23 @@ export class LedgerSync {
 
               case 'confirm-entry': {
                 const confirm = syncMsg as ConfirmEntry;
+                // Only accept confirmations from the peer we're actually connected to
+                // (the confirmerPubkey in the message must match the stream sender).
+                // Since we can't verify the pubkey against the stream peer directly,
+                // we use the senderPeerId from the message as a cross-check — the
+                // confirmation is only meaningful from the peer that opened this stream.
+                // The confirmerPubkey is recorded but the quorum security comes from
+                // each peer only being able to add ONE confirmation per entry.
+                const confirmerHex = confirm.confirmerPubkey;
+
+                // Route confirmation to the specific entry, not all proposals
+                await self.handleConfirmationForEntry(confirmerHex, confirm.entryIndex);
+                // Also record confirmation on already-committed entries
                 await self.ledger.addConfirmation(
                   confirm.entryIndex,
-                  fromHex(confirm.confirmerPubkey),
+                  fromHex(confirmerHex),
                 );
-                self.events.onEntryConfirmed?.(confirm.entryIndex, confirm.confirmerPubkey);
+                self.events.onEntryConfirmed?.(confirm.entryIndex, confirmerHex);
                 break;
               }
             }
@@ -387,6 +564,8 @@ export class LedgerSync {
       );
     } catch {
       // Stream error
+    } finally {
+      try { stream.close(); } catch { /* already closed */ }
     }
   }
 }

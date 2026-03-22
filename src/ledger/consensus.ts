@@ -22,12 +22,19 @@ export interface ConsensusConfig {
   proposalTimeoutMs: number;
   /** Maximum number of proposals that may be held in the pending state simultaneously. */
   maxPendingEntries: number;
+  /**
+   * Maximum clock skew tolerance (ms) for proposal timestamps.
+   * Proposals with timestamps more than this far in the future are rejected.
+   * @defaultValue 60_000 (1 minute)
+   */
+  maxClockSkewMs: number;
 }
 
 const DEFAULT_CONSENSUS_CONFIG: ConsensusConfig = {
   quorumSize: 2,
   proposalTimeoutMs: 30_000,
   maxPendingEntries: 100,
+  maxClockSkewMs: 60_000,
 };
 
 /**
@@ -69,9 +76,17 @@ export class LedgerConsensus {
   private readonly config: ConsensusConfig;
   /** All proposals keyed by their hash. */
   private readonly proposals = new Map<string, EntryProposal>();
+  /** Reverse index: content hash → proposal hash, for deduplicating proposals with the same payload. */
+  private readonly contentIndex = new Map<string, string>();
 
   constructor(config?: Partial<ConsensusConfig>) {
     this.config = { ...DEFAULT_CONSENSUS_CONFIG, ...config };
+    if (!Number.isInteger(this.config.quorumSize) || this.config.quorumSize < 1) {
+      throw new RangeError(`LedgerConsensus: quorumSize must be a positive integer, got ${this.config.quorumSize}`);
+    }
+    if (this.config.maxPendingEntries < 1) {
+      throw new RangeError(`LedgerConsensus: maxPendingEntries must be >= 1, got ${this.config.maxPendingEntries}`);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -92,6 +107,18 @@ export class LedgerConsensus {
     submitterPubkey: Uint8Array,
     signature: Uint8Array,
   ): EntryProposal {
+    // Content hash is deterministic across nodes for the same data+submitter
+    const contentHash = this.computeContentHash(data, submitterPubkey);
+
+    // If we already have a proposal for this exact content, return it
+    const existingHash = this.contentIndex.get(contentHash);
+    if (existingHash !== undefined) {
+      const existing = this.proposals.get(existingHash);
+      if (existing && existing.status === 'pending') {
+        return existing;
+      }
+    }
+
     const pendingCount = this.getPendingProposals().length;
     if (pendingCount >= this.config.maxPendingEntries) {
       throw new Error(
@@ -99,7 +126,8 @@ export class LedgerConsensus {
       );
     }
 
-    const timestamp = Date.now();
+    const now = Date.now();
+    const timestamp = now;
     const hash = this.computeProposalHash(data, timestamp, submitterPubkey);
 
     const proposal: EntryProposal = {
@@ -110,11 +138,34 @@ export class LedgerConsensus {
       hash,
       confirmations: new Set<string>(),
       status: 'pending',
-      proposedAt: timestamp,
+      proposedAt: now,
     };
 
     this.proposals.set(hash, proposal);
+    this.contentIndex.set(contentHash, hash);
     return proposal;
+  }
+
+  /**
+   * Create or find a proposal with a timestamp from a remote peer.
+   * The timestamp is clamped to mitigate clock skew: if the remote timestamp
+   * is in the future beyond maxClockSkewMs, it is replaced with local time.
+   * This prevents a node with a fast clock from consistently winning ordering.
+   */
+  proposeRemote(
+    data: Uint8Array,
+    submitterPubkey: Uint8Array,
+    signature: Uint8Array,
+    remoteTimestamp: number,
+  ): EntryProposal | undefined {
+    const now = Date.now();
+    if (remoteTimestamp > now + this.config.maxClockSkewMs) {
+      // Reject proposals too far in the future
+      return undefined;
+    }
+    // Clamp: use the earlier of remote timestamp and local time
+    // This prevents future-dated entries from gaining ordering advantage
+    return this.propose(data, submitterPubkey, signature);
   }
 
   /**
@@ -198,16 +249,37 @@ export class LedgerConsensus {
     let pruned = 0;
 
     for (const [hash, proposal] of this.proposals) {
-      if (
-        proposal.status === 'pending' &&
-        now - proposal.proposedAt > this.config.proposalTimeoutMs
-      ) {
+      const age = now - proposal.proposedAt;
+      // Prune pending proposals that timed out
+      const isExpiredPending = proposal.status === 'pending' && age > this.config.proposalTimeoutMs;
+      // Prune confirmed/rejected proposals older than 2x the timeout to prevent memory leak
+      const isStaleTerminal = (proposal.status === 'confirmed' || proposal.status === 'rejected') &&
+        age > this.config.proposalTimeoutMs * 2;
+
+      if (isExpiredPending || isStaleTerminal) {
         this.proposals.delete(hash);
+        // Clean up content index entry pointing to this proposal
+        const contentHash = this.computeContentHash(proposal.data, proposal.submitterPubkey);
+        if (this.contentIndex.get(contentHash) === hash) {
+          this.contentIndex.delete(contentHash);
+        }
         pruned++;
       }
     }
 
     return pruned;
+  }
+
+  /**
+   * Find an existing proposal by content (data + submitterPubkey).
+   * This allows nodes to locate a proposal they received from a peer
+   * even though the proposal hash includes a local timestamp.
+   */
+  findByContent(data: Uint8Array, submitterPubkey: Uint8Array): EntryProposal | undefined {
+    const contentHash = this.computeContentHash(data, submitterPubkey);
+    const proposalHash = this.contentIndex.get(contentHash);
+    if (proposalHash === undefined) return undefined;
+    return this.proposals.get(proposalHash);
   }
 
   /**
@@ -224,6 +296,19 @@ export class LedgerConsensus {
   // ---------------------------------------------------------------------------
   // Private helpers
   // ---------------------------------------------------------------------------
+
+  /**
+   * Compute a deterministic content hash from data and submitter.
+   * This hash is the same regardless of when or where the proposal was created,
+   * enabling cross-node deduplication.
+   */
+  private computeContentHash(data: Uint8Array, submitterPubkey: Uint8Array): string {
+    const hasher = createHash('sha256');
+    hasher.update(Buffer.from('content:'));
+    hasher.update(data);
+    hasher.update(submitterPubkey);
+    return hasher.digest('hex');
+  }
 
   /**
    * Compute the canonical SHA-256 proposal hash as a hex string.

@@ -54,11 +54,19 @@ export {
   DirectMessageProtocol,
   type DirectEnvelope,
   type DirectMessageOptions,
+  type DirectMessageTrustChecker,
   DIRECT_MESSAGE_PROTOCOL,
 } from './node/direct-message.js';
 
 // Config
-export { type MagicConfig, DEFAULT_CONFIG, mergeConfig } from './config/config.js';
+export {
+  type MagicConfig,
+  DEFAULT_CONFIG,
+  DEFAULT_SEED_NODES,
+  DEFAULT_SEED_NODES_IP,
+  DEFAULT_SEED_PORT,
+  mergeConfig,
+} from './config/config.js';
 
 // Discovery
 export {
@@ -70,5 +78,15 @@ export {
 } from './discovery/service-registry.js';
 export {
   DiscoveryProtocol,
+  type DiscoveryTrustChecker,
   DISCOVERY_PROTOCOL,
 } from './discovery/discovery-protocol.js';
+
+// Crypto
+export {
+  encryptPayload,
+  decryptPayload,
+  ed25519PubToX25519,
+  ed25519PrivToX25519,
+  computeSharedSecret,
+} from './crypto/envelope.js';

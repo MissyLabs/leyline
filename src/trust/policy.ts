@@ -225,7 +225,32 @@ export class SpamFilter {
     // Record the current message arrival.
     window.timestamps.push(now);
 
+    // Periodically evict empty sender windows to prevent unbounded growth.
+    // Run eviction every 1000 calls to amortise the cost.
+    this.#rateLimitCallCount++;
+    if (this.#rateLimitCallCount >= 1000) {
+      this.#rateLimitCallCount = 0;
+      this.#evictStaleSenderWindows(cutoff);
+    }
+
     return window.timestamps.length > maxPerMinute;
+  }
+
+  /** Eviction counter for amortised stale window cleanup. */
+  #rateLimitCallCount = 0;
+
+  /**
+   * Remove sender window entries that have no timestamps within the active
+   * window. This prevents the map from growing without bound when many
+   * distinct senders send a single message and then go silent.
+   */
+  #evictStaleSenderWindows(cutoff: number): void {
+    for (const [key, window] of this.#senderWindows) {
+      if (window.timestamps.length === 0 ||
+          window.timestamps[window.timestamps.length - 1] < cutoff) {
+        this.#senderWindows.delete(key);
+      }
+    }
   }
 
   /**

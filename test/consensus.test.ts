@@ -282,27 +282,41 @@ describe('LedgerConsensus', () => {
       expect(short.getPendingProposals()).toHaveLength(0);
     });
 
-    it('does not prune confirmed proposals', async () => {
-      const short = new LedgerConsensus({ proposalTimeoutMs: 1, quorumSize: 1 });
+    it('does not prune recently confirmed proposals', async () => {
+      // Use a longer timeout so 2x timeout isn't exceeded during the test
+      const short = new LedgerConsensus({ proposalTimeoutMs: 5000, quorumSize: 1 });
       const p = proposeEntry(short, 'confirmed-entry');
       short.addConfirmation(p.hash, 'peer');
-
-      await new Promise((r) => setTimeout(r, 20));
 
       expect(short.pruneExpired()).toBe(0);
       expect(short.getOrderedEntries()).toHaveLength(1);
     });
 
-    it('does not prune rejected proposals', async () => {
+    it('eventually prunes stale confirmed proposals', async () => {
+      const short = new LedgerConsensus({ proposalTimeoutMs: 1, quorumSize: 1 });
+      const p = proposeEntry(short, 'confirmed-entry');
+      short.addConfirmation(p.hash, 'peer');
+
+      // Wait for 2x timeout to elapse (stale terminal proposals are cleaned up)
+      await new Promise((r) => setTimeout(r, 20));
+      expect(short.pruneExpired()).toBe(1);
+    });
+
+    it('does not prune recently rejected proposals', async () => {
+      const short = new LedgerConsensus({ proposalTimeoutMs: 5000 });
+      const p = proposeEntry(short, 'rejected-entry');
+      short.reject(p.hash);
+
+      expect(short.pruneExpired()).toBe(0);
+    });
+
+    it('eventually prunes stale rejected proposals', async () => {
       const short = new LedgerConsensus({ proposalTimeoutMs: 1 });
       const p = proposeEntry(short, 'rejected-entry');
       short.reject(p.hash);
 
       await new Promise((r) => setTimeout(r, 20));
-
-      // pruneExpired only removes pending — rejected proposals are terminal but
-      // the implementation only deletes pending ones.
-      expect(short.pruneExpired()).toBe(0);
+      expect(short.pruneExpired()).toBe(1);
     });
 
     it('selectively prunes only the expired pending proposals', async () => {

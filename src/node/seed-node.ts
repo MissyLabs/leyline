@@ -1,5 +1,12 @@
+import { Level } from 'level';
 import { MagicNode } from './magic-node.js';
 import type { MagicConfig } from '../config/config.js';
+
+interface StoredPeer {
+  peerId: string;
+  multiaddrs: string[];
+  lastSeen: number;
+}
 
 /**
  * Seed node specialization.
@@ -10,6 +17,8 @@ import type { MagicConfig } from '../config/config.js';
  */
 export class SeedNode extends MagicNode {
   private knownPeers = new Map<string, { multiaddrs: string[]; lastSeen: number }>();
+  private peerExchangeTimer: ReturnType<typeof setInterval> | null = null;
+  private peerDb: Level<string, string> | null = null;
 
   constructor(config: Partial<MagicConfig>) {
     super(
@@ -30,16 +39,50 @@ export class SeedNode extends MagicNode {
     await super.start();
     console.log('[Magic] Running as SEED NODE — peer discovery only');
 
+    // Open persistent peer store and hydrate in-memory map
+    this.peerDb = new Level(`${this.config.dataDir}/seed-peers`, { valueEncoding: 'utf8' });
+    await this.peerDb.open();
+    for await (const [key, raw] of this.peerDb.iterator({ gt: 'peer:', lt: 'peer:~' })) {
+      const peerId = key.slice('peer:'.length);
+      const stored: StoredPeer = JSON.parse(raw);
+      this.knownPeers.set(peerId, {
+        multiaddrs: stored.multiaddrs,
+        lastSeen: stored.lastSeen,
+      });
+    }
+    if (this.knownPeers.size > 0) {
+      console.log(`[Seed] Restored ${this.knownPeers.size} persisted peer(s)`);
+    }
+
     // Periodically broadcast known peer list
     this.startPeerExchange();
   }
 
+  async stop(): Promise<void> {
+    if (this.peerExchangeTimer) {
+      clearInterval(this.peerExchangeTimer);
+      this.peerExchangeTimer = null;
+    }
+    await this.peerDb?.close();
+    this.peerDb = null;
+    await super.stop();
+  }
+
   private trackPeer(peerId: string): void {
-    const addrs = this.getMultiaddrs();
-    this.knownPeers.set(peerId, {
-      multiaddrs: addrs,
-      lastSeen: Date.now(),
-    });
+    const lastSeen = Date.now();
+
+    // Look up the connecting peer's multiaddrs from the libp2p peer store
+    let addrs: string[] = [];
+    if (this.libp2p) {
+      const peerIdObj = this.libp2p.getPeers().find((p) => p.toString() === peerId);
+      if (peerIdObj) {
+        const conns = this.libp2p.getConnections(peerIdObj);
+        addrs = conns.map((c) => c.remoteAddr.toString());
+      }
+    }
+
+    this.knownPeers.set(peerId, { multiaddrs: addrs, lastSeen });
+    this.persistPeer(peerId, { peerId, multiaddrs: addrs, lastSeen });
     console.log(`[Seed] Peer connected: ${peerId} (total: ${this.knownPeers.size})`);
   }
 
@@ -48,8 +91,21 @@ export class SeedNode extends MagicNode {
     const peer = this.knownPeers.get(peerId);
     if (peer) {
       peer.lastSeen = Date.now();
+      this.persistPeer(peerId, { peerId, multiaddrs: peer.multiaddrs, lastSeen: peer.lastSeen });
     }
     console.log(`[Seed] Peer disconnected: ${peerId}`);
+  }
+
+  private persistPeer(peerId: string, data: StoredPeer): void {
+    this.peerDb?.put(`peer:${peerId}`, JSON.stringify(data)).catch((err) => {
+      console.error(`[Seed] Failed to persist peer ${peerId}:`, err);
+    });
+  }
+
+  private deletePeer(peerId: string): void {
+    this.peerDb?.del(`peer:${peerId}`).catch((err) => {
+      console.error(`[Seed] Failed to delete peer ${peerId}:`, err);
+    });
   }
 
   /** Get all known peers and their addresses. */
@@ -72,6 +128,7 @@ export class SeedNode extends MagicNode {
     for (const [peerId, info] of this.knownPeers) {
       if (info.lastSeen < cutoff) {
         this.knownPeers.delete(peerId);
+        this.deletePeer(peerId);
         pruned++;
       }
     }
@@ -83,7 +140,7 @@ export class SeedNode extends MagicNode {
 
   private startPeerExchange(): void {
     // Broadcast known peers every 30 seconds
-    setInterval(() => {
+    this.peerExchangeTimer = setInterval(() => {
       this.pruneStale();
 
       const peerList = this.getKnownPeers();

@@ -55,6 +55,12 @@ export interface ServiceDescriptor {
 
   /** Arbitrary string key/value metadata attached to the advertisement. */
   metadata: Record<string, string>;
+
+  /**
+   * Ed25519 signature over the canonical descriptor fields, hex-encoded.
+   * Proves the advertisement was created by the holder of `providerPubkey`.
+   */
+  signature?: string;
 }
 
 /**
@@ -168,6 +174,50 @@ export class ServiceRegistry {
   // ---------------------------------------------------------------------------
 
   /**
+   * Update an existing descriptor in-place (e.g. to attach a signature).
+   *
+   * @param descriptor - The updated descriptor. Must have a matching `id`.
+   */
+  updateDescriptor(descriptor: ServiceDescriptor): void {
+    this.services.set(descriptor.id, descriptor);
+  }
+
+  /** Maximum total remote services to prevent memory exhaustion from flooding. */
+  static readonly MAX_REMOTE_SERVICES = 10_000;
+  /** Maximum metadata keys per descriptor. */
+  static readonly MAX_METADATA_KEYS = 50;
+  /** Maximum string length for metadata keys and values. */
+  static readonly MAX_METADATA_VALUE_LENGTH = 1024;
+  /** Maximum tags per descriptor. */
+  static readonly MAX_TAGS = 100;
+  /** Maximum multiaddrs per descriptor. */
+  static readonly MAX_MULTIADDRS = 20;
+
+  /**
+   * Validate a descriptor's field sizes to prevent resource exhaustion
+   * from malicious peers.
+   */
+  private isValidDescriptor(descriptor: ServiceDescriptor): boolean {
+    if (typeof descriptor.id !== 'string' || descriptor.id.length === 0) return false;
+    if (typeof descriptor.name !== 'string' || descriptor.name.length > 256) return false;
+    if (typeof descriptor.description !== 'string' || descriptor.description.length > 2048) return false;
+    if (!Array.isArray(descriptor.tags) || descriptor.tags.length > ServiceRegistry.MAX_TAGS) return false;
+    if (!Array.isArray(descriptor.multiaddrs) || descriptor.multiaddrs.length > ServiceRegistry.MAX_MULTIADDRS) return false;
+
+    if (descriptor.metadata && typeof descriptor.metadata === 'object') {
+      const keys = Object.keys(descriptor.metadata);
+      if (keys.length > ServiceRegistry.MAX_METADATA_KEYS) return false;
+      for (const key of keys) {
+        if (key.length > ServiceRegistry.MAX_METADATA_VALUE_LENGTH) return false;
+        const val = descriptor.metadata[key];
+        if (typeof val !== 'string' || val.length > ServiceRegistry.MAX_METADATA_VALUE_LENGTH) return false;
+      }
+    }
+
+    return true;
+  }
+
+  /**
    * Merge a service advertisement received from a remote peer into the
    * registry.
    *
@@ -175,11 +225,23 @@ export class ServiceRegistry {
    * replaces it unconditionally (callers should pre-validate TTL before
    * calling this if deduplication is desired).
    *
+   * Rejects descriptors with oversized fields to prevent resource exhaustion.
+   *
    * @param descriptor - The remote {@link ServiceDescriptor} to store.
+   * @returns `true` if the descriptor was accepted, `false` if rejected.
    */
-  addRemote(descriptor: ServiceDescriptor): void {
+  addRemote(descriptor: ServiceDescriptor): boolean {
+    if (!this.isValidDescriptor(descriptor)) return false;
+
+    // Cap total remote services to prevent memory exhaustion from flooding
+    const remoteCount = this.services.size - this.localIds.size;
+    if (!this.services.has(descriptor.id) && remoteCount >= ServiceRegistry.MAX_REMOTE_SERVICES) {
+      return false;
+    }
+
     this.services.set(descriptor.id, descriptor);
     // Intentionally not added to localIds — it originated remotely.
+    return true;
   }
 
   // ---------------------------------------------------------------------------

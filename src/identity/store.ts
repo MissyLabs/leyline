@@ -134,7 +134,7 @@ export class IdentityStore {
     await writeFile(
       this.getIdentityPath(),
       JSON.stringify(payload, null, 2),
-      "utf8",
+      { encoding: "utf8", mode: 0o600 },
     );
   }
 

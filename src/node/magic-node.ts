@@ -17,7 +17,7 @@ import { LocalLedger } from '../ledger/local-log.js';
 import { SharedLedger } from '../ledger/shared-ledger.js';
 import { LedgerSync } from '../ledger/ledger-sync.js';
 import { PeerExchange } from './peer-exchange.js';
-import { DirectMessageProtocol, type DirectEnvelope } from './direct-message.js';
+import { DirectMessageProtocol, type DirectEnvelope, type DirectMessageTrustChecker } from './direct-message.js';
 import { ServiceRegistry, type ServiceDescriptor } from '../discovery/service-registry.js';
 import { DiscoveryProtocol } from '../discovery/discovery-protocol.js';
 import { PersistentTrustPolicy, PersistentSpamFilter } from '../trust/persistent-policy.js';
@@ -62,6 +62,13 @@ export class MagicNode {
   protected publicKey: Uint8Array = new Uint8Array(0);
   protected privateKey: Uint8Array = new Uint8Array(0);
   protected events: MagicNodeEvents;
+  private gossipHandler: ((evt: CustomEvent) => void) | null = null;
+  private peerConnectHandler: ((evt: CustomEvent) => void) | null = null;
+  private peerDisconnectHandler: ((evt: CustomEvent) => void) | null = null;
+  /** Serialization lock for submitToSharedLedger to prevent concurrent submit races. */
+  private ledgerSubmitLock: Promise<void> = Promise.resolve();
+  /** Timer for periodic service re-advertisement. */
+  private reAdvertiseTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor(config: Partial<MagicConfig>, events: MagicNodeEvents = {}) {
     this.config = mergeConfig(config);
@@ -138,22 +145,25 @@ export class MagicNode {
     // Subscribe to discovery
     this.tagPubSub.subscribeDiscovery();
 
-    // Handle incoming messages
-    gs.addEventListener('gossipsub:message', (evt: CustomEvent) => {
+    // Handle incoming messages (store handler for cleanup in stop())
+    this.gossipHandler = (evt: CustomEvent) => {
       const { msg } = evt.detail;
       this.handleIncomingMessage(msg.topic, msg.data);
-    });
+    };
+    gs.addEventListener('gossipsub:message', this.gossipHandler);
 
-    // Track peer connections
-    this.libp2p.addEventListener('peer:connect', (evt: CustomEvent) => {
+    // Track peer connections (store handlers for cleanup in stop())
+    this.peerConnectHandler = (evt: CustomEvent) => {
       const peerId = evt.detail.toString();
       this.events.onPeerConnected?.(peerId);
-    });
+    };
+    this.libp2p.addEventListener('peer:connect', this.peerConnectHandler);
 
-    this.libp2p.addEventListener('peer:disconnect', (evt: CustomEvent) => {
+    this.peerDisconnectHandler = (evt: CustomEvent) => {
       const peerId = evt.detail.toString();
       this.events.onPeerDisconnected?.(peerId);
-    });
+    };
+    this.libp2p.addEventListener('peer:disconnect', this.peerDisconnectHandler);
 
     // Open persistent stores
     await this.trustPolicy.open();
@@ -161,43 +171,98 @@ export class MagicNode {
     await this.localLedger.open();
     await this.sharedLedger.open();
 
-    // Start peer exchange protocol
-    this.peerExchange = new PeerExchange(this.libp2p);
+    // Start peer exchange protocol (with signing keys for authenticated records)
+    this.peerExchange = new PeerExchange(this.libp2p, {
+      localPrivateKey: this.privateKey,
+      localPubkeyHex: publicKeyToHex(this.publicKey),
+    });
     await this.peerExchange.start();
 
     // Start ledger sync protocol
     this.ledgerSync = new LedgerSync(
       this.libp2p,
       this.sharedLedger,
+      this.ledgerConsensus,
       this.publicKey,
       this.privateKey,
     );
     await this.ledgerSync.start();
 
-    // Start direct message protocol
+    // Build trust checker for direct messages
+    const dmTrustChecker: DirectMessageTrustChecker = {
+      isAllowed: (pubkeyHex: string) => this.trustPolicy.isAllowed(pubkeyHex, []),
+      isDuplicate: (id: string) => this.spamFilter.isDuplicate(id),
+      isRateLimited: (pubkeyHex: string) => this.spamFilter.isRateLimited(pubkeyHex, this.config.rateLimitPerMinute),
+      reportSpam: (pubkeyHex: string) => { this.spamFilter.reportSpam(pubkeyHex); },
+    };
+
+    // Start direct message protocol with encryption keys and trust checking
     this.directMessage = new DirectMessageProtocol(this.libp2p, {
       onMessage: (envelope) => this.events.onDirectMessage?.(envelope),
+      localPrivateKey: this.privateKey,
+      localPubkeyHex: publicKeyToHex(this.publicKey),
+      trustChecker: dmTrustChecker,
     });
     await this.directMessage.start();
 
-    // Start discovery protocol
+    // Start discovery protocol (with trust filtering)
     const localPeerId = this.libp2p.peerId.toString();
     this.discoveryProtocol = new DiscoveryProtocol(
       this.libp2p,
       this.serviceRegistry,
       publicKeyToHex(this.publicKey),
       localPeerId,
+      this.privateKey,
+      { isAllowed: (pubkeyHex: string) => this.trustPolicy.isAllowed(pubkeyHex, []) },
     );
     await this.discoveryProtocol.start();
+
+    // Auto-register a service for advertised tags so peers can discover this node
+    if (this.config.advertisedTags.length > 0) {
+      await this.registerService({
+        name: getFingerprint(this.publicKey),
+        tags: this.config.advertisedTags,
+        description: '',
+        ttl: 300_000,
+        metadata: {},
+      });
+    }
+
+    // Re-advertise local services periodically before TTL expires (every 4 minutes for 5-min TTL)
+    if (this.config.advertisedTags.length > 0 && this.discoveryProtocol) {
+      const dp = this.discoveryProtocol;
+      this.reAdvertiseTimer = setInterval(() => {
+        const locals = this.serviceRegistry.getLocal();
+        for (const descriptor of locals) {
+          // Refresh the advertisedAt timestamp and re-sign (signature covers advertisedAt)
+          const refreshed = { ...descriptor, advertisedAt: Date.now(), signature: undefined };
+          dp.signDescriptor(refreshed).then((signed) => {
+            this.serviceRegistry.updateDescriptor(signed);
+            dp.broadcastAdvertisement(signed).catch(() => {
+              // Best-effort re-advertisement
+            });
+          }).catch(() => {
+            // Signing failure — skip this cycle
+          });
+        }
+      }, 4 * 60_000);
+    }
 
     const fingerprint = getFingerprint(this.publicKey);
     const addrs = this.libp2p.getMultiaddrs().map((a) => a.toString());
     console.log(`[Magic] Node started: ${fingerprint}`);
     console.log(`[Magic] Listening on: ${addrs.join(', ')}`);
     console.log(`[Magic] Subscribed tags: ${this.config.subscribedTags.join(', ') || '(none)'}`);
+    if (this.config.advertisedTags.length > 0) {
+      console.log(`[Magic] Advertised tags: ${this.config.advertisedTags.join(', ')}`);
+    }
   }
 
   async stop(): Promise<void> {
+    if (this.reAdvertiseTimer) {
+      clearInterval(this.reAdvertiseTimer);
+      this.reAdvertiseTimer = null;
+    }
     await this.discoveryProtocol?.stop();
     await this.directMessage?.stop();
     await this.peerExchange?.stop();
@@ -206,7 +271,25 @@ export class MagicNode {
     await this.sharedLedger.close();
     await this.trustPolicy.close();
     await this.spamFilter.close();
+
+    // Remove event listeners before stopping libp2p
+    if (this.libp2p && this.gossipHandler) {
+      const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
+      gs.removeEventListener('gossipsub:message', this.gossipHandler);
+      this.gossipHandler = null;
+    }
+    if (this.libp2p && this.peerConnectHandler) {
+      this.libp2p.removeEventListener('peer:connect', this.peerConnectHandler);
+      this.peerConnectHandler = null;
+    }
+    if (this.libp2p && this.peerDisconnectHandler) {
+      this.libp2p.removeEventListener('peer:disconnect', this.peerDisconnectHandler);
+      this.peerDisconnectHandler = null;
+    }
+
     await this.libp2p?.stop();
+    this.tagPubSub = null;
+    this.libp2p = null;
     console.log('[Magic] Node stopped');
   }
 
@@ -225,8 +308,11 @@ export class MagicNode {
       publicKey: this.publicKey,
     });
 
+    if (!this.tagPubSub) {
+      throw new Error('MagicNode: cannot broadcast before start() completes');
+    }
     const data = serializeMessage(msg);
-    await this.tagPubSub!.publish(tags, data);
+    await this.tagPubSub.publish(tags, data);
 
     // Record in local ledger
     await this.localLedger.append(data, 'sent');
@@ -272,20 +358,37 @@ export class MagicNode {
     await this.trustPolicy.blockAgent(pubkeyHex);
   }
 
-  /** Send a direct message to a specific peer. */
-  async sendDirect(targetPeerId: string, payload: Uint8Array): Promise<boolean> {
+  /** Allow a specific agent on a specific tag. */
+  async allowTag(pubkeyHex: string, tag: string): Promise<void> {
+    await this.trustPolicy.allowTag(pubkeyHex, tag);
+  }
+
+  /** Block a specific agent from a specific tag. */
+  async blockTag(pubkeyHex: string, tag: string): Promise<void> {
+    await this.trustPolicy.blockTag(pubkeyHex, tag);
+  }
+
+  /** Send a direct (encrypted) message to a specific peer. */
+  async sendDirect(targetPeerId: string, payload: Uint8Array, recipientPubkeyHex?: string): Promise<boolean> {
     if (!this.directMessage) return false;
-    return this.directMessage.send(targetPeerId, payload);
+    return this.directMessage.send(targetPeerId, payload, recipientPubkeyHex);
   }
 
   /** Register a local service for discovery. */
-  registerService(opts: Omit<ServiceDescriptor, 'id' | 'advertisedAt' | 'providerPubkey' | 'providerPeerId' | 'multiaddrs'>): ServiceDescriptor {
-    return this.serviceRegistry.register({
+  async registerService(opts: Omit<ServiceDescriptor, 'id' | 'advertisedAt' | 'providerPubkey' | 'providerPeerId' | 'multiaddrs' | 'signature'>): Promise<ServiceDescriptor> {
+    const descriptor = this.serviceRegistry.register({
       ...opts,
       providerPubkey: publicKeyToHex(this.publicKey),
       providerPeerId: this.libp2p?.peerId.toString() ?? '',
       multiaddrs: this.getMultiaddrs(),
     });
+    // Sign the descriptor and update it in the registry
+    if (this.discoveryProtocol) {
+      const signed = await this.discoveryProtocol.signDescriptor(descriptor);
+      this.serviceRegistry.updateDescriptor(signed);
+      return signed;
+    }
+    return descriptor;
   }
 
   /** Query all connected peers for services matching a query. */
@@ -294,11 +397,48 @@ export class MagicNode {
     return this.discoveryProtocol.queryAllPeers(query);
   }
 
-  /** Submit data to the shared (provable) ledger. */
+  /** Submit data to the shared (provable) ledger via consensus. Serialized to prevent races. */
   async submitToSharedLedger(data: Uint8Array): Promise<void> {
+    // Chain onto the lock so concurrent calls execute sequentially
+    const prev = this.ledgerSubmitLock;
+    let resolve!: () => void;
+    this.ledgerSubmitLock = new Promise<void>((r) => { resolve = r; });
+
+    try {
+      await prev;
+      await this.submitToSharedLedgerInner(data);
+    } finally {
+      resolve();
+    }
+  }
+
+  private async submitToSharedLedgerInner(data: Uint8Array): Promise<void> {
     const { sign } = await import('../identity/keypair.js');
     const signature = await sign(this.privateKey, data);
-    await this.sharedLedger.submit(data, this.publicKey, signature);
+
+    if (this.ledgerSync) {
+      const countBefore = await this.sharedLedger.getEntryCount();
+
+      // Route through consensus: propose, add own confirmation, broadcast to peers
+      await this.ledgerSync.proposeAndMaybeCommit(
+        data,
+        this.publicKey,
+        signature,
+        [publicKeyToHex(this.publicKey)],
+      );
+
+      // Only broadcast if a new entry was actually committed
+      const countAfter = await this.sharedLedger.getEntryCount();
+      if (countAfter > countBefore) {
+        const entry = await this.sharedLedger.getLatest();
+        if (entry) {
+          await this.ledgerSync.broadcastEntry(entry);
+        }
+      }
+    } else {
+      // Fallback for nodes without ledger sync (e.g. before start())
+      await this.sharedLedger.submit(data, this.publicKey, signature);
+    }
   }
 
   /** Get this node's public key hex. */
@@ -381,7 +521,8 @@ export class MagicNode {
     // Check deduplication
     const msgIdHex = Buffer.from(msg.id).toString('hex');
     if (this.spamFilter.isDuplicate(msgIdHex)) {
-      return; // Already seen
+      await this.localLedger.append(data, 'blocked');
+      return; // Already seen — recorded as blocked for audit
     }
 
     // Check rate limiting
@@ -397,8 +538,13 @@ export class MagicNode {
       return;
     }
 
-    // Verify signature
-    const sigValid = await verifyMessageSignature(msg);
+    // Verify signature (wrapped in try/catch since ed.verifyAsync can throw on malformed keys)
+    let sigValid: boolean;
+    try {
+      sigValid = await verifyMessageSignature(msg);
+    } catch {
+      sigValid = false;
+    }
     if (!sigValid) {
       await this.spamFilter.reportSpam(senderHex);
       await this.localLedger.append(data, 'blocked');
@@ -408,7 +554,9 @@ export class MagicNode {
     // Message passed all checks — record and deliver
     await this.localLedger.append(data, 'received');
 
-    // Deliver to tag pub/sub handlers
+    // Deliver to tag-specific handlers (registered via onTag()).
+    // These are distinct from the global onMessage event — a consumer may
+    // listen to both without receiving duplicate notifications.
     this.tagPubSub?.handleMessage(topic, data);
 
     // Fire global event

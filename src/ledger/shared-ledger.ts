@@ -105,8 +105,17 @@ export class SharedLedger {
       const meta = JSON.parse(metaRaw);
       this.currentIndex = meta.index;
       this.latestHash = fromHex(meta.hash);
-    } catch {
-      // No entries yet
+    } catch (err: unknown) {
+      // Distinguish between "no entries yet" (NotFound/parse error on empty) and actual corruption
+      const isExpectedEmpty = err instanceof Error && (
+        err.message.includes('LEVEL_NOT_FOUND') ||
+        err.message.includes('NotFound') ||
+        err.message.includes('is not valid JSON') ||
+        (err as { code?: string }).code === 'LEVEL_NOT_FOUND'
+      );
+      if (!isExpectedEmpty) {
+        console.warn('[SharedLedger] Failed to load metadata — resetting to empty state. This may indicate data corruption:', err);
+      }
       this.currentIndex = 0;
       this.latestHash = new Uint8Array(0);
     }

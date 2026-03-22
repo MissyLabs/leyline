@@ -97,8 +97,11 @@ export interface MagicMessage {
   type: MessageType;
 
   /**
-   * Remaining hop count. Each relay node MUST decrement this value before
-   * forwarding and MUST drop the message when it reaches zero.
+   * Application-level hop limit. For broadcast messages, GossipSub handles
+   * hop limiting internally via its mesh overlay — this field is not
+   * decremented by GossipSub relay nodes. It IS decremented by the
+   * DirectMessageProtocol relay path. Validated on receive to reject
+   * messages with exhausted TTL.
    */
   ttl: number;
 }
@@ -431,6 +434,23 @@ export interface ValidationResult {
  * @returns A {@link ValidationResult} indicating pass or the first failure.
  */
 export function validateMessage(msg: MagicMessage): ValidationResult {
+  // Verify sender public key length (must be 32-byte Ed25519 key)
+  if (msg.senderPubkey.length !== 32) {
+    return {
+      valid: false,
+      error: `Sender public key must be 32 bytes, got ${msg.senderPubkey.length}`,
+    };
+  }
+
+  // Recompute message ID to prevent forgery (attacker changing ID to bypass dedup)
+  const expectedId = computeId(msg.payload, msg.tags, msg.timestamp, msg.nonce);
+  if (!buffersEqual(msg.id, expectedId)) {
+    return {
+      valid: false,
+      error: 'Message ID does not match content hash — possible forgery',
+    };
+  }
+
   if (msg.payload.length > MAX_PAYLOAD_SIZE) {
     return {
       valid: false,
@@ -497,6 +517,16 @@ export function validateMessage(msg: MagicMessage): ValidationResult {
  * @param msg - The message whose signature should be verified.
  * @returns `true` if the signature is cryptographically valid, `false` otherwise.
  */
+function buffersEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  // Use constant-time comparison to avoid timing side channels
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= a[i] ^ b[i];
+  }
+  return diff === 0;
+}
+
 export async function verifyMessageSignature(msg: MagicMessage): Promise<boolean> {
   const signableBytes = buildSignableBytes(
     msg.payload,

@@ -28,6 +28,7 @@ import {
   type DiscoveryResult,
   ServiceRegistry,
 } from './service-registry.js';
+import { sign, verify, hexToPublicKey } from '../identity/keypair.js';
 
 // ---------------------------------------------------------------------------
 // Protocol ID
@@ -109,11 +110,19 @@ function newRequestId(): string {
  * await discovery.broadcastAdvertisement(descriptor);
  * ```
  */
+/** Interface for trust checking in discovery (avoids circular dependency). */
+export interface DiscoveryTrustChecker {
+  /** Returns true if the provider is allowed (not blocked). */
+  isAllowed(pubkeyHex: string): boolean;
+}
+
 export class DiscoveryProtocol {
   private readonly libp2p: Libp2p;
   private readonly registry: ServiceRegistry;
   private readonly localPubkeyHex: string;
   private readonly localPeerId: string;
+  private readonly localPrivateKey: Uint8Array;
+  private readonly trustChecker?: DiscoveryTrustChecker;
 
   /** Timer handle for the periodic prune task. */
   private pruneTimer: ReturnType<typeof setInterval> | null = null;
@@ -126,11 +135,50 @@ export class DiscoveryProtocol {
     registry: ServiceRegistry,
     localPubkeyHex: string,
     localPeerId: string,
+    localPrivateKey: Uint8Array,
+    trustChecker?: DiscoveryTrustChecker,
   ) {
     this.libp2p = libp2p;
     this.registry = registry;
     this.localPubkeyHex = localPubkeyHex;
     this.localPeerId = localPeerId;
+    this.localPrivateKey = localPrivateKey;
+    this.trustChecker = trustChecker;
+  }
+
+  /**
+   * Compute the canonical signable bytes for a service descriptor.
+   * Includes all fields except `signature` itself, sorted by key for determinism.
+   */
+  static computeSignableBytes(descriptor: ServiceDescriptor): Uint8Array {
+    const { signature: _, ...rest } = descriptor;
+    const canonical = Object.keys(rest)
+      .sort()
+      .reduce<Record<string, unknown>>((acc, key) => {
+        acc[key] = (rest as Record<string, unknown>)[key];
+        return acc;
+      }, {});
+    return new TextEncoder().encode(JSON.stringify(canonical));
+  }
+
+  /** Sign a descriptor with the local private key. */
+  async signDescriptor(descriptor: ServiceDescriptor): Promise<ServiceDescriptor> {
+    const signable = DiscoveryProtocol.computeSignableBytes(descriptor);
+    const sig = await sign(this.localPrivateKey, signable);
+    return { ...descriptor, signature: Buffer.from(sig).toString('hex') };
+  }
+
+  /** Verify a descriptor's signature against its providerPubkey. Returns false if unsigned or invalid. */
+  static async verifyDescriptor(descriptor: ServiceDescriptor): Promise<boolean> {
+    if (!descriptor.signature) return false;
+    try {
+      const pubkey = hexToPublicKey(descriptor.providerPubkey);
+      const signable = DiscoveryProtocol.computeSignableBytes(descriptor);
+      const sigBytes = new Uint8Array(Buffer.from(descriptor.signature, 'hex'));
+      return await verify(pubkey, sigBytes, signable);
+    } catch {
+      return false;
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -215,10 +263,17 @@ export class DiscoveryProtocol {
           for await (const chunk of source) {
             const msg = decodeMsg(chunk.subarray());
             if (msg.kind === 'result' && msg.requestId === requestId) {
-              // Merge received descriptors into local registry for future use.
+              // Merge received descriptors into local registry, verifying signatures and trust.
               for (const descriptor of msg.result.services) {
-                this.registry.addRemote(descriptor);
-                collected.push(descriptor);
+                // Skip services from blocked providers
+                if (this.trustChecker && !this.trustChecker.isAllowed(descriptor.providerPubkey)) {
+                  continue;
+                }
+                const valid = await DiscoveryProtocol.verifyDescriptor(descriptor);
+                if (valid) {
+                  this.registry.addRemote(descriptor);
+                  collected.push(descriptor);
+                }
               }
             }
           }
@@ -355,8 +410,15 @@ export class DiscoveryProtocol {
               yield encodeMsg(reply);
 
             } else if (msg.kind === 'advertisement') {
-              // Merge the advertised descriptor into our registry.
-              self.registry.addRemote(msg.descriptor);
+              // Skip advertisements from blocked providers
+              if (self.trustChecker && !self.trustChecker.isAllowed(msg.descriptor.providerPubkey)) {
+                continue;
+              }
+              // Verify signature before merging into our registry.
+              const valid = await DiscoveryProtocol.verifyDescriptor(msg.descriptor);
+              if (valid) {
+                self.registry.addRemote(msg.descriptor);
+              }
               // No reply sent — the generator produces nothing for this branch.
             }
             // 'result' frames are never expected as inbound openers; ignore.
@@ -367,6 +429,8 @@ export class DiscoveryProtocol {
       );
     } catch {
       // Stream errors are expected during normal peer churn.
+    } finally {
+      try { stream.close(); } catch { /* already closed */ }
     }
   }
 }

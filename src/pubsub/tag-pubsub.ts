@@ -99,10 +99,13 @@ export class TagPubSub {
    */
   handleMessage(topic: string, data: Uint8Array): void {
     const tag = this.topicToTag(topic);
-    const effectiveTag = tag ?? topic;
+
+    // Only dispatch messages from recognized tag topics.
+    // Discovery and other non-tag topics are handled via separate paths.
+    if (tag === null) return;
 
     // Fire tag-specific handlers
-    if (tag && this.handlers.has(tag)) {
+    if (this.handlers.has(tag)) {
       for (const handler of this.handlers.get(tag)!) {
         handler(data, tag);
       }
@@ -110,7 +113,7 @@ export class TagPubSub {
 
     // Fire global handlers
     for (const handler of this.globalHandlers) {
-      handler(data, effectiveTag);
+      handler(data, tag);
     }
   }
 
