@@ -165,6 +165,8 @@ fi
 # ---------------------------------------------------------------------------
 if [ -d "$LEYLINE_DIR/.git" ]; then
   info "Updating existing installation at $LEYLINE_DIR"
+  # Ensure git trusts this directory (owned by service user, script runs as root)
+  git config --global --add safe.directory "$LEYLINE_DIR" 2>/dev/null || true
   cd "$LEYLINE_DIR"
   git fetch origin
   git reset --hard "origin/$LEYLINE_BRANCH"
