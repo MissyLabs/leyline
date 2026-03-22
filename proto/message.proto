@@ -1,0 +1,119 @@
+syntax = "proto3";
+
+package magic;
+
+// Core message envelope sent over the network
+message MagicMessage {
+  // Unique message ID (hash of content + timestamp + sender)
+  bytes id = 1;
+
+  // Sender's Ed25519 public key (32 bytes)
+  bytes sender_pubkey = 2;
+
+  // Ed25519 signature over (id + payload + tags + timestamp + nonce)
+  bytes signature = 3;
+
+  // Tags for pub/sub routing
+  repeated string tags = 4;
+
+  // Application-level payload (max 256KB enforced at validation)
+  bytes payload = 5;
+
+  // Unix timestamp in milliseconds
+  uint64 timestamp = 6;
+
+  // Random nonce for uniqueness
+  bytes nonce = 7;
+
+  // Message type
+  MessageType type = 8;
+
+  // Time-to-live: number of hops remaining
+  uint32 ttl = 9;
+}
+
+enum MessageType {
+  MESSAGE_TYPE_UNSPECIFIED = 0;
+  // Standard broadcast message
+  MESSAGE_TYPE_BROADCAST = 1;
+  // Direct message to a specific peer
+  MESSAGE_TYPE_DIRECT = 2;
+  // Service/skill advertisement
+  MESSAGE_TYPE_ADVERTISE = 3;
+  // Discovery query
+  MESSAGE_TYPE_DISCOVER = 4;
+  // Discovery response
+  MESSAGE_TYPE_DISCOVER_RESPONSE = 5;
+}
+
+// Entry in the local append-only ledger
+message LedgerEntry {
+  // Sequential index in the local chain
+  uint64 index = 1;
+
+  // Hash of the previous entry (SHA-256), empty for genesis
+  bytes prev_hash = 2;
+
+  // SHA-256 hash of this entry's content
+  bytes hash = 3;
+
+  // The message that was recorded
+  MagicMessage message = 4;
+
+  // Timestamp when this entry was appended locally
+  uint64 recorded_at = 5;
+
+  // Action taken (received, sent, blocked, etc.)
+  LedgerAction action = 6;
+}
+
+enum LedgerAction {
+  LEDGER_ACTION_UNSPECIFIED = 0;
+  LEDGER_ACTION_SENT = 1;
+  LEDGER_ACTION_RECEIVED = 2;
+  LEDGER_ACTION_BLOCKED = 3;
+  LEDGER_ACTION_RELAYED = 4;
+}
+
+// Entry in the shared distributed ledger (provable records)
+message SharedLedgerEntry {
+  // Sequential index
+  uint64 index = 1;
+
+  // Hash of previous entry
+  bytes prev_hash = 2;
+
+  // Hash of this entry
+  bytes hash = 3;
+
+  // The provable data
+  bytes data = 4;
+
+  // Who submitted this entry
+  bytes submitter_pubkey = 5;
+
+  // Signature over (index + prev_hash + data + timestamp)
+  bytes signature = 6;
+
+  // Unix timestamp ms
+  uint64 timestamp = 7;
+
+  // Number of peer confirmations
+  uint32 confirmations = 8;
+
+  // Peers who confirmed
+  repeated bytes confirmer_pubkeys = 9;
+}
+
+// Peer discovery messages
+message PeerInfo {
+  bytes peer_id = 1;
+  bytes pubkey = 2;
+  repeated string multiaddrs = 3;
+  repeated string offered_tags = 4;
+  uint64 last_seen = 5;
+}
+
+message PeerExchange {
+  repeated PeerInfo peers = 1;
+}
