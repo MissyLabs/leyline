@@ -551,9 +551,7 @@ export class MagicNode {
     const signature = await sign(this.privateKey, data);
 
     if (this.ledgerSync) {
-      const countBefore = await this.sharedLedger.getEntryCount();
-
-      // Route through consensus: propose, add own confirmation, broadcast to peers
+      // Route through consensus: propose, add own confirmation
       await this.ledgerSync.proposeAndMaybeCommit(
         data,
         this.publicKey,
@@ -561,13 +559,18 @@ export class MagicNode {
         [publicKeyToHex(this.publicKey)],
       );
 
-      // Only broadcast if a new entry was actually committed
-      const countAfter = await this.sharedLedger.getEntryCount();
-      if (countAfter > countBefore) {
-        const entry = await this.sharedLedger.getLatest();
-        if (entry) {
-          await this.ledgerSync.broadcastEntry(entry);
-        }
+      // ALWAYS broadcast to peers (especially seeds) so they can add their
+      // confirmation and reach quorum. Previously this only fired when quorum
+      // was reached locally, but with quorum=2 a single bot can never reach
+      // quorum alone — seeds need to receive the entry to confirm it.
+      // Submit locally first (so we have something to broadcast), then push.
+      const entry = await this.sharedLedger.getLatest();
+      if (!entry) {
+        // No committed entry yet — submit directly so we have something to broadcast
+        const submitted = await this.sharedLedger.submit(data, this.publicKey, signature);
+        await this.ledgerSync.broadcastEntry(submitted);
+      } else {
+        await this.ledgerSync.broadcastEntry(entry);
       }
     } else {
       // Fallback for nodes without ledger sync (e.g. before start())
