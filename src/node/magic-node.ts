@@ -74,6 +74,8 @@ export class MagicNode {
   private ledgerSubmitLock: Promise<void> = Promise.resolve();
   /** Timer for periodic service re-advertisement. */
   private reAdvertiseTimer: ReturnType<typeof setInterval> | null = null;
+  /** Timer for periodic inbox polling (fallback receive for NATted nodes). */
+  private inboxPollTimer: ReturnType<typeof setInterval> | null = null;
 
   // --- Global inbound rate limiting (token burn protection) ---
   /** Timestamps of messages delivered to handlers in the current window. */
@@ -124,16 +126,36 @@ export class MagicNode {
         emitSelf: false,
         allowPublishToZeroTopicPeers: true,
         fallbackToFloodsub: true,
+        // floodPublish sends messages to ALL connected peers, not just mesh peers.
+        // This is critical for NATted nodes that can dial out to seeds but can't
+        // receive inbound mesh connections. Without this, GossipSub only sends
+        // to mesh peers, and mesh formation requires bidirectional reachability.
+        floodPublish: true,
       }),
       dcutr: dcutr(),
     };
     if (this.config.isSeedNode) services.relay = circuitRelayServer();
+
+    // Filter out non-routable addresses from announcements.
+    // Nodes behind NAT advertise private IPs (10.x, 172.16-31.x, 192.168.x)
+    // which other peers can't reach. This wastes dial attempts and breaks
+    // GossipSub mesh formation.
+    const announceFilter = (addrs: Array<{ toString(): string }>) =>
+      addrs.filter((ma) => {
+        const str = ma.toString();
+        // Keep loopback for local testing, filter private ranges for production
+        if (str.includes('/ip4/10.') || str.includes('/ip4/172.') || str.includes('/ip4/192.168.')) {
+          return false;
+        }
+        return true;
+      });
 
     // Build libp2p config
     const libp2pOptions: Record<string, unknown> = {
       privateKey: privKey,
       addresses: {
         listen: listenAddresses,
+        announceFilter,
       },
       transports,
       connectionEncrypters: [noise()],
@@ -297,6 +319,31 @@ export class MagicNode {
       }, 4 * 60_000);
     }
 
+    // Periodic inbox polling — fallback receive path for NATted nodes.
+    // GossipSub requires bidirectional mesh, which breaks for nodes behind NAT.
+    // This polls seeds every 30 seconds for any messages we missed, ensuring
+    // messages are eventually delivered even when GossipSub relay fails.
+    if (this.inboxClient && this.tagPubSub && !this.config.isSeedNode) {
+      this.inboxPollTimer = setInterval(() => {
+        if (this.paused || !this.inboxClient || !this.tagPubSub) return;
+        const topics = this.tagPubSub.getSubscribedTags().map(
+          (tag) => `magic/tag/${tag}`,
+        );
+        if (topics.length === 0) return;
+
+        this.inboxClient.fetchFromAllPeers(topics).then((messages) => {
+          if (messages.length > 0) {
+            console.log(`[Magic] Inbox poll: ${messages.length} new message(s)`);
+            for (const msg of messages) {
+              this.handleIncomingMessage(msg.topic, msg.data);
+            }
+          }
+        }).catch(() => {
+          // Poll failure — will retry next cycle
+        });
+      }, 30_000);
+    }
+
     const fingerprint = getFingerprint(this.publicKey);
     const addrs = this.libp2p.getMultiaddrs().map((a) => a.toString());
     console.log(`[Magic] Node started: ${fingerprint} (v${LEYLINE_VERSION})`);
@@ -311,6 +358,10 @@ export class MagicNode {
     if (this.reAdvertiseTimer) {
       clearInterval(this.reAdvertiseTimer);
       this.reAdvertiseTimer = null;
+    }
+    if (this.inboxPollTimer) {
+      clearInterval(this.inboxPollTimer);
+      this.inboxPollTimer = null;
     }
     await this.handshake?.stop();
     await this.discoveryProtocol?.stop();
