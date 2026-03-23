@@ -152,12 +152,19 @@ export class TrustPolicy {
       return true;
     }
 
-    // Agent is not explicitly allowed — check if any message tag is open.
-    // This allows unknown senders to participate on open tags.
+    // Agent is not explicitly allowed — check open tags.
+    // For unknown senders, EVERY tag on the message must be open.
+    // This prevents abuse where an attacker tags a message with both an open tag
+    // and a private tag to sneak past trust on the open tag.
     if (this.#openTags.size > 0 && tags.length > 0) {
+      let allOpen = true;
       for (const tag of tags) {
-        if (this.#openTags.has(tag)) return true;
+        if (!this.#openTags.has(tag)) {
+          allOpen = false;
+          break;
+        }
       }
+      if (allOpen) return true;
     }
 
     // Deny-first default.

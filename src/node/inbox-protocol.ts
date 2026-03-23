@@ -16,6 +16,7 @@
 
 import type { Libp2p } from 'libp2p';
 import type { Stream } from '@libp2p/interface';
+import type { GossipSub } from '@chainsafe/libp2p-gossipsub';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { type BufferedMessage, type MessageBuffer } from './message-buffer.js';
@@ -93,8 +94,9 @@ export class InboxServer {
   }
 
   async start(): Promise<void> {
-    await this.libp2p.handle(INBOX_PROTOCOL, async ({ stream }) => {
-      await this.handleRequest(stream);
+    await this.libp2p.handle(INBOX_PROTOCOL, async ({ stream, connection }) => {
+      const remotePeerId = connection.remotePeer.toString();
+      await this.handleRequest(stream, remotePeerId);
     });
   }
 
@@ -102,7 +104,28 @@ export class InboxServer {
     await this.libp2p.unhandle(INBOX_PROTOCOL);
   }
 
-  private async handleRequest(stream: Stream): Promise<void> {
+  /**
+   * Get the set of GossipSub topics a remote peer is subscribed to.
+   * Used to authorize inbox fetch requests — a peer can only fetch
+   * messages for topics they're actually subscribed to.
+   */
+  private getPeerSubscriptions(peerId: string): Set<string> {
+    const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
+    const subscribed = new Set<string>();
+    // Check each topic we know about for this peer's membership
+    for (const topic of gs.getTopics()) {
+      const subscribers = gs.getSubscribers(topic);
+      if (subscribers.some((p) => p.toString() === peerId)) {
+        subscribed.add(topic);
+      }
+    }
+    return subscribed;
+  }
+
+  private async handleRequest(stream: Stream, remotePeerId: string): Promise<void> {
+    // Get the topics this peer is actually subscribed to for authorization
+    const peerTopics = this.getPeerSubscriptions(remotePeerId);
+
     try {
       await pipe(
         stream,
@@ -111,7 +134,11 @@ export class InboxServer {
           for await (const msg of source) {
             const req = decode(msg.subarray());
             if (req.type === 'fetch') {
-              const messages = this.buffer.getForTopics(req.topics, req.since);
+              // Authorization: only serve topics the peer is subscribed to.
+              // This prevents arbitrary topic harvesting.
+              const authorizedTopics = req.topics.filter((t: string) => peerTopics.has(t));
+
+              const messages = this.buffer.getForTopics(authorizedTopics, req.since);
               const limited = messages.slice(0, Math.min(req.limit, 500));
 
               const response: InboxResponse = {

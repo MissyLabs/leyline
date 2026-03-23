@@ -272,29 +272,42 @@ describe('Integration: Peer exchange protocol', () => {
     await nodeB?.stop();
   });
 
-  it('peers exchange peer records via the protocol', async () => {
-    const pexA = new PeerExchange(nodeA, { exchangeIntervalMs: 60000 }); // Disable auto
+  it('peers exchange signed peer records via the protocol', async () => {
+    // Generate a keypair for signing peer records
+    const recordSigner = await generateKeypair();
+    const signerHex = publicKeyToHex(recordSigner.publicKey);
+
+    const pexA = new PeerExchange(nodeA, {
+      exchangeIntervalMs: 60000,
+      localPrivateKey: recordSigner.privateKey,
+      localPubkeyHex: signerHex,
+    });
     const pexB = new PeerExchange(nodeB, { exchangeIntervalMs: 60000 });
 
     await pexA.start();
     await pexB.start();
 
-    // Add some peer records to A
-    pexA.addPeer({
+    // Create and sign peer records before adding them
+    const record1 = {
       peerId: 'fake-peer-1',
       multiaddrs: ['/ip4/10.0.0.1/tcp/9876'],
-      pubkeyHex: 'aabbccdd',
+      pubkeyHex: signerHex,
       offeredTags: ['skill:code'],
       lastSeen: Date.now(),
-    });
-
-    pexA.addPeer({
+    };
+    const record2 = {
       peerId: 'fake-peer-2',
       multiaddrs: ['/ip4/10.0.0.2/tcp/9876'],
-      pubkeyHex: 'eeff0011',
+      pubkeyHex: signerHex,
       offeredTags: ['compute:gpu'],
       lastSeen: Date.now(),
-    });
+    };
+
+    // Sign the records so they'll be accepted by addPeerVerified
+    const signed1 = await pexA.signRecord(record1);
+    const signed2 = await pexA.signRecord(record2);
+    pexA.addPeer(signed1);
+    pexA.addPeer(signed2);
 
     expect(pexA.getPeerCount()).toBe(2);
     expect(pexB.getPeerCount()).toBe(0);
@@ -302,7 +315,7 @@ describe('Integration: Peer exchange protocol', () => {
     // B requests exchange from A
     const received = await pexB.exchangeWithPeer(nodeA.peerId.toString());
 
-    // B should now have A's peers
+    // B should now have A's signed peers
     expect(pexB.getPeerCount()).toBeGreaterThanOrEqual(1);
 
     await pexA.stop();

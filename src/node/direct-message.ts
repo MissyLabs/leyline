@@ -2,8 +2,9 @@ import type { Libp2p } from 'libp2p';
 import type { Stream } from '@libp2p/interface';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
+import { createHash } from 'node:crypto';
 import { encryptPayload, decryptPayload } from '../crypto/envelope.js';
-import { hexToPublicKey } from '../identity/keypair.js';
+import { hexToPublicKey, sign as edSign, verify as edVerify } from '../identity/keypair.js';
 
 /**
  * Direct Message Protocol for the Leyline network.
@@ -40,10 +41,16 @@ export interface DirectEnvelope {
   encrypted: boolean;
   /** XChaCha20 nonce (24 bytes), present when encrypted */
   nonce?: Uint8Array;
-  /** Sender's Ed25519 public key hex, present when encrypted (needed for decryption) */
+  /** Sender's Ed25519 public key hex (needed for trust checks and decryption) */
   senderPubkeyHex?: string;
   /** Peer IDs that have already handled this envelope (prevents relay loops) */
   visitedPeers?: string[];
+  /**
+   * Ed25519 signature over the canonical envelope fields, hex-encoded.
+   * Proves the envelope was created by the holder of senderPubkeyHex.
+   * Prevents spoofing of sender identity in DMs and relay hops.
+   */
+  envelopeSignature?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +68,26 @@ interface WireEnvelope {
   nonce?: string;
   senderPubkeyHex?: string;
   visitedPeers?: string[];
+  envelopeSignature?: string;
+}
+
+/**
+ * Compute the canonical signable bytes for an envelope.
+ * Covers all fields that identify the sender and intent — payload hash,
+ * target, sender, timestamp. Relay fields (hopsRemaining, visitedPeers)
+ * are excluded since they change during relay.
+ */
+function computeEnvelopeSignableBytes(wire: WireEnvelope): Uint8Array {
+  const payloadHash = createHash('sha256').update(wire.payload).digest('hex');
+  const canonical = [
+    payloadHash,
+    wire.targetPeerId,
+    wire.senderPeerId,
+    String(wire.timestamp),
+    wire.senderPubkeyHex ?? '',
+    String(wire.encrypted),
+  ].join('|');
+  return new TextEncoder().encode(canonical);
 }
 
 function encodeEnvelope(envelope: DirectEnvelope): Uint8Array {
@@ -75,6 +102,7 @@ function encodeEnvelope(envelope: DirectEnvelope): Uint8Array {
     nonce: envelope.nonce ? Buffer.from(envelope.nonce).toString('base64') : undefined,
     senderPubkeyHex: envelope.senderPubkeyHex,
     visitedPeers: envelope.visitedPeers,
+    envelopeSignature: envelope.envelopeSignature,
   };
   return new TextEncoder().encode(JSON.stringify(wire));
 }
@@ -110,6 +138,7 @@ function decodeEnvelope(data: Uint8Array): DirectEnvelope {
     nonce: wire.nonce ? new Uint8Array(Buffer.from(wire.nonce, 'base64')) : undefined,
     senderPubkeyHex: typeof wire.senderPubkeyHex === 'string' ? wire.senderPubkeyHex : undefined,
     visitedPeers,
+    envelopeSignature: typeof wire.envelopeSignature === 'string' ? wire.envelopeSignature : undefined,
   };
 }
 
@@ -239,6 +268,23 @@ export class DirectMessageProtocol {
       senderPubkeyHex: this.opts.localPubkeyHex,
       visitedPeers: [localPeerId],
     };
+
+    // Sign the envelope to prove sender identity (prevents spoofing)
+    if (this.opts.localPrivateKey && this.opts.localPubkeyHex) {
+      const wireForSig: WireEnvelope = {
+        payload: Buffer.from(finalPayload).toString('base64'),
+        targetPeerId,
+        senderPeerId: localPeerId,
+        timestamp: envelope.timestamp,
+        isRelay: false,
+        hopsRemaining: 0,
+        encrypted,
+        senderPubkeyHex: this.opts.localPubkeyHex,
+      };
+      const signable = computeEnvelopeSignableBytes(wireForSig);
+      const sig = await edSign(this.opts.localPrivateKey, signable);
+      envelope.envelopeSignature = Buffer.from(sig).toString('hex');
+    }
 
     // 1. Try direct delivery.
     if (await this.deliverDirect(targetPeerId, envelope)) {
@@ -380,6 +426,35 @@ export class DirectMessageProtocol {
             }
 
             if (envelope.targetPeerId === localPeerId) {
+              // Verify envelope signature — proves senderPubkeyHex is authentic
+              if (envelope.senderPubkeyHex && envelope.envelopeSignature) {
+                try {
+                  const senderPub = hexToPublicKey(envelope.senderPubkeyHex);
+                  const wireForVerify: WireEnvelope = {
+                    payload: Buffer.from(envelope.payload).toString('base64'),
+                    targetPeerId: envelope.targetPeerId,
+                    senderPeerId: envelope.senderPeerId,
+                    timestamp: envelope.timestamp,
+                    isRelay: envelope.isRelay,
+                    hopsRemaining: envelope.hopsRemaining,
+                    encrypted: envelope.encrypted,
+                    senderPubkeyHex: envelope.senderPubkeyHex,
+                  };
+                  const signable = computeEnvelopeSignableBytes(wireForVerify);
+                  const sigBytes = new Uint8Array(Buffer.from(envelope.envelopeSignature, 'hex'));
+                  const sigValid = await edVerify(senderPub, sigBytes, signable);
+                  if (!sigValid) {
+                    continue; // Forged envelope — drop
+                  }
+                } catch {
+                  continue; // Malformed key or signature — drop
+                }
+              } else if (this.opts.trustChecker) {
+                // No signature on the envelope — reject if trust checking is enabled.
+                // Without a signature, senderPubkeyHex is attacker-controlled.
+                continue;
+              }
+
               // Trust validation for direct messages
               if (this.opts.trustChecker) {
                 // Reject DMs without sender identity — can't validate trust

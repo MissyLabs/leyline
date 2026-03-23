@@ -201,16 +201,17 @@ export class PeerExchange {
     }
   }
 
-  /** Add or update a peer after async signature verification. Returns true if accepted. */
+  /** Add or update a peer after signature verification. Returns true if accepted. */
   async addPeerVerified(record: PeerRecord): Promise<boolean> {
     if (record.peerId === this.localPeerId) return false;
     if (!this.isValidRecord(record)) return false;
 
-    // If the record has a signature, verify it
-    if (record.signature) {
-      const valid = await PeerExchange.verifyRecord(record);
-      if (!valid) return false;
-    }
+    // Require a valid signature on all remote peer records.
+    // Without this, a malicious peer can inject fake addresses into the peer table
+    // and redirect traffic to attacker-controlled nodes.
+    if (!record.signature || !record.pubkeyHex) return false;
+    const valid = await PeerExchange.verifyRecord(record);
+    if (!valid) return false;
 
     const isNew = !this.peerTable.has(record.peerId);
     this.addPeer(record);
