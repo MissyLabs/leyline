@@ -18,6 +18,8 @@ import { SharedLedger } from '../ledger/shared-ledger.js';
 import { LedgerSync } from '../ledger/ledger-sync.js';
 import { PeerExchange } from './peer-exchange.js';
 import { InboxClient } from './inbox-protocol.js';
+import { HandshakeProtocol } from './handshake-protocol.js';
+import { LEYLINE_VERSION } from '../config/compat.js';
 import { DirectMessageProtocol, type DirectEnvelope, type DirectMessageTrustChecker } from './direct-message.js';
 import { ServiceRegistry, type ServiceDescriptor } from '../discovery/service-registry.js';
 import { DiscoveryProtocol } from '../discovery/discovery-protocol.js';
@@ -60,6 +62,7 @@ export class MagicNode {
   protected serviceRegistry: ServiceRegistry;
   protected discoveryProtocol: DiscoveryProtocol | null = null;
   protected inboxClient: InboxClient | null = null;
+  protected handshake: HandshakeProtocol | null = null;
   protected ledgerConsensus: LedgerConsensus;
   protected publicKey: Uint8Array = new Uint8Array(0);
   protected privateKey: Uint8Array = new Uint8Array(0);
@@ -143,6 +146,16 @@ export class MagicNode {
 
     this.libp2p = await createLibp2p(libp2pOptions as Parameters<typeof createLibp2p>[0]);
 
+    // Start version handshake protocol
+    this.handshake = new HandshakeProtocol(this.libp2p, {
+      onPeerVersion: (peerId, version, result) => {
+        if (!result.compatible) {
+          console.warn(`[Magic] Incompatible peer ${peerId.slice(0, 16)}... (v${version}) — messages will be rejected`);
+        }
+      },
+    });
+    await this.handshake.start();
+
     // Set up tag-based pub/sub
     const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
     this.tagPubSub = new TagPubSub(gs);
@@ -196,6 +209,7 @@ export class MagicNode {
 
     this.peerDisconnectHandler = (evt: CustomEvent) => {
       const peerId = evt.detail.toString();
+      this.handshake?.removePeer(peerId);
       this.events.onPeerDisconnected?.(peerId);
     };
     this.libp2p.addEventListener('peer:disconnect', this.peerDisconnectHandler);
@@ -285,7 +299,7 @@ export class MagicNode {
 
     const fingerprint = getFingerprint(this.publicKey);
     const addrs = this.libp2p.getMultiaddrs().map((a) => a.toString());
-    console.log(`[Magic] Node started: ${fingerprint}`);
+    console.log(`[Magic] Node started: ${fingerprint} (v${LEYLINE_VERSION})`);
     console.log(`[Magic] Listening on: ${addrs.join(', ')}`);
     console.log(`[Magic] Subscribed tags: ${this.config.subscribedTags.join(', ') || '(none)'}`);
     if (this.config.advertisedTags.length > 0) {
@@ -298,6 +312,7 @@ export class MagicNode {
       clearInterval(this.reAdvertiseTimer);
       this.reAdvertiseTimer = null;
     }
+    await this.handshake?.stop();
     await this.discoveryProtocol?.stop();
     await this.directMessage?.stop();
     await this.peerExchange?.stop();
@@ -614,6 +629,21 @@ export class MagicNode {
       await new Promise((r) => setTimeout(r, 500));
     }
     return this.getPeerCount();
+  }
+
+  /** Get this node's Leyline version. */
+  getVersion(): string {
+    return LEYLINE_VERSION;
+  }
+
+  /** Get version distribution of connected peers: version → count. */
+  getVersionStats(): Map<string, number> {
+    return this.handshake?.getVersionStats() ?? new Map();
+  }
+
+  /** Get the handshake protocol instance (for advanced version queries). */
+  getHandshake(): HandshakeProtocol | null {
+    return this.handshake;
   }
 
   /** Get this node's public key hex. */

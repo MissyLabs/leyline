@@ -194,9 +194,19 @@ export class SeedNode extends MagicNode {
   }
 
   private startPeerExchange(): void {
-    // Broadcast known peers every 30 seconds
+    // Broadcast known peers every 30 seconds + log version stats
     this.peerExchangeTimer = setInterval(() => {
       this.pruneStale();
+
+      // Log version distribution every cycle
+      const stats = this.getVersionStats();
+      if (stats.size > 0) {
+        const parts: string[] = [];
+        for (const [version, count] of stats) {
+          parts.push(`v${version}: ${count}`);
+        }
+        console.log(`[Seed] Version stats: ${parts.join(' | ')} (${this.getPeerCount()} peers)`);
+      }
 
       const peerList = this.getKnownPeers();
       if (peerList.length > 0) {

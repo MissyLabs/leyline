@@ -82,6 +82,22 @@ export {
   DISCOVERY_PROTOCOL,
 } from './discovery/discovery-protocol.js';
 
+// Version Compatibility
+export {
+  LEYLINE_VERSION,
+  COMPAT,
+  checkCompat,
+  semverGte,
+  semverLt,
+  type CompatMatrix,
+  type CompatResult,
+} from './config/compat.js';
+export {
+  HandshakeProtocol,
+  HANDSHAKE_PROTOCOL,
+  type HandshakeEvents,
+} from './node/handshake-protocol.js';
+
 // Store-and-Forward
 export { MessageBuffer, type BufferedMessage, type MessageBufferConfig } from './node/message-buffer.js';
 export { InboxServer, InboxClient, INBOX_PROTOCOL } from './node/inbox-protocol.js';
