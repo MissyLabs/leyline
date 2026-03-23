@@ -1,6 +1,7 @@
 import { MagicNode } from './node/magic-node.js';
 import { SeedNode } from './node/seed-node.js';
 import { type MagicConfig, DEFAULT_SEED_NODES } from './config/config.js';
+import { publicKeyToHex } from './identity/keypair.js';
 
 const args = process.argv.slice(2);
 const isSeed = args.includes('--seed');
@@ -48,7 +49,36 @@ async function main() {
   await node.start();
 
   if (!isSeed) {
-    console.log('[Magic] Node is ready. Use as a library or extend with custom handlers.');
+    // Open all subscribed tags so messages from anyone can arrive
+    for (const tag of tags) {
+      await node.allowTagOpen(tag);
+    }
+
+    // Register receive handlers for all subscribed tags — log to stdout
+    for (const tag of tags) {
+      node.onTag(tag, (msg, t) => {
+        const sender = publicKeyToHex(msg.senderPubkey).slice(0, 16);
+        let payload: string;
+        try {
+          payload = new TextDecoder().decode(msg.payload);
+        } catch {
+          payload = `<binary ${msg.payload.length} bytes>`;
+        }
+        console.log(`[${t}] ${sender}...: ${payload}`);
+      });
+    }
+
+    // Wait for mesh formation
+    const peers = await node.waitForPeers(1, 10_000);
+
+    console.log(`[Magic] Node is ready — ${peers} peer(s) connected`);
+    console.log(`[Magic] Listening for messages on: ${tags.join(', ') || '(no tags)'}`);
+    console.log(`[Magic] Open tags: ${node.getOpenTags().join(', ') || '(none)'}`);
+
+    // Health probe every 30 seconds
+    setInterval(() => {
+      console.log(`[health] peers: ${node.getPeerCount()} | open tags: ${node.getOpenTags().join(', ')} | paused: ${node.isPaused()}`);
+    }, 30_000);
   }
 }
 
