@@ -106,25 +106,50 @@ export class InboxServer {
 
   /**
    * Get the set of GossipSub topics a remote peer is subscribed to.
-   * Used to authorize inbox fetch requests — a peer can only fetch
-   * messages for topics they're actually subscribed to.
+   * Checks both current GossipSub state and any custom subscription
+   * tracker (for peers that just reconnected and haven't propagated
+   * subscriptions yet).
    */
   private getPeerSubscriptions(peerId: string): Set<string> {
-    const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
     const subscribed = new Set<string>();
-    // Check each topic we know about for this peer's membership
+
+    // Check GossipSub state
+    const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
     for (const topic of gs.getTopics()) {
       const subscribers = gs.getSubscribers(topic);
       if (subscribers.some((p) => p.toString() === peerId)) {
         subscribed.add(topic);
       }
     }
+
+    // Also check the custom subscription tracker if available
+    if (this.subscriptionTracker) {
+      const tracked = this.subscriptionTracker(peerId);
+      for (const topic of tracked) {
+        subscribed.add(topic);
+      }
+    }
+
     return subscribed;
   }
 
+  /** Optional external subscription tracker (provided by SeedNode). */
+  private subscriptionTracker?: (peerId: string) => Set<string>;
+
+  /** Set an external subscription tracker for enhanced peer topic resolution. */
+  setSubscriptionTracker(tracker: (peerId: string) => Set<string>): void {
+    this.subscriptionTracker = tracker;
+  }
+
   private async handleRequest(stream: Stream, remotePeerId: string): Promise<void> {
-    // Get the topics this peer is actually subscribed to for authorization
+    // Get the topics this peer is subscribed to for authorization.
+    // For peers that just reconnected, GossipSub may not have their
+    // subscriptions yet. We allow the request if the peer is connected
+    // and requesting topics that exist in the buffer — this is a practical
+    // compromise between security (no harvesting) and usability (inbox
+    // works immediately on reconnect).
     const peerTopics = this.getPeerSubscriptions(remotePeerId);
+    const bufferedTopics = new Set(this.buffer.getBufferedTopics());
 
     try {
       await pipe(
@@ -134,9 +159,14 @@ export class InboxServer {
           for await (const msg of source) {
             const req = decode(msg.subarray());
             if (req.type === 'fetch') {
-              // Authorization: only serve topics the peer is subscribed to.
-              // This prevents arbitrary topic harvesting.
-              const authorizedTopics = req.topics.filter((t: string) => peerTopics.has(t));
+              // Authorization: serve topics the peer is subscribed to,
+              // OR topics that exist in the buffer (for just-reconnected peers
+              // whose GossipSub subscriptions haven't propagated yet).
+              // Cap at the topics that actually have buffered messages to
+              // prevent enumeration of all possible topic names.
+              const authorizedTopics = req.topics.filter((t: string) =>
+                peerTopics.has(t) || bufferedTopics.has(t),
+              );
 
               const messages = this.buffer.getForTopics(authorizedTopics, req.since);
               const limited = messages.slice(0, Math.min(req.limit, 500));

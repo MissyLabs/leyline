@@ -5,6 +5,7 @@ import { MagicNode } from './magic-node.js';
 import type { MagicConfig } from '../config/config.js';
 import { MessageBuffer } from './message-buffer.js';
 import { InboxServer } from './inbox-protocol.js';
+import { publicKeyToHex } from '../identity/keypair.js';
 
 interface StoredPeer {
   peerId: string;
@@ -22,11 +23,14 @@ interface StoredPeer {
 export class SeedNode extends MagicNode {
   private knownPeers = new Map<string, { multiaddrs: string[]; lastSeen: number }>();
   private peerExchangeTimer: ReturnType<typeof setInterval> | null = null;
+  private ledgerConfirmTimer: ReturnType<typeof setInterval> | null = null;
   private mirroredTopics = new Set<string>();
   private peerDb: Level<string, string> | null = null;
   /** Message buffer for store-and-forward delivery to offline peers. */
   private messageBuffer: MessageBuffer = new MessageBuffer();
   private inboxServer: InboxServer | null = null;
+  /** Track which GossipSub topics each peer is subscribed to, for topic-addressed mailbox delivery. */
+  private peerSubscriptions = new Map<string, Set<string>>();
 
   constructor(config: Partial<MagicConfig>) {
     super(
@@ -67,6 +71,11 @@ export class SeedNode extends MagicNode {
 
     // Start inbox server so reconnecting peers can fetch missed messages
     this.inboxServer = new InboxServer(this.libp2p!, this.messageBuffer);
+    // Provide the subscription tracker so the inbox server can serve
+    // topics for peers that just reconnected (before GossipSub propagates)
+    this.inboxServer.setSubscriptionTracker((peerId: string) =>
+      this.peerSubscriptions.get(peerId) ?? new Set(),
+    );
     await this.inboxServer.start();
     console.log(`[Seed] Inbox server active — buffering messages for offline peers`);
 
@@ -80,12 +89,25 @@ export class SeedNode extends MagicNode {
     // so they can relay GossipSub messages between bots that aren't directly connected.
     // Without this, messages have no relay path through seeds.
     this.startTopicMirroring();
+
+    // Track per-peer topic subscriptions for topic-addressed mailbox delivery
+    this.startSubscriptionTracking();
+
+    // Seeds actively participate in ledger consensus — confirm pending entries
+    // and broadcast confirmed entries to other seeds. This ensures quorum is
+    // reached even when the submitting bot disconnects immediately.
+    this.startLedgerParticipation();
+    console.log('[Seed] Ledger participation active — will auto-confirm entries');
   }
 
   async stop(): Promise<void> {
     if (this.peerExchangeTimer) {
       clearInterval(this.peerExchangeTimer);
       this.peerExchangeTimer = null;
+    }
+    if (this.ledgerConfirmTimer) {
+      clearInterval(this.ledgerConfirmTimer);
+      this.ledgerConfirmTimer = null;
     }
     this.messageBuffer.stop();
     await this.inboxServer?.stop();
@@ -251,5 +273,104 @@ export class SeedNode extends MagicNode {
     });
 
     console.log('[Seed] Topic mirroring active — will relay all peer topics');
+  }
+
+  /**
+   * Track which GossipSub topics each peer subscribes to.
+   * Used by the inbox server to deliver topic-addressed messages
+   * to the right peers when they reconnect.
+   */
+  private startSubscriptionTracking(): void {
+    if (!this.libp2p) return;
+
+    const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
+
+    gs.addEventListener('subscription-change', (evt: CustomEvent) => {
+      const { peerId, subscriptions } = evt.detail;
+      const peerIdStr = peerId?.toString();
+      if (!peerIdStr || !Array.isArray(subscriptions)) return;
+
+      let subs = this.peerSubscriptions.get(peerIdStr);
+      if (!subs) {
+        subs = new Set();
+        this.peerSubscriptions.set(peerIdStr, subs);
+      }
+
+      for (const sub of subscriptions) {
+        const topic = (sub as { topic: string; subscribe: boolean }).topic;
+        const subscribing = (sub as { topic: string; subscribe: boolean }).subscribe;
+        if (subscribing) {
+          subs.add(topic);
+        } else {
+          subs.delete(topic);
+        }
+      }
+    });
+  }
+
+  /**
+   * Seeds actively participate in ledger consensus:
+   *
+   * 1. Periodically check for pending consensus proposals and add the
+   *    seed's own confirmation. Since there are 4 seeds and quorum is 2,
+   *    a single seed confirmation + the submitter's confirmation = quorum.
+   *
+   * 2. When an entry is confirmed, immediately broadcast it to all
+   *    connected peers (other seeds + any online bots) so the confirmed
+   *    entry propagates quickly.
+   *
+   * This means a bot can submit a ledger entry, disconnect immediately,
+   * and the seeds will carry the entry to quorum without the bot needing
+   * to stay online.
+   */
+  private startLedgerParticipation(): void {
+    const localPubkeyHex = publicKeyToHex(this.publicKey);
+    const consensus = this.ledgerConsensus;
+    const ledgerSync = this.ledgerSync;
+    const sharedLedger = this.sharedLedger;
+
+    // Every 5 seconds, check for pending proposals and confirm them
+    this.ledgerConfirmTimer = setInterval(async () => {
+      try {
+        const pending = consensus.getPendingProposals();
+        if (pending.length === 0) return;
+
+        for (const proposal of pending) {
+          // Add our own confirmation
+          const reached = consensus.addConfirmation(proposal.hash, localPubkeyHex);
+
+          if (reached) {
+            // Quorum reached — commit to the shared ledger
+            const committed = consensus.getProposal(proposal.hash);
+            if (committed) {
+              await sharedLedger.submit(
+                committed.data,
+                committed.submitterPubkey,
+                committed.signature,
+              );
+
+              const count = await sharedLedger.getEntryCount();
+              console.log(`[Seed] Ledger: confirmed entry (${count} total)`);
+
+              // Immediately broadcast the confirmed entry to all peers
+              if (ledgerSync) {
+                const entry = await sharedLedger.getLatest();
+                if (entry) {
+                  await ledgerSync.broadcastEntry(entry);
+                  console.log(`[Seed] Ledger: broadcast confirmed entry to peers`);
+                }
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[Seed] Ledger participation error:', err);
+      }
+    }, 5_000);
+  }
+
+  /** Get the topic subscriptions for a specific peer (for inbox authorization). */
+  getPeerSubscriptions(peerId: string): Set<string> {
+    return this.peerSubscriptions.get(peerId) ?? new Set();
   }
 }
