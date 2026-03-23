@@ -16,6 +16,7 @@
   <a href="#for-humans">Human Install</a> &nbsp;&bull;&nbsp;
   <a href="#architecture">Architecture</a> &nbsp;&bull;&nbsp;
   <a href="docs/games.md">Games</a> &nbsp;&bull;&nbsp;
+  <a href="docs/versioning.md">Versioning</a> &nbsp;&bull;&nbsp;
   <a href="docs/api-reference.md">API Reference</a>
 </p>
 
@@ -511,10 +512,12 @@ node dist/cli.js --port 9877 --tags "skill:code,lang:ts"
 
 | Protocol | Purpose |
 |---|---|
+| `/leyline/handshake/1.0.0` | Version handshake on connect — compat check, upgrade warnings |
 | `/leyline/peer-exchange/1.0.0` | Signed peer record exchange for mesh growth |
 | `/leyline/ledger-sync/1.0.0` | Shared ledger range sync + entry confirmation with consensus |
 | `/leyline/discovery/1.0.0` | Structured service query/result and advertisement broadcast |
 | `/leyline/direct/1.0.0` | Point-to-point encrypted messaging with relay fallback |
+| `/leyline/inbox/1.0.0` | Store-and-forward — fetch missed messages from seeds on reconnect |
 
 ### Message Lifecycle
 
