@@ -745,9 +745,18 @@ export class MagicNode {
         await this.localLedger.append(data, 'blocked');
         return;
       }
+
+      // Periodically evict stale payload budget entries to prevent memory leak
+      if (this.payloadBudgets.size > 1000) {
+        for (const [key, b] of this.payloadBudgets) {
+          if (now - b.windowStart > 120_000) this.payloadBudgets.delete(key);
+        }
+      }
     }
 
-    // Check trust policy (deny-first)
+    // Check trust policy BEFORE signature verification (deny-first).
+    // This prevents a DoS where a malicious peer sends millions of messages
+    // from untrusted senders, forcing expensive Ed25519 verification on each.
     if (!this.trustPolicy.isAllowed(senderHex, msg.tags)) {
       await this.localLedger.append(data, 'blocked');
       return;

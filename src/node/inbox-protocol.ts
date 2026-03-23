@@ -60,7 +60,19 @@ function encode(msg: InboxWireMessage): Uint8Array {
 }
 
 function decode(data: Uint8Array): InboxWireMessage {
-  return JSON.parse(new TextDecoder().decode(data));
+  const parsed = JSON.parse(new TextDecoder().decode(data));
+  if (typeof parsed.type !== 'string') {
+    throw new TypeError('Malformed InboxWireMessage');
+  }
+  if (parsed.type === 'fetch') {
+    if (!Array.isArray(parsed.topics)) parsed.topics = [];
+    // Cap and deduplicate topics to prevent DoS via oversized arrays
+    const unique = [...new Set<string>(parsed.topics.filter((t: unknown) => typeof t === 'string'))];
+    parsed.topics = unique.slice(0, 100);
+    parsed.since = typeof parsed.since === 'number' ? parsed.since : 0;
+    parsed.limit = typeof parsed.limit === 'number' ? Math.min(Math.max(1, parsed.limit), 500) : 200;
+  }
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------

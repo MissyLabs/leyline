@@ -139,7 +139,17 @@ function encode(msg: AnySyncMessage): Uint8Array {
 }
 
 function decode(data: Uint8Array): AnySyncMessage {
-  return JSON.parse(new TextDecoder().decode(data));
+  const parsed = JSON.parse(new TextDecoder().decode(data));
+  if (typeof parsed.type !== 'string' || typeof parsed.senderPeerId !== 'string' ||
+      typeof parsed.timestamp !== 'number') {
+    throw new TypeError('Malformed SyncMessage');
+  }
+  // Sanitize numeric fields to prevent NaN/Infinity
+  if (parsed.type === 'range-request') {
+    parsed.startIndex = Math.max(0, Math.floor(parsed.startIndex ?? 0));
+    parsed.endIndex = Math.max(0, Math.floor(parsed.endIndex ?? 0));
+  }
+  return parsed;
 }
 
 export interface LedgerSyncEvents {

@@ -93,17 +93,23 @@ function decodeEnvelope(data: Uint8Array): DirectEnvelope {
     throw new TypeError('Malformed DirectEnvelope: missing or incorrectly typed field(s)');
   }
 
+  // Validate and sanitize fields to prevent type confusion from malicious peers
+  const hopsRemaining = Math.max(0, Math.min(wire.hopsRemaining, 10));
+  const visitedPeers = Array.isArray(wire.visitedPeers)
+    ? wire.visitedPeers.filter((p): p is string => typeof p === 'string').slice(0, 50)
+    : [];
+
   return {
     payload: new Uint8Array(Buffer.from(wire.payload, 'base64')),
     targetPeerId: wire.targetPeerId,
     senderPeerId: wire.senderPeerId,
     timestamp: wire.timestamp,
     isRelay: wire.isRelay,
-    hopsRemaining: wire.hopsRemaining,
+    hopsRemaining,
     encrypted: wire.encrypted ?? false,
     nonce: wire.nonce ? new Uint8Array(Buffer.from(wire.nonce, 'base64')) : undefined,
-    senderPubkeyHex: wire.senderPubkeyHex,
-    visitedPeers: wire.visitedPeers ?? [],
+    senderPubkeyHex: typeof wire.senderPubkeyHex === 'string' ? wire.senderPubkeyHex : undefined,
+    visitedPeers,
   };
 }
 
@@ -374,8 +380,11 @@ export class DirectMessageProtocol {
             }
 
             if (envelope.targetPeerId === localPeerId) {
-              // Validate against trust policy if a checker is configured
-              if (this.opts.trustChecker && envelope.senderPubkeyHex) {
+              // Trust validation for direct messages
+              if (this.opts.trustChecker) {
+                // Reject DMs without sender identity — can't validate trust
+                if (!envelope.senderPubkeyHex) continue;
+
                 const checker = this.opts.trustChecker;
                 // Dedup check using a hash of sender+timestamp+target as envelope ID
                 const envelopeId = `dm:${envelope.senderPubkeyHex}:${envelope.timestamp}:${envelope.targetPeerId}`;

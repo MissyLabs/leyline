@@ -38,7 +38,14 @@ function encode(msg: PeerExchangeMessage): Uint8Array {
 }
 
 function decode(data: Uint8Array): PeerExchangeMessage {
-  return JSON.parse(new TextDecoder().decode(data));
+  const parsed = JSON.parse(new TextDecoder().decode(data));
+  if (typeof parsed.type !== 'string' || !Array.isArray(parsed.peers) ||
+      typeof parsed.senderPeerId !== 'string' || typeof parsed.timestamp !== 'number') {
+    throw new TypeError('Malformed PeerExchangeMessage');
+  }
+  // Cap incoming peers array to prevent DoS via oversized responses
+  if (parsed.peers.length > 200) parsed.peers = parsed.peers.slice(0, 200);
+  return parsed;
 }
 
 /**

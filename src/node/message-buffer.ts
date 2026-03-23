@@ -27,6 +27,8 @@ export interface MessageBufferConfig {
   maxPerTopic: number;
   /** Maximum total messages across all topics. @defaultValue 10000 */
   maxTotal: number;
+  /** Maximum size in bytes for a single buffered message. Larger messages are rejected. @defaultValue 262144 (256KB) */
+  maxMessageBytes: number;
   /** TTL in milliseconds. Messages older than this are pruned. @defaultValue 300_000 (5 min) */
   ttlMs: number;
   /** How often to run the prune cycle. @defaultValue 30_000 (30s) */
@@ -36,6 +38,7 @@ export interface MessageBufferConfig {
 const DEFAULT_BUFFER_CONFIG: MessageBufferConfig = {
   maxPerTopic: 500,
   maxTotal: 10_000,
+  maxMessageBytes: 262_144,
   ttlMs: 5 * 60_000,
   pruneIntervalMs: 30_000,
 };
@@ -77,6 +80,9 @@ export class MessageBuffer {
   push(topic: string, data: Uint8Array, id: string): boolean {
     // Dedup
     if (this.seenIds.has(id)) return false;
+
+    // Reject oversized messages
+    if (data.length > this.config.maxMessageBytes) return false;
 
     // Global cap — drop oldest across all topics
     if (this.totalCount >= this.config.maxTotal) {

@@ -74,9 +74,13 @@ function encodeMsg(msg: DiscoveryWireMessage): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(msg));
 }
 
-/** Decode UTF-8 JSON bytes back to a wire message. */
+/** Decode UTF-8 JSON bytes back to a wire message with validation. */
 function decodeMsg(data: Uint8Array): DiscoveryWireMessage {
-  return JSON.parse(new TextDecoder().decode(data)) as DiscoveryWireMessage;
+  const parsed = JSON.parse(new TextDecoder().decode(data));
+  if (typeof parsed.kind !== 'string') {
+    throw new TypeError('Malformed DiscoveryWireMessage: missing kind');
+  }
+  return parsed as DiscoveryWireMessage;
 }
 
 /** Generate a short random request-correlation ID. */
@@ -392,8 +396,12 @@ export class DiscoveryProtocol {
             const msg = decodeMsg(chunk.subarray());
 
             if (msg.kind === 'query') {
-              // Search local registry and respond.
-              const matches = self.registry.query(msg.query);
+              // Search local registry and respond, capped to prevent amplification
+              const cappedQuery = {
+                ...msg.query,
+                limit: Math.min(msg.query.limit ?? 100, 100),
+              };
+              const matches = self.registry.query(cappedQuery);
 
               const result: DiscoveryResult = {
                 services: matches,
