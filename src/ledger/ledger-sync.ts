@@ -469,6 +469,8 @@ export class LedgerSync {
       proposal.submitterPubkey,
       proposal.signature,
     );
+    const count = await this.ledger.getEntryCount();
+    console.log(`[LedgerSync] Committed entry to ledger (${count} total, ${proposal.confirmations.size} confirmations)`);
     return true;
   }
 
