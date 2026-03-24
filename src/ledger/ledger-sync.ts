@@ -521,6 +521,7 @@ export class LedgerSync {
                 const push = syncMsg as PushEntry;
                 const entry = deserializeEntry(push.entry);
                 const valid = await self.validateReceivedEntry(entry);
+                console.log(`[LedgerSync] Received push-entry #${entry.index} (valid: ${valid}) from ${push.senderPeerId.slice(0, 16)}...`);
 
                 if (valid) {
                   // Propose through consensus and add our own confirmation

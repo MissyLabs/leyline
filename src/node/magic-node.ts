@@ -629,7 +629,9 @@ export class MagicNode {
       // the push-entry, add their confirmation, and the entry gets committed
       // on the seed side. The bot doesn't need to stay online for this.
       const submitted = await this.sharedLedger.submit(data, this.publicKey, signature);
+      console.log(`[Magic] Ledger: submitted entry #${submitted.index}, broadcasting to ${this.libp2p?.getPeers().length ?? 0} peers...`);
       await this.ledgerSync.broadcastEntry(submitted);
+      console.log(`[Magic] Ledger: broadcast complete`);
     } else {
       // Fallback for nodes without ledger sync (e.g. before start())
       await this.sharedLedger.submit(data, this.publicKey, signature);
