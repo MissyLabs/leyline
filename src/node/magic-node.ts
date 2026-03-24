@@ -276,15 +276,29 @@ export class MagicNode {
     });
     await this.directMessage.start();
 
-    // Start discovery protocol (with trust filtering)
+    // Start discovery protocol.
+    // For discovery trust: if the node has open tags, we're permissive with service
+    // advertisements (signed descriptors from anyone are accepted). For seed nodes,
+    // we skip the trust check entirely — seeds relay all signed advertisements.
+    // For regular nodes with no open tags, we filter by the trust policy.
     const localPeerId = this.libp2p.peerId.toString();
+    const discoveryTrust = this.config.isSeedNode
+      ? undefined  // Seeds accept all signed advertisements (they're relay infrastructure)
+      : { isAllowed: (pubkeyHex: string) => {
+          // Allow if the agent is explicitly trusted
+          if (this.trustPolicy.isAllowed(pubkeyHex, [])) return true;
+          // Allow if any tags are open (permissive discovery mode)
+          if (this.trustPolicy.getOpenTags().length > 0) return true;
+          // Deny-first default
+          return false;
+        }};
     this.discoveryProtocol = new DiscoveryProtocol(
       this.libp2p,
       this.serviceRegistry,
       publicKeyToHex(this.publicKey),
       localPeerId,
       this.privateKey,
-      { isAllowed: (pubkeyHex: string) => this.trustPolicy.isAllowed(pubkeyHex, []) },
+      discoveryTrust,
     );
     await this.discoveryProtocol.start();
 
@@ -610,19 +624,12 @@ export class MagicNode {
         [publicKeyToHex(this.publicKey)],
       );
 
-      // ALWAYS broadcast to peers (especially seeds) so they can add their
-      // confirmation and reach quorum. Previously this only fired when quorum
-      // was reached locally, but with quorum=2 a single bot can never reach
-      // quorum alone — seeds need to receive the entry to confirm it.
-      // Submit locally first (so we have something to broadcast), then push.
-      const entry = await this.sharedLedger.getLatest();
-      if (!entry) {
-        // No committed entry yet — submit directly so we have something to broadcast
-        const submitted = await this.sharedLedger.submit(data, this.publicKey, signature);
-        await this.ledgerSync.broadcastEntry(submitted);
-      } else {
-        await this.ledgerSync.broadcastEntry(entry);
-      }
+      // Always submit directly to the local ledger AND broadcast to seeds.
+      // With quorum=2, a single bot can't reach quorum alone. Seeds receive
+      // the push-entry, add their confirmation, and the entry gets committed
+      // on the seed side. The bot doesn't need to stay online for this.
+      const submitted = await this.sharedLedger.submit(data, this.publicKey, signature);
+      await this.ledgerSync.broadcastEntry(submitted);
     } else {
       // Fallback for nodes without ledger sync (e.g. before start())
       await this.sharedLedger.submit(data, this.publicKey, signature);
