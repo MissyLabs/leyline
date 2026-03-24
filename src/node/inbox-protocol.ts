@@ -67,8 +67,9 @@ function decode(data: Uint8Array): InboxWireMessage {
   }
   if (parsed.type === 'fetch') {
     if (!Array.isArray(parsed.topics)) parsed.topics = [];
-    // Cap and deduplicate topics to prevent DoS via oversized arrays
-    const unique = [...new Set<string>(parsed.topics.filter((t: unknown) => typeof t === 'string'))];
+    // Pre-cap BEFORE Set construction to prevent O(n) processing of huge arrays
+    const raw = parsed.topics.slice(0, 200).filter((t: unknown) => typeof t === 'string');
+    const unique = [...new Set<string>(raw)];
     parsed.topics = unique.slice(0, 100);
     parsed.since = typeof parsed.since === 'number' ? parsed.since : 0;
     parsed.limit = typeof parsed.limit === 'number' ? Math.min(Math.max(1, parsed.limit), 500) : 200;

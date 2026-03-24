@@ -92,6 +92,8 @@ export class SharedLedger {
   private db: Level<string, string>;
   private currentIndex = 0;
   private latestHash: Uint8Array = new Uint8Array(0);
+  /** Serialization lock for submit() to prevent concurrent hash chain corruption. */
+  private submitLock: Promise<void> = Promise.resolve();
 
   constructor(dataDir: string) {
     this.db = new Level(dataDir, { valueEncoding: 'utf8' });
@@ -127,8 +129,27 @@ export class SharedLedger {
 
   /**
    * Submit a new provable entry to the shared ledger.
+   * Serialized to prevent concurrent writes from corrupting the hash chain.
    */
   async submit(
+    data: Uint8Array,
+    submitterPubkey: Uint8Array,
+    signature: Uint8Array,
+  ): Promise<SharedLedgerEntry> {
+    // Chain onto the lock so concurrent calls execute sequentially
+    const prev = this.submitLock;
+    let resolve!: () => void;
+    this.submitLock = new Promise<void>((r) => { resolve = r; });
+
+    try {
+      await prev;
+      return await this.submitInner(data, submitterPubkey, signature);
+    } finally {
+      resolve();
+    }
+  }
+
+  private async submitInner(
     data: Uint8Array,
     submitterPubkey: Uint8Array,
     signature: Uint8Array,

@@ -201,6 +201,9 @@ export class SeedNode extends MagicNode {
       const topic = msg.topic as string;
       const data = msg.data as Uint8Array;
 
+      // Skip internal seed topics (peer exchange, discovery) — only buffer application messages
+      if (topic === 'magic/discovery') return;
+
       // Generate a dedup ID from the message content
       const id = createHash('sha256').update(data).digest('hex');
 
@@ -265,6 +268,11 @@ export class SeedNode extends MagicNode {
         const subscribing = (sub as { topic: string; subscribe: boolean }).subscribe;
 
         if (subscribing && !this.mirroredTopics.has(topic)) {
+          // Cap total mirrored topics to prevent memory exhaustion from malicious peers
+          if (this.mirroredTopics.size >= 500) {
+            console.warn(`[Seed] Topic mirror cap reached (500) — ignoring: ${topic}`);
+            continue;
+          }
           gs.subscribe(topic);
           this.mirroredTopics.add(topic);
           console.log(`[Seed] Mirroring topic: ${topic} (${this.mirroredTopics.size} total)`);

@@ -77,8 +77,12 @@ export class PersistentTrustPolicy {
 
     for await (const [key, raw] of this.#db.iterator({ gt: 'trust:', lt: 'trust:~' })) {
       const pubkeyHex = key.slice('trust:'.length);
-      const record: AgentPolicyRecord = JSON.parse(raw) as AgentPolicyRecord;
-      this.#rehydrateAgent(pubkeyHex, record);
+      try {
+        const record: AgentPolicyRecord = JSON.parse(raw) as AgentPolicyRecord;
+        this.#rehydrateAgent(pubkeyHex, record);
+      } catch {
+        console.warn(`[TrustPolicy] Skipping corrupted record for ${pubkeyHex}`);
+      }
     }
 
     // Rehydrate open tags

@@ -76,6 +76,10 @@ export class MagicNode {
   private reAdvertiseTimer: ReturnType<typeof setInterval> | null = null;
   /** Timer for periodic inbox polling (fallback receive for NATted nodes). */
   private inboxPollTimer: ReturnType<typeof setInterval> | null = null;
+  /** Tracked per-peer setTimeout handles for cleanup on stop(). */
+  private pendingTimeouts = new Set<ReturnType<typeof setTimeout>>();
+  /** Whether the node is in the process of stopping. */
+  private stopping = false;
 
   // --- Global inbound rate limiting (token burn protection) ---
   /** Timestamps of messages delivered to handlers in the current window. */
@@ -212,7 +216,9 @@ export class MagicNode {
           (tag) => `magic/tag/${tag}`,
         );
         if (topics.length > 0) {
-          setTimeout(() => {
+          const timer = setTimeout(() => {
+            this.pendingTimeouts.delete(timer);
+            if (this.stopping) return; // Node is shutting down
             this.inboxClient?.fetch(peerId, topics).then((messages) => {
               if (messages.length > 0) {
                 console.log(`[Magic] Inbox: fetched ${messages.length} missed message(s) from ${peerId.slice(0, 16)}...`);
@@ -224,6 +230,7 @@ export class MagicNode {
               // Peer doesn't support inbox protocol (not a seed) — that's fine
             });
           }, 2000);
+          this.pendingTimeouts.add(timer);
         }
       }
     };
@@ -369,6 +376,9 @@ export class MagicNode {
   }
 
   async stop(): Promise<void> {
+    this.stopping = true;
+
+    // Clear all tracked timers
     if (this.reAdvertiseTimer) {
       clearInterval(this.reAdvertiseTimer);
       this.reAdvertiseTimer = null;
@@ -377,6 +387,11 @@ export class MagicNode {
       clearInterval(this.inboxPollTimer);
       this.inboxPollTimer = null;
     }
+    for (const timer of this.pendingTimeouts) {
+      clearTimeout(timer);
+    }
+    this.pendingTimeouts.clear();
+
     await this.handshake?.stop();
     await this.discoveryProtocol?.stop();
     await this.directMessage?.stop();

@@ -116,9 +116,15 @@ export class LocalLedger {
 
     if (this.entryCount > 0) {
       const latestIndex = this.entryCount - 1;
-      const raw = await this.db.get(indexKey(latestIndex));
-      const stored: StoredEntry = JSON.parse(raw) as StoredEntry;
-      this.latestEntry = storedToEntry(stored);
+      try {
+        const raw = await this.db.get(indexKey(latestIndex));
+        const stored: StoredEntry = JSON.parse(raw) as StoredEntry;
+        this.latestEntry = storedToEntry(stored);
+      } catch (err) {
+        console.warn('[LocalLedger] Failed to load latest entry — starting from empty. This may indicate data corruption:', err);
+        this.entryCount = 0;
+        this.latestEntry = null;
+      }
     }
   }
 

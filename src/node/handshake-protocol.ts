@@ -85,6 +85,9 @@ export class HandshakeProtocol {
 
   /** Peers that failed compat check: peerId → rejection message */
   private readonly incompatiblePeers = new Set<string>();
+  /** Tracked per-peer timeouts for cleanup on stop(). */
+  private readonly pendingTimeouts = new Set<ReturnType<typeof setTimeout>>();
+  private stopped = false;
 
   private connectHandler: ((evt: CustomEvent) => void) | null = null;
 
@@ -104,7 +107,9 @@ export class HandshakeProtocol {
     this.connectHandler = (evt: CustomEvent) => {
       const peerId = evt.detail.toString();
       // Small delay to let the connection stabilize
-      setTimeout(() => {
+      const timer = setTimeout(() => {
+        this.pendingTimeouts.delete(timer);
+        if (this.stopped) return;
         this.initiateHandshake(peerId).catch(() => {
           // Peer may not support handshake protocol (old version) — that's informative too
           if (!this.peerVersions.has(peerId)) {
@@ -114,11 +119,17 @@ export class HandshakeProtocol {
           }
         });
       }, 1000);
+      this.pendingTimeouts.add(timer);
     };
     this.libp2p.addEventListener('peer:connect', this.connectHandler);
   }
 
   async stop(): Promise<void> {
+    this.stopped = true;
+    for (const timer of this.pendingTimeouts) {
+      clearTimeout(timer);
+    }
+    this.pendingTimeouts.clear();
     if (this.connectHandler) {
       this.libp2p.removeEventListener('peer:connect', this.connectHandler);
       this.connectHandler = null;
