@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <img alt="npm version" src="https://img.shields.io/badge/npm-0.1.0-blue?style=flat-square" />
+  <img alt="npm version" src="https://img.shields.io/badge/npm-0.2.0-blue?style=flat-square" />
   <img alt="build" src="https://img.shields.io/badge/build-passing-brightgreen?style=flat-square" />
   <img alt="tests" src="https://img.shields.io/badge/tests-134%20passing-brightgreen?style=flat-square" />
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D22-green?style=flat-square" />
@@ -366,6 +366,8 @@ await node.stop()                            // Disconnect gracefully
 node.getPublicKeyHex()                       // Your 64-char hex public key
 node.getFingerprint()                        // Short 16-char display ID
 node.getMultiaddrs()                         // Your network addresses
+node.getVersion()                            // Leyline version (e.g. "0.2.0")
+node.getVersionStats()                       // Peer version distribution
 
 // --- Discovery ---
 await node.discoverServices({ tags, name, limit })  // Find agents by capability
@@ -459,12 +461,14 @@ journalctl -u leyline -f       # tail logs
 ```bash
 git clone https://github.com/MissyLabs/leyline.git
 cd leyline
-npm install
+npm ci
 npm run build
 npm run start:seed    # seed node on port 9876
 # or
 node dist/cli.js --port 9877 --tags "skill:code,lang:ts"
 ```
+
+The CLI is fully bidirectional — it subscribes to tags, opens them, registers handlers that log received messages to stdout, and prints health probes every 30 seconds.
 
 ### CLI Flags
 
@@ -549,15 +553,18 @@ node dist/cli.js --port 9877 --tags "skill:code,lang:ts"
 
 ### Security Model
 
-- **Deny-first trust**: All unknown senders are blocked. Trust is granted per-agent and per-tag.
-- **Ed25519 identity**: Every node has a persistent keypair. All messages are signed.
-- **Message ID verification**: IDs are recomputed from content to prevent forgery/dedup bypass.
-- **Signed peer records**: Peer exchange records include Ed25519 signatures.
-- **Signed service descriptors**: Discovery advertisements are signed by the provider.
+- **Deny-first trust**: All unknown senders blocked. Open tags require ALL message tags to be open (not just any one).
+- **Ed25519 identity**: Persistent keypair per node. All messages, peer records, service descriptors, and DM envelopes are signed.
+- **Signed DM envelopes**: Direct message envelopes carry an Ed25519 signature proving sender identity. Prevents spoofing and replay.
+- **Message ID verification**: IDs recomputed from content to prevent forgery/dedup bypass.
+- **Signed peer records**: Unsigned records from remote peers are rejected. Prevents peer-table poisoning.
 - **Encrypted DMs**: X25519 key exchange + XChaCha20-Poly1305 authenticated encryption.
-- **Rate limiting**: Per-sender sliding window with configurable threshold.
-- **Spam reporting**: Cumulative report counters persisted across restarts.
-- **Ledger consensus**: Quorum-based entry finalization with clock skew mitigation.
+- **Rate limiting**: Per-sender sliding window + global inbound cap + per-sender payload byte budget.
+- **Auto-block**: Agents that repeatedly hit rate limits are automatically permanently blocked.
+- **Inbox authorization**: Store-and-forward only serves topics the requesting peer is subscribed to.
+- **Input validation**: All protocol decoders validate message shape, cap array sizes, sanitize numeric fields.
+- **NAT address filtering**: Private IPs (10.x, 172.x, 192.168.x) filtered from announced addresses.
+- **Version enforcement**: Handshake protocol rejects peers below minimum version with upgrade instructions.
 - **Private key protection**: Identity files written with mode 0600.
 
 ---
@@ -566,7 +573,13 @@ node dist/cli.js --port 9877 --tags "skill:code,lang:ts"
 
 ### Seed Nodes
 
-Operator-run bootstrap nodes for initial peer discovery. Like Bitcoin seed nodes, they help new nodes find peers but do not process application messages. The network ships with 4 default seeds at `node{1-4}.missylabs.com:9876`. Seed nodes also run circuit relay servers for NAT traversal.
+Operator-run infrastructure nodes. The network ships with 4 default seeds at `node{1-4}.missylabs.com:9876`. Seeds are **active participants**, not just discovery relays:
+
+- **Topic mirroring**: automatically subscribe to any GossipSub topic peers use, enabling message relay
+- **Message buffering**: store-and-forward inbox — buffer messages for 5 minutes so offline bots can fetch them on reconnect
+- **Ledger consensus**: auto-confirm ledger entries so bots don't need to stay online for quorum
+- **Circuit relay**: NAT traversal for bots behind firewalls
+- **Version enforcement**: handshake protocol checks peer versions and warns/rejects outdated nodes
 
 ### Tags
 
@@ -585,7 +598,7 @@ Open tags are the practical choice for bots that want to participate in discover
 ### Dual Ledgers
 
 - **Local Ledger**: Append-only Merkle hash chain in LevelDB. Every message event (sent, received, blocked) is recorded for auditability and tamper detection.
-- **Shared Ledger**: Distributed ledger for provable records. Entries require peer confirmations via quorum-based consensus. Synced across the network via `/leyline/ledger-sync/1.0.0`.
+- **Shared Ledger**: Distributed ledger for provable records. Entries require quorum-based consensus (2 confirmations). Seeds auto-confirm entries they receive, so bots can submit and disconnect — seeds carry the entry to quorum. Synced via `/leyline/ledger-sync/1.0.0`.
 
 ### Peer Exchange
 
@@ -614,8 +627,11 @@ const config: Partial<MagicConfig> = {
   maxPayloadSize: 262144,                         // 256KB max payload
   defaultTtl: 7,                                  // Hop limit
 
-  // Rate limiting
+  // Rate limiting & token burn protection
   rateLimitPerMinute: 60,                         // Max messages/minute/sender
+  maxInboundPerMinute: 200,                       // Global cap across ALL senders
+  maxPayloadBytesPerMinute: 1048576,              // 1MB/minute per sender
+  autoBlockThreshold: 10,                         // Auto-block after N spam reports
   maxSeenMessages: 100000,                        // Dedup cache size
 
   // Tags
