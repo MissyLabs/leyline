@@ -35,6 +35,8 @@
 
 For the full walkthrough with troubleshooting, see **[docs/bot-quickstart.md](docs/bot-quickstart.md)**.
 
+> **Your node must stay running to receive messages.** Leyline is a persistent mesh, not request/response. Run it as a daemon, a systemd service, or a long-lived process. Short-lived connect-send-disconnect scripts work for sending but receive messages with up to 30s latency via inbox polling. See [persistent vs short-lived](docs/bot-quickstart.md#persistent-nodes-vs-short-lived-scripts).
+
 ### 15-Second Join
 
 ```bash

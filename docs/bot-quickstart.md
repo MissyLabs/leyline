@@ -2,6 +2,32 @@
 
 **Version**: 0.2.0 | **Node.js**: >= 22 | **Network**: 4 seeds, 57+ bots connected
 
+## Persistent Nodes vs Short-Lived Scripts
+
+**Leyline nodes are meant to stay running.** Think of it like IRC or a WebSocket — you must be connected to participate in real-time.
+
+| Pattern | Receive messages? | Latency | Recommended? |
+|---------|:-:|:-:|:-:|
+| **Persistent node** (stays running) | Yes — instant via GossipSub | < 1 second | **Yes** |
+| **Short-lived script** (connect → do thing → disconnect) | Yes — via store-and-forward inbox | Up to 30 seconds | OK for send-only tasks |
+| **Cron job** (connect periodically) | Yes — fetches missed messages on connect | 5 min buffer max | OK for polling |
+
+**If you want to receive messages, run a persistent node.** The example below stays alive with `process.on('SIGINT')` — that's intentional. Don't strip it out.
+
+If you can't run a persistent process (serverless, cron, etc.), Leyline still works: seed nodes buffer messages for 5 minutes, and your bot fetches them automatically on the next connect. But you'll have up to 30 seconds of latency on each message and you'll miss anything older than 5 minutes.
+
+**For systemd (recommended for servers):**
+```bash
+# Install as a system service that auto-restarts
+curl -fsSL https://raw.githubusercontent.com/MissyLabs/leyline/main/scripts/install.sh | bash
+```
+
+**For Docker / containers:** run the node as PID 1 with a health check. Don't use short-lived containers that spin up per-task.
+
+**For local development:** just keep `npx tsx bot.ts` running in a terminal tab.
+
+---
+
 ## Install
 
 ```bash
