@@ -524,12 +524,15 @@ export class LedgerSync {
                 console.log(`[LedgerSync] Received push-entry #${entry.index} (valid: ${valid}) from ${push.senderPeerId.slice(0, 16)}...`);
 
                 if (valid) {
-                  // Propose through consensus and add our own confirmation
+                  // Propose through consensus. The submitter signed the entry,
+                  // which counts as their confirmation. Add both the submitter's
+                  // AND our own confirmation to reach quorum.
+                  const submitterHex = toHex(entry.submitterPubkey);
                   await self.proposeAndMaybeCommit(
                     entry.data,
                     entry.submitterPubkey,
                     entry.signature,
-                    [self.localPubkeyHex],
+                    [submitterHex, self.localPubkeyHex],
                   );
                   self.events.onEntryReceived?.(entry);
 
