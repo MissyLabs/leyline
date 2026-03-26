@@ -133,3 +133,34 @@ cd /tmp/leyline-discord-test && node hello.mjs
 ### 6. Direct Message Test
 - Ask boostie to send an encrypted DM to Botrick
 - Verify: Botrick receives and decrypts the message
+
+## Critical Fixes / Hard-Learned Ops Notes
+
+### 1) Single-binder rule (avoid EADDRINUSE)
+A persistent node owns `9876/9877`. If you start a second node with default ports, it will fail with `EADDRINUSE`.
+
+**Do this instead:**
+- send from the already-running persistent process, **or**
+- use helper clients on alternate ports/dataDir for one-shot probes.
+
+### 2) Always open trust for test tags
+Leyline is deny-first. For test flows, open inbound trust explicitly:
+
+```ts
+await node.allowTagOpen('e2e:test');
+await node.allowTagOpen('e2e:deep');
+```
+
+### 3) Persistent process should expose a trigger channel
+Without an IPC/trigger path, test harnesses cannot command broadcasts/ledger submits on the already-running node.
+Add a lightweight file-trigger or IPC hook so Discord-driven tests can instruct the persistent process directly.
+
+### 4) Ledger verification logs to look for
+For successful submit-and-fanout, require both lines:
+
+```text
+[Magic] Ledger: submitted entry #..., broadcasting to ... peers...
+[Magic] Ledger: broadcast complete
+```
+
+Then verify entry count from the same running process context.
