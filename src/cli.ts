@@ -2,6 +2,8 @@ import { MagicNode } from './node/magic-node.js';
 import { SeedNode } from './node/seed-node.js';
 import { type MagicConfig, DEFAULT_SEED_NODES } from './config/config.js';
 import { publicKeyToHex } from './identity/keypair.js';
+import { MessageType } from './messages/message.js';
+import { promises as fs } from 'node:fs';
 
 const args = process.argv.slice(2);
 const isSeed = args.includes('--seed');
@@ -25,6 +27,16 @@ const tags: string[] = [];
 if (tagsFlag !== -1) {
   tags.push(...args[tagsFlag + 1].split(','));
 }
+
+// Optional trigger file for send-on-demand from a persistent CLI node.
+// JSON format:
+// { "tag": "e2e:test", "payload": { ... } }
+// If payload is omitted, the whole object is sent as payload.
+const sendTriggerFlag = args.indexOf('--send-trigger-file');
+const sendTriggerFile = sendTriggerFlag !== -1 ? args[sendTriggerFlag + 1] : undefined;
+const sendPollFlag = args.indexOf('--send-poll-ms');
+const parsedSendPollMs = sendPollFlag !== -1 ? parseInt(args[sendPollFlag + 1], 10) : 300;
+const sendPollMs = Number.isFinite(parsedSendPollMs) && parsedSendPollMs > 0 ? parsedSendPollMs : 300;
 
 const config: Partial<MagicConfig> = {
   listenPort: port,
@@ -79,6 +91,27 @@ async function main() {
     setInterval(() => {
       console.log(`[health] peers: ${node.getPeerCount()} | open tags: ${node.getOpenTags().join(', ')} | paused: ${node.isPaused()}`);
     }, 30_000);
+
+    if (sendTriggerFile) {
+      console.log(`[Magic] Send trigger watching: ${sendTriggerFile} (poll ${sendPollMs}ms)`);
+
+      setInterval(async () => {
+        try {
+          const raw = await fs.readFile(sendTriggerFile, 'utf8');
+          const req = JSON.parse(raw);
+          const tag = typeof req?.tag === 'string' ? req.tag : tags[0] ?? 'skill:general';
+          const payloadObj = req?.payload ?? req;
+          const bytes = new TextEncoder().encode(JSON.stringify(payloadObj));
+
+          await node.broadcast([tag], bytes, MessageType.BROADCAST);
+          console.log(`[Magic][SEND][${tag}] ${JSON.stringify(payloadObj)}`);
+
+          await fs.unlink(sendTriggerFile).catch(() => {});
+        } catch {
+          // Ignore missing/invalid trigger file and keep polling.
+        }
+      }, sendPollMs);
+    }
   }
 }
 
