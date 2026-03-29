@@ -233,6 +233,28 @@ export class ServiceRegistry {
   addRemote(descriptor: ServiceDescriptor): boolean {
     if (!this.isValidDescriptor(descriptor)) return false;
 
+    const normalizeTags = (tags: string[]) => [...tags].sort().join(',');
+    const incomingKey = `${descriptor.providerPubkey}::${descriptor.name}::${normalizeTags(descriptor.tags)}`;
+
+    // Deduplicate semantically-equivalent remote advertisements coming from
+    // the same provider/name/tags tuple. Keep the newest advertisement.
+    for (const [id, existing] of this.services.entries()) {
+      if (this.localIds.has(id)) continue; // never evict local registrations
+      if (id === descriptor.id) continue;
+
+      const existingKey = `${existing.providerPubkey}::${existing.name}::${normalizeTags(existing.tags)}`;
+      if (existingKey !== incomingKey) continue;
+
+      // If existing is newer-or-equal, ignore incoming stale duplicate.
+      if (existing.advertisedAt >= descriptor.advertisedAt) {
+        return true;
+      }
+
+      // Incoming is newer: replace the stale duplicate entry.
+      this.services.delete(id);
+      break;
+    }
+
     // Cap total remote services to prevent memory exhaustion from flooding
     const remoteCount = this.services.size - this.localIds.size;
     if (!this.services.has(descriptor.id) && remoteCount >= ServiceRegistry.MAX_REMOTE_SERVICES) {
