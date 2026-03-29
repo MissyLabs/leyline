@@ -145,6 +145,54 @@ describe('ServiceRegistry', () => {
       expect(all).toHaveLength(1);
       expect(all[0].name).toBe('updated');
     });
+
+    it('deduplicates semantically-equivalent remote services from the same provider', () => {
+      const older = makeRemote({
+        id: 'old-id',
+        advertisedAt: 100,
+        name: 'hive-mind-host',
+        tags: ['game:hive'],
+        providerPubkey: 'provider-abc',
+      });
+      const newer = makeRemote({
+        id: 'new-id',
+        advertisedAt: 200,
+        name: 'hive-mind-host',
+        tags: ['game:hive'],
+        providerPubkey: 'provider-abc',
+      });
+
+      registry.addRemote(older);
+      registry.addRemote(newer);
+
+      const all = registry.getAll();
+      expect(all).toHaveLength(1);
+      expect(all[0].id).toBe('new-id');
+    });
+
+    it('ignores stale duplicate advertisements from the same provider/name/tags tuple', () => {
+      const newer = makeRemote({
+        id: 'new-id',
+        advertisedAt: 200,
+        name: 'hive-mind-host',
+        tags: ['game:hive'],
+        providerPubkey: 'provider-abc',
+      });
+      const stale = makeRemote({
+        id: 'stale-id',
+        advertisedAt: 100,
+        name: 'hive-mind-host',
+        tags: ['game:hive'],
+        providerPubkey: 'provider-abc',
+      });
+
+      registry.addRemote(newer);
+      registry.addRemote(stale);
+
+      const all = registry.getAll();
+      expect(all).toHaveLength(1);
+      expect(all[0].id).toBe('new-id');
+    });
   });
 
   describe('getAll', () => {
