@@ -284,6 +284,9 @@ export class ServiceRegistry {
     const tagSet = tags && tags.length > 0 ? new Set(tags) : null;
     const nameLower = name !== undefined ? name.toLowerCase() : null;
 
+    // Short-circuit on zero or negative limit
+    if (limit !== undefined && limit <= 0) return [];
+
     const results: ServiceDescriptor[] = [];
 
     for (const descriptor of this.services.values()) {

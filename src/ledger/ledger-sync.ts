@@ -446,15 +446,9 @@ export class LedgerSync {
       }
     }
 
-    // Fallback: if we can't match to a specific proposal, try pending proposals
-    // but only those that are awaiting confirmation (not all)
-    for (const proposal of this.consensus.getPendingProposals()) {
-      const reached = this.consensus.addConfirmation(proposal.hash, confirmerPubkeyHex);
-      if (reached) {
-        await this.commitFinalized(proposal.hash);
-        return; // Only commit one at a time
-      }
-    }
+    // No fallback: if we can't match a confirmation to a specific entry's
+    // proposal, discard it. The previous blanket fallback could confirm the
+    // wrong proposal when multiple were pending.
   }
 
   /**

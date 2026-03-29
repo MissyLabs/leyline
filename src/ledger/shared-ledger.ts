@@ -92,7 +92,7 @@ export class SharedLedger {
   private db: Level<string, string>;
   private currentIndex = 0;
   private latestHash: Uint8Array = new Uint8Array(0);
-  /** Serialization lock for submit() to prevent concurrent hash chain corruption. */
+  /** Serialization lock for submit() and addConfirmation() to prevent concurrent corruption. */
   private submitLock: Promise<void> = Promise.resolve();
 
   constructor(dataDir: string) {
@@ -181,8 +181,23 @@ export class SharedLedger {
 
   /**
    * Add a peer confirmation to an existing entry.
+   * Serialized via the same lock as submit() to prevent concurrent
+   * read-modify-write races that could produce duplicate confirmers.
    */
   async addConfirmation(index: number, confirmerPubkey: Uint8Array): Promise<SharedLedgerEntry | null> {
+    const prev = this.submitLock;
+    let resolve!: () => void;
+    this.submitLock = new Promise<void>((r) => { resolve = r; });
+
+    try {
+      await prev;
+      return await this.addConfirmationInner(index, confirmerPubkey);
+    } finally {
+      resolve();
+    }
+  }
+
+  private async addConfirmationInner(index: number, confirmerPubkey: Uint8Array): Promise<SharedLedgerEntry | null> {
     const entry = await this.getEntry(index);
     if (!entry) return null;
 
