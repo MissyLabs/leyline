@@ -87,6 +87,12 @@ export class LedgerConsensus {
     if (this.config.maxPendingEntries < 1) {
       throw new RangeError(`LedgerConsensus: maxPendingEntries must be >= 1, got ${this.config.maxPendingEntries}`);
     }
+    if (this.config.proposalTimeoutMs < 0) {
+      throw new RangeError(`LedgerConsensus: proposalTimeoutMs must be >= 0, got ${this.config.proposalTimeoutMs}`);
+    }
+    if (this.config.maxClockSkewMs < 0) {
+      throw new RangeError(`LedgerConsensus: maxClockSkewMs must be >= 0, got ${this.config.maxClockSkewMs}`);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -106,6 +112,7 @@ export class LedgerConsensus {
     data: Uint8Array,
     submitterPubkey: Uint8Array,
     signature: Uint8Array,
+    overrideTimestamp?: number,
   ): EntryProposal {
     // Content hash is deterministic across nodes for the same data+submitter
     const contentHash = this.computeContentHash(data, submitterPubkey);
@@ -127,7 +134,7 @@ export class LedgerConsensus {
     }
 
     const now = Date.now();
-    const timestamp = now;
+    const timestamp = overrideTimestamp ?? now;
     const hash = this.computeProposalHash(data, timestamp, submitterPubkey);
 
     const proposal: EntryProposal = {
@@ -163,9 +170,11 @@ export class LedgerConsensus {
       // Reject proposals too far in the future
       return undefined;
     }
-    // Clamp: use the earlier of remote timestamp and local time
-    // This prevents future-dated entries from gaining ordering advantage
-    return this.propose(data, submitterPubkey, signature);
+    // Clamp: use the earlier of remote timestamp and local time.
+    // This prevents future-dated entries from gaining ordering advantage.
+    // Floor at 0 to avoid negative values in the unsigned timestamp hash.
+    const clampedTimestamp = Math.max(0, Math.min(remoteTimestamp, now));
+    return this.propose(data, submitterPubkey, signature, clampedTimestamp);
   }
 
   /**
