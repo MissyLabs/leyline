@@ -356,7 +356,6 @@ export class DiscoveryProtocol {
           stream,
           // Drain any bytes the remote might send (none expected for ads).
           async (source) => {
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
             for await (const _ of source) { /* intentional no-op */ }
           },
         );
