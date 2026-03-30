@@ -162,15 +162,22 @@ describe('LedgerConsensus — proposeRemote', () => {
   });
 
   it('rejects 1ms beyond clock skew boundary', () => {
-    const now = Date.now();
-    const beyondBoundary = now + 60_001;
-    const result = consensus.proposeRemote(
-      makeData('beyond'),
-      makePubkey('beyond'),
-      makeSig('beyond'),
-      beyondBoundary,
-    );
-    expect(result).toBeUndefined();
+    const fixedNow = 1_700_000_000_000;
+    const originalNow = Date.now;
+    Date.now = () => fixedNow;
+
+    try {
+      const beyondBoundary = fixedNow + 60_001;
+      const result = consensus.proposeRemote(
+        makeData('beyond'),
+        makePubkey('beyond'),
+        makeSig('beyond'),
+        beyondBoundary,
+      );
+      expect(result).toBeUndefined();
+    } finally {
+      Date.now = originalNow;
+    }
   });
 
   it('proposeRemote with zero timestamp is accepted', () => {
