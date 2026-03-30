@@ -28,14 +28,18 @@ import {
 // ---------------------------------------------------------------------------
 
 function makeRemote(overrides: Partial<ServiceDescriptor> = {}): ServiceDescriptor {
+  const id = overrides.id ?? `remote-${Math.random().toString(36).slice(2, 10)}`;
+  const suffix = id.replace(/[^a-zA-Z0-9]/g, '').slice(-8) || 'remote';
+
   return {
-    id: `remote-${Math.random().toString(36).slice(2, 10)}`,
+    id,
     advertisedAt: Date.now(),
     name: 'remote-service',
     tags: ['tag:remote'],
     description: 'A remote service',
-    providerPubkey: 'aabbccdd',
-    providerPeerId: 'peer-remote',
+    // Use per-descriptor defaults so bulk tests don't collapse via semantic dedupe
+    providerPubkey: `aabbccdd-${suffix}`,
+    providerPeerId: `peer-${suffix}`,
     multiaddrs: ['/ip4/10.0.0.1/tcp/4001'],
     ttl: DEFAULT_SERVICE_TTL,
     metadata: {},
