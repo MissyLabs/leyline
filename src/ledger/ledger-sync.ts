@@ -4,6 +4,7 @@ import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { SharedLedger, type SharedLedgerEntry } from './shared-ledger.js';
 import { LedgerConsensus } from './consensus.js';
+import { ForkResolver, type PeerChainQuerier } from './fork-resolver.js';
 import { sign, verify, publicKeyToHex } from '../identity/keypair.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
 
@@ -143,6 +144,7 @@ export class LedgerSync {
   private events: LedgerSyncEvents;
   private syncInterval: ReturnType<typeof setInterval> | null = null;
   private pruneInterval: ReturnType<typeof setInterval> | null = null;
+  private forkResolver: ForkResolver;
 
   /** How often to attempt sync with peers (60 seconds) */
   private syncIntervalMs: number;
@@ -167,6 +169,7 @@ export class LedgerSync {
     this.localPrivkey = localPrivkey;
     this.syncIntervalMs = opts.syncIntervalMs ?? 60_000;
     this.events = opts.events ?? {};
+    this.forkResolver = new ForkResolver(ledger);
   }
 
   async start(): Promise<void> {
@@ -329,60 +332,85 @@ export class LedgerSync {
    * Also performs fork detection by comparing hashes at the boundary.
    */
   async syncWithAllPeers(): Promise<void> {
-    const localCount = await this.ledger.getEntryCount();
     const peers = this.libp2p.getPeers();
 
     for (const peerId of peers) {
       try {
-        // Fork detection: if we have entries, request the overlapping entry to compare hashes
-        if (localCount > 0) {
-          const overlap = await this.requestRange(peerId.toString(), localCount, localCount);
-          if (overlap.length > 0) {
-            const localEntry = await this.ledger.getEntry(localCount);
-            if (localEntry && toHex(localEntry.hash) !== toHex(overlap[0].hash)) {
-              console.warn(
-                `[LedgerSync] Fork detected with peer ${peerId.toString()} at index ${localCount}. ` +
-                `Local hash: ${toHex(localEntry.hash).slice(0, 16)}..., ` +
-                `Peer hash: ${toHex(overlap[0].hash).slice(0, 16)}...`,
-              );
-              // Skip this peer — their chain diverged. In a non-Byzantine network
-              // the longest chain with the most confirmations is preferred.
-              // A future protocol upgrade could implement chain reorganization.
-              continue;
-            }
-          }
-        }
-
-        // Request entries beyond what we have
-        const entries = await this.requestRange(
-          peerId.toString(),
-          localCount + 1,
-          localCount + 100, // Request up to 100 entries at a time
-        );
-
-        // Validate and propose received entries through consensus
-        let ingested = 0;
-        for (const entry of entries) {
-          const valid = await this.validateReceivedEntry(entry);
-          if (valid) {
-            const committed = await this.proposeAndMaybeCommit(
-              entry.data,
-              entry.submitterPubkey,
-              entry.signature,
-              // Count existing confirmers from the synced entry
-              entry.confirmerPubkeys.map(toHex),
-            );
-            if (committed) ingested++;
-          }
-        }
-
-        if (ingested > 0) {
-          this.events.onSyncComplete?.(peerId.toString(), ingested);
-        }
+        await this.syncWithPeer(peerId.toString());
       } catch {
         // Individual peer sync failure — continue with others
       }
     }
+  }
+
+  private async syncWithPeer(peerId: string): Promise<void> {
+    const localCount = await this.ledger.getEntryCount();
+
+    // Fork detection and resolution via ForkResolver
+    if (localCount > 0) {
+      const peerQuerier = this.makePeerQuerier(peerId);
+      const forkResult = await this.forkResolver.resolve(peerQuerier);
+      if (forkResult) {
+        this.events.onSyncComplete?.(peerId, forkResult.resolved ? 1 : 0);
+        if (forkResult.winner === 'peer' && forkResult.resolved) return;
+      }
+    }
+
+    // Request entries beyond what we have
+    const currentCount = await this.ledger.getEntryCount();
+    const entries = await this.requestRange(
+      peerId,
+      currentCount + 1,
+      currentCount + 100,
+    );
+
+    let ingested = 0;
+    for (const entry of entries) {
+      const valid = await this.validateReceivedEntry(entry);
+      if (valid) {
+        const committed = await this.proposeAndMaybeCommit(
+          entry.data,
+          entry.submitterPubkey,
+          entry.signature,
+          entry.confirmerPubkeys.map(toHex),
+        );
+        if (committed) ingested++;
+      }
+    }
+
+    if (ingested > 0) {
+      this.events.onSyncComplete?.(peerId, ingested);
+    }
+  }
+
+  private makePeerQuerier(peerId: string): PeerChainQuerier {
+    const self = this;
+    return {
+      async getEntryHash(index: number): Promise<string | null> {
+        const entries = await self.requestRange(peerId, index, index);
+        if (entries.length === 0) return null;
+        return toHex(entries[0].hash);
+      },
+      async getRange(startIndex: number, endIndex: number): Promise<SharedLedgerEntry[]> {
+        return self.requestRange(peerId, startIndex, endIndex);
+      },
+      async getEntryCount(): Promise<number> {
+        const probe = await self.requestRange(peerId, 1, 1);
+        if (probe.length === 0) return 0;
+        // Use a binary probe to estimate peer chain length
+        let low = 1, high = 100_000;
+        while (low < high) {
+          const mid = Math.floor((low + high + 1) / 2);
+          const check = await self.requestRange(peerId, mid, mid);
+          if (check.length > 0) {
+            low = mid;
+          } else {
+            high = mid - 1;
+          }
+        }
+        return low;
+      },
+    };
   }
 
   /**
