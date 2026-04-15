@@ -169,6 +169,23 @@ export class SeedNode extends MagicNode {
     }
 
     this.knownPeers.set(peerId, { multiaddrs: addrs, lastSeen });
+
+    // LRU eviction: cap at 10,000 known peers to prevent unbounded memory growth
+    if (this.knownPeers.size > 10_000) {
+      let oldestId: string | undefined;
+      let oldestTime = Infinity;
+      for (const [id, info] of this.knownPeers) {
+        if (info.lastSeen < oldestTime) {
+          oldestTime = info.lastSeen;
+          oldestId = id;
+        }
+      }
+      if (oldestId) {
+        this.knownPeers.delete(oldestId);
+        this.deletePeer(oldestId);
+      }
+    }
+
     this.persistPeer(peerId, { peerId, multiaddrs: addrs, lastSeen });
     console.log(`[Seed] Peer connected: ${peerId} (total: ${this.knownPeers.size})`);
   }

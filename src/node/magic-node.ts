@@ -421,6 +421,7 @@ export class MagicNode {
     }
 
     await this.libp2p?.stop();
+    this.tagPubSub?.clear();
     this.tagPubSub = null;
     this.libp2p = null;
     console.log('[Magic] Node stopped');

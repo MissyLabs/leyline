@@ -179,6 +179,16 @@ export class HandshakeProtocol {
     return this.incompatiblePeers.has(peerId);
   }
 
+  /** Prune tracking data for peers no longer connected. */
+  pruneDisconnected(connectedPeerIds: Set<string>): void {
+    for (const peerId of this.peerVersions.keys()) {
+      if (!connectedPeerIds.has(peerId)) {
+        this.peerVersions.delete(peerId);
+        this.incompatiblePeers.delete(peerId);
+      }
+    }
+  }
+
   /** Disconnect an incompatible peer by closing all connections. */
   private disconnectPeer(peerId: string): void {
     const peerIdObj = this.libp2p.getPeers().find((p) => p.toString() === peerId);
