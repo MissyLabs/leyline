@@ -81,6 +81,7 @@ export class LocalLedger {
   private db: Level<string, string>;
   private latestEntry: LedgerEntry | null = null;
   private entryCount: number = 0;
+  private appendLock: Promise<void> = Promise.resolve();
 
   /**
    * @param dataDir - Filesystem path used by LevelDB for persistent storage.
@@ -144,6 +145,19 @@ export class LocalLedger {
    * @returns The newly created {@link LedgerEntry}.
    */
   async append(message: Uint8Array, action: string): Promise<LedgerEntry> {
+    const prev = this.appendLock;
+    let resolve!: () => void;
+    this.appendLock = new Promise<void>((r) => { resolve = r; });
+
+    try {
+      await prev;
+      return await this.appendInner(message, action);
+    } finally {
+      resolve();
+    }
+  }
+
+  private async appendInner(message: Uint8Array, action: string): Promise<LedgerEntry> {
     const index = this.entryCount;
     const prevHash =
       this.latestEntry !== null ? this.latestEntry.hash : new Uint8Array(0);
