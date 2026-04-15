@@ -828,10 +828,15 @@ export class MagicNode {
     if (this.config.maxInboundPerMinute > 0) {
       const now = Date.now();
       const cutoff = now - 60_000;
-      // Prune old timestamps
-      while (this.inboundTimestamps.length > 0 && this.inboundTimestamps[0] < cutoff) {
-        this.inboundTimestamps.shift();
+      // Prune old timestamps using binary search + slice (O(log n) vs O(n) shift loop)
+      let lo = 0;
+      let hi = this.inboundTimestamps.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (this.inboundTimestamps[mid] < cutoff) lo = mid + 1;
+        else hi = mid;
       }
+      if (lo > 0) this.inboundTimestamps = this.inboundTimestamps.slice(lo);
       if (this.inboundTimestamps.length >= this.config.maxInboundPerMinute) {
         // Global cap reached — drop silently (not the sender's fault, just backpressure)
         return;

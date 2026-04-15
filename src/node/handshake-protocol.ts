@@ -52,10 +52,27 @@ function encode(msg: HandshakeMessage): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(msg));
 }
 
+const MAX_HANDSHAKE_VERSION_LEN = 32;
+
 function decode(data: Uint8Array): HandshakeMessage {
   const parsed = JSON.parse(new TextDecoder().decode(data));
   if (typeof parsed.type !== 'string') {
     throw new TypeError('Malformed HandshakeMessage');
+  }
+  if (parsed.version !== undefined) {
+    if (typeof parsed.version !== 'string' || parsed.version.length > MAX_HANDSHAKE_VERSION_LEN) {
+      throw new TypeError('Malformed HandshakeMessage: invalid version field');
+    }
+  }
+  if (parsed.minVersion !== undefined) {
+    if (typeof parsed.minVersion !== 'string' || parsed.minVersion.length > MAX_HANDSHAKE_VERSION_LEN) {
+      throw new TypeError('Malformed HandshakeMessage: invalid minVersion field');
+    }
+  }
+  if (parsed.message !== undefined) {
+    if (typeof parsed.message !== 'string' || parsed.message.length > 256) {
+      throw new TypeError('Malformed HandshakeMessage: invalid message field');
+    }
   }
   return parsed;
 }
