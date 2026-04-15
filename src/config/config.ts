@@ -110,6 +110,9 @@ export interface MagicConfig {
 
   /** Port for the seed node HTTP health check endpoint. 0 to disable. */
   healthCheckPort: number;
+
+  /** Enable mDNS for automatic local network peer discovery. */
+  enableMdns: boolean;
 }
 
 export const DEFAULT_CONFIG: MagicConfig = {
@@ -131,6 +134,7 @@ export const DEFAULT_CONFIG: MagicConfig = {
   enableRelay: true,
   webSocketPort: 9877,
   healthCheckPort: 0,
+  enableMdns: false,
 };
 
 export function mergeConfig(partial: Partial<MagicConfig>): MagicConfig {

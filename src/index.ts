@@ -109,7 +109,7 @@ export { MessageBuffer, type BufferedMessage, type MessageBufferConfig } from '.
 export { InboxServer, InboxClient, INBOX_PROTOCOL } from './node/inbox-protocol.js';
 
 // Utilities
-export { withTimeout, STREAM_TIMEOUT_MS } from './utils/stream-timeout.js';
+export { withTimeout, STREAM_TIMEOUT_MS, StreamAbortedError } from './utils/stream-timeout.js';
 export { compressMessage, decompressMessage, isCompressedMessage } from './utils/compression.js';
 
 // Crypto

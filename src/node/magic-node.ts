@@ -8,6 +8,7 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { gossipsub, type GossipSub } from '@chainsafe/libp2p-gossipsub';
 import { bootstrap } from '@libp2p/bootstrap';
 import { identify } from '@libp2p/identify';
+import { mdns } from '@libp2p/mdns';
 import { generateKeyPairFromSeed } from '@libp2p/crypto/keys';
 
 import { type MagicConfig, mergeConfig } from '../config/config.js';
@@ -179,9 +180,18 @@ export class MagicNode {
       connectionEncrypters: [noise()],
       streamMuxers: [yamux()],
       services,
-      ...(this.config.seedNodes.length > 0
-        ? { peerDiscovery: [bootstrap({ list: this.config.seedNodes })] }
-        : {}),
+      ...(() => {
+        const discoveryModules: unknown[] = [];
+        if (this.config.seedNodes.length > 0) {
+          discoveryModules.push(bootstrap({ list: this.config.seedNodes }));
+        }
+        if (this.config.enableMdns) {
+          discoveryModules.push(mdns());
+        }
+        return discoveryModules.length > 0
+          ? { peerDiscovery: discoveryModules }
+          : {};
+      })(),
     };
 
     this.libp2p = await createLibp2p(libp2pOptions as Parameters<typeof createLibp2p>[0]);

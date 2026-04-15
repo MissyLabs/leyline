@@ -8,6 +8,7 @@ import { promises as fs } from 'node:fs';
 const args = process.argv.slice(2);
 const isSeed = args.includes('--seed');
 const noSeeds = args.includes('--no-seeds');
+const enableMdns = args.includes('--mdns');
 const portFlag = args.indexOf('--port');
 const port = portFlag !== -1 ? parseInt(args[portFlag + 1], 10) : 9876;
 
@@ -44,6 +45,7 @@ const config: Partial<MagicConfig> = {
   ...(seedNodes !== undefined ? { seedNodes } : {}),
   subscribedTags: tags,
   dataDir: `./data/node-${port}`,
+  enableMdns,
 };
 
 async function main() {
