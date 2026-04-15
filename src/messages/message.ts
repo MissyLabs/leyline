@@ -40,6 +40,9 @@ const MAX_TAG_LENGTH = 100;
 /** Maximum clock skew tolerated for incoming messages (5 minutes in ms). */
 const MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
 
+/** Maximum age of a message before it's considered stale (10 minutes in ms). */
+const MAX_MESSAGE_AGE_MS = 10 * 60 * 1000;
+
 /** Required nonce length in bytes. */
 const NONCE_LENGTH = 16;
 
@@ -452,6 +455,22 @@ export function validateMessage(msg: MagicMessage): ValidationResult {
     };
   }
 
+  // Cheap timestamp checks before expensive SHA-256 recomputation
+  const now = Date.now();
+  if (msg.timestamp > now + MAX_FUTURE_SKEW_MS) {
+    return {
+      valid: false,
+      error: `Timestamp is too far in the future: ${msg.timestamp - now}ms ahead`,
+    };
+  }
+
+  if (msg.timestamp < now - MAX_MESSAGE_AGE_MS) {
+    return {
+      valid: false,
+      error: `Message is too old: ${now - msg.timestamp}ms in the past (max ${MAX_MESSAGE_AGE_MS}ms)`,
+    };
+  }
+
   // Recompute message ID to prevent forgery (attacker changing ID to bypass dedup)
   const expectedId = computeId(msg.payload, msg.tags, msg.timestamp, msg.nonce);
   if (!buffersEqual(msg.id, expectedId)) {
@@ -490,14 +509,6 @@ export function validateMessage(msg: MagicMessage): ValidationResult {
 
   if (msg.ttl <= 0) {
     return { valid: false, error: `TTL must be greater than zero, got ${msg.ttl}` };
-  }
-
-  const now = Date.now();
-  if (msg.timestamp > now + MAX_FUTURE_SKEW_MS) {
-    return {
-      valid: false,
-      error: `Timestamp is too far in the future: ${msg.timestamp - now}ms ahead`,
-    };
   }
 
   if (msg.nonce.length !== NONCE_LENGTH) {
