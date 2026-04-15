@@ -61,4 +61,14 @@ describe('mergeConfig', () => {
     expect(config.rateLimitPerMinute).toBe(10);
     expect(config.autoBlockThreshold).toBe(5);
   });
+
+  it('defaults enableMdns to false', () => {
+    const config = mergeConfig({});
+    expect(config.enableMdns).toBe(false);
+  });
+
+  it('enables mDNS when configured', () => {
+    const config = mergeConfig({ enableMdns: true });
+    expect(config.enableMdns).toBe(true);
+  });
 });
