@@ -112,6 +112,7 @@ describe('Index — public API exports', () => {
     expect(typeof leyline.setGlobalLogLevel).toBe('function');
     expect(typeof leyline.getGlobalLogLevel).toBe('function');
     expect(typeof leyline.setGlobalLogHandler).toBe('function');
+    expect(leyline.CircuitBreaker).toBeDefined();
   });
 
   it('exports crypto envelope', () => {

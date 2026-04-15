@@ -75,6 +75,7 @@ export interface NodeStatus {
   paused: boolean;
   uptime: number;
   version: string;
+  circuitBreakerOpen: number;
 }
 
 export class MagicNode {
@@ -1007,6 +1008,7 @@ export class MagicNode {
       paused: this.paused,
       uptime: 0,
       version: LEYLINE_VERSION,
+      circuitBreakerOpen: this.circuitBreaker.getOpenPeers().length,
     };
   }
 
