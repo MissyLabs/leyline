@@ -158,7 +158,14 @@ export class SeedNode extends MagicNode {
     await this.peerDb?.close();
     this.peerDb = null;
     this.peerSubscriptions.clear();
+    if (this.libp2p) {
+      const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
+      for (const topic of this.mirroredTopics) {
+        try { gs.unsubscribe(topic); } catch { /* already torn down */ }
+      }
+    }
     this.mirroredTopics.clear();
+    this.ledgerSubmitTimestamps.clear();
     await super.stop();
   }
 
