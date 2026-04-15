@@ -930,8 +930,8 @@ export class MagicNode {
           // Expected — seed may still be unreachable
         });
       }
-    }).catch(() => {
-      // multiaddr module not available — shouldn't happen in practice
+    }).catch((err) => {
+      console.warn(`[Magic] multiaddr import failed in redialSeeds: ${err}`);
     });
   }
 

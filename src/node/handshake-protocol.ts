@@ -193,7 +193,9 @@ export class HandshakeProtocol {
   private disconnectPeer(peerId: string): void {
     const peerIdObj = this.libp2p.getPeers().find((p) => p.toString() === peerId);
     if (peerIdObj) {
-      this.libp2p.hangUp(peerIdObj).catch(() => {});
+      this.libp2p.hangUp(peerIdObj).catch((err) => {
+        console.warn(`[Handshake] hangUp failed for ${peerId}: ${err}`);
+      });
     }
   }
 

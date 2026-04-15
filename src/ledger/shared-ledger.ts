@@ -269,4 +269,54 @@ export class SharedLedger {
     }
     return entries;
   }
+
+  /**
+   * Roll back the ledger to a given index, deleting all entries after it.
+   * Used during fork resolution to replace a divergent suffix.
+   * Serialized via the submit lock to prevent concurrent corruption.
+   */
+  async rollbackTo(targetIndex: number): Promise<void> {
+    const prev = this.submitLock;
+    let resolve!: () => void;
+    this.submitLock = new Promise<void>((r) => { resolve = r; });
+
+    try {
+      await prev;
+      await this.rollbackToInner(targetIndex);
+    } finally {
+      resolve();
+    }
+  }
+
+  private async rollbackToInner(targetIndex: number): Promise<void> {
+    if (targetIndex < 0) targetIndex = 0;
+    if (targetIndex >= this.currentIndex) return;
+
+    for (let i = this.currentIndex; i > targetIndex; i--) {
+      try {
+        await this.db.del(`entry:${i}`);
+      } catch {
+        // Entry may already be missing
+      }
+    }
+
+    if (targetIndex === 0) {
+      this.currentIndex = 0;
+      this.latestHash = new Uint8Array(0);
+    } else {
+      const entry = await this.getEntry(targetIndex);
+      if (entry) {
+        this.currentIndex = targetIndex;
+        this.latestHash = entry.hash;
+      } else {
+        this.currentIndex = 0;
+        this.latestHash = new Uint8Array(0);
+      }
+    }
+
+    await this.db.put('meta:latest', JSON.stringify({
+      index: this.currentIndex,
+      hash: toHex(this.latestHash),
+    }));
+  }
 }

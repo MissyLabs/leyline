@@ -46,6 +46,7 @@ export {
   type ConsensusConfig,
   type EntryProposal,
 } from './ledger/consensus.js';
+export { ForkResolver, type ForkInfo, type PeerChainQuerier } from './ledger/fork-resolver.js';
 
 // Peer Exchange
 export { PeerExchange, type PeerRecord } from './node/peer-exchange.js';
