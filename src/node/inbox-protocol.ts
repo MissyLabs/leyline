@@ -167,12 +167,12 @@ export class InboxServer {
                 peerTopics.has(t),
               );
 
-              const messages = this.buffer.getForTopics(authorizedTopics, req.since);
-              const limited = messages.slice(0, Math.min(req.limit, 500));
+              const cap = Math.min(req.limit, 500);
+              const messages = this.buffer.getForTopics(authorizedTopics, req.since, cap);
 
               const response: InboxResponse = {
                 type: 'messages',
-                messages: limited.map((m) => ({
+                messages: messages.map((m) => ({
                   data: Buffer.from(m.data).toString('base64'),
                   topic: m.topic,
                   receivedAt: m.receivedAt,
