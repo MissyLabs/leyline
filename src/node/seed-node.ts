@@ -5,7 +5,7 @@ import { MagicNode } from './magic-node.js';
 import type { MagicConfig } from '../config/config.js';
 import { MessageBuffer } from './message-buffer.js';
 import { InboxServer } from './inbox-protocol.js';
-import { publicKeyToHex } from '../identity/keypair.js';
+import { publicKeyToHex, verify } from '../identity/keypair.js';
 import { HealthCheckServer } from './health-check.js';
 
 interface StoredPeer {
@@ -37,6 +37,11 @@ export class SeedNode extends MagicNode {
   private topicMirrorHandler: ((evt: CustomEvent) => void) | null = null;
   private subscriptionTrackHandler: ((evt: CustomEvent) => void) | null = null;
   private healthCheck: HealthCheckServer | null = null;
+  /** Per-submitter rate limiting for ledger entries: pubkeyHex → timestamps */
+  private ledgerSubmitTimestamps = new Map<string, number[]>();
+  /** Max ledger submissions per submitter per window */
+  private static readonly LEDGER_RATE_LIMIT = 10;
+  private static readonly LEDGER_RATE_WINDOW_MS = 60_000;
 
   constructor(config: Partial<MagicConfig>) {
     super(
@@ -399,11 +404,34 @@ export class SeedNode extends MagicNode {
         if (pending.length === 0) return;
 
         for (const proposal of pending) {
-          // Add our own confirmation
+          // Verify submitter signature before confirming
+          let sigValid = false;
+          try {
+            sigValid = await verify(
+              proposal.submitterPubkey,
+              proposal.signature,
+              proposal.data,
+            );
+          } catch {
+            // Malformed key or signature
+          }
+          if (!sigValid) {
+            consensus.reject(proposal.hash);
+            console.warn(`[Seed] Rejected proposal with invalid submitter signature`);
+            continue;
+          }
+
+          // Per-submitter rate limiting
+          const submitterHex = publicKeyToHex(proposal.submitterPubkey);
+          if (!this.checkLedgerRateLimit(submitterHex)) {
+            consensus.reject(proposal.hash);
+            console.warn(`[Seed] Rate-limited ledger submission from ${submitterHex.slice(0, 16)}...`);
+            continue;
+          }
+
           const reached = consensus.addConfirmation(proposal.hash, localPubkeyHex);
 
           if (reached) {
-            // Quorum reached — commit to the shared ledger
             const committed = consensus.getProposal(proposal.hash);
             if (committed) {
               await sharedLedger.submit(
@@ -415,7 +443,6 @@ export class SeedNode extends MagicNode {
               const count = await sharedLedger.getEntryCount();
               console.log(`[Seed] Ledger: confirmed entry (${count} total)`);
 
-              // Immediately broadcast the confirmed entry to all peers
               if (ledgerSync) {
                 const entry = await sharedLedger.getLatest();
                 if (entry) {
@@ -430,6 +457,24 @@ export class SeedNode extends MagicNode {
         console.error('[Seed] Ledger participation error:', err);
       }
     }, 5_000);
+  }
+
+  private checkLedgerRateLimit(submitterHex: string): boolean {
+    const now = Date.now();
+    const cutoff = now - SeedNode.LEDGER_RATE_WINDOW_MS;
+    let timestamps = this.ledgerSubmitTimestamps.get(submitterHex);
+    if (!timestamps) {
+      timestamps = [];
+      this.ledgerSubmitTimestamps.set(submitterHex, timestamps);
+    }
+    // Prune old entries
+    const firstValid = timestamps.findIndex(t => t > cutoff);
+    if (firstValid > 0) timestamps.splice(0, firstValid);
+    else if (firstValid === -1) timestamps.length = 0;
+
+    if (timestamps.length >= SeedNode.LEDGER_RATE_LIMIT) return false;
+    timestamps.push(now);
+    return true;
   }
 
   /** Get the topic subscriptions for a specific peer (for inbox authorization). */

@@ -4,7 +4,7 @@ import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { SharedLedger, type SharedLedgerEntry } from './shared-ledger.js';
 import { LedgerConsensus } from './consensus.js';
-import { verify, publicKeyToHex } from '../identity/keypair.js';
+import { sign, verify, publicKeyToHex } from '../identity/keypair.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
 
 /**
@@ -49,7 +49,9 @@ interface PushEntry extends SyncMessage {
 interface ConfirmEntry extends SyncMessage {
   type: 'confirm-entry';
   entryIndex: number;
+  entryHash: string; // hex — binds confirmation to a specific entry
   confirmerPubkey: string; // hex
+  confirmationSignature: string; // hex — Ed25519 sig over "confirm:{entryHash}"
 }
 
 /** JSON-safe entry for wire transfer */
@@ -501,13 +503,18 @@ export class LedgerSync {
                   );
                   self.events.onEntryReceived?.(entry);
 
-                  // Send back a confirmation so the sender can count us
+                  // Send back a signed confirmation so the sender can count us
+                  const entryHash = toHex(entry.hash);
+                  const confirmPayload = new TextEncoder().encode(`confirm:${entryHash}`);
+                  const confirmSig = await sign(self.localPrivkey, confirmPayload);
                   const confirm: ConfirmEntry = {
                     type: 'confirm-entry',
                     senderPeerId: self.localPeerId,
                     timestamp: Date.now(),
                     entryIndex: entry.index,
+                    entryHash,
                     confirmerPubkey: toHex(self.localPubkey),
+                    confirmationSignature: toHex(confirmSig),
                   };
                   yield encode(confirm);
                 }
@@ -516,18 +523,38 @@ export class LedgerSync {
 
               case 'confirm-entry': {
                 const confirm = syncMsg as ConfirmEntry;
-                // Only accept confirmations from the peer we're actually connected to
-                // (the confirmerPubkey in the message must match the stream sender).
-                // Since we can't verify the pubkey against the stream peer directly,
-                // we use the senderPeerId from the message as a cross-check — the
-                // confirmation is only meaningful from the peer that opened this stream.
-                // The confirmerPubkey is recorded but the quorum security comes from
-                // each peer only being able to add ONE confirmation per entry.
                 const confirmerHex = confirm.confirmerPubkey;
 
-                // Route confirmation to the specific entry, not all proposals
+                // Validate field lengths
+                if (!confirmerHex || confirmerHex.length !== 64 ||
+                    !confirm.entryHash || confirm.entryHash.length !== 64 ||
+                    !confirm.confirmationSignature || confirm.confirmationSignature.length !== 128) {
+                  break;
+                }
+
+                // Verify the confirmation is cryptographically signed by the confirmer
+                const confirmData = new TextEncoder().encode(`confirm:${confirm.entryHash}`);
+                let sigValid = false;
+                try {
+                  sigValid = await verify(
+                    fromHex(confirmerHex),
+                    fromHex(confirm.confirmationSignature),
+                    confirmData,
+                  );
+                } catch {
+                  // Malformed key or signature
+                }
+                if (!sigValid) {
+                  break;
+                }
+
+                // Verify entryHash matches the actual entry at the claimed index
+                const ledgerEntry = await self.ledger.getEntry(confirm.entryIndex);
+                if (ledgerEntry && toHex(ledgerEntry.hash) !== confirm.entryHash) {
+                  break;
+                }
+
                 await self.handleConfirmationForEntry(confirmerHex, confirm.entryIndex);
-                // Also record confirmation on already-committed entries
                 await self.ledger.addConfirmation(
                   confirm.entryIndex,
                   fromHex(confirmerHex),
