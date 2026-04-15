@@ -119,8 +119,10 @@ function decode(data: Uint8Array): AnySyncMessage {
   }
   // Sanitize numeric fields to prevent NaN/Infinity
   if (parsed.type === 'range-request') {
-    parsed.startIndex = Math.max(0, Math.floor(parsed.startIndex ?? 0));
-    parsed.endIndex = Math.max(0, Math.floor(parsed.endIndex ?? 0));
+    const si = Number(parsed.startIndex);
+    const ei = Number(parsed.endIndex);
+    parsed.startIndex = Number.isFinite(si) ? Math.max(0, Math.floor(si)) : 0;
+    parsed.endIndex = Number.isFinite(ei) ? Math.max(0, Math.floor(ei)) : 0;
   }
   return parsed;
 }
