@@ -22,6 +22,7 @@
 import { randomBytes, createHash } from "node:crypto";
 import { sign, verify } from "../identity/keypair.js";
 import { encodeMessage as protoEncode, decodeMessage as protoDecode } from "./proto.js";
+import { compressMessage, decompressMessage } from "../utils/compression.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -379,7 +380,8 @@ export function serializeMessage(
   if (format === "json") {
     return serializeMessageJson(msg);
   }
-  return protoEncode(msg);
+  const raw = protoEncode(msg);
+  return compressMessage(raw);
 }
 
 /**
@@ -404,7 +406,8 @@ export function deserializeMessage(
   if (format === "json") {
     return deserializeMessageJson(data);
   }
-  return protoDecode(data);
+  const raw = decompressMessage(data);
+  return protoDecode(raw);
 }
 
 /**
