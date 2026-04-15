@@ -280,9 +280,35 @@ export class LedgerSync {
         [encode(msg)],
         (source) => lp.encode(source),
         stream,
+        (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
+        async (source) => {
+          for await (const chunk of source) {
+            const syncMsg = decode(chunk.subarray());
+            if (syncMsg.type === 'confirm-entry') {
+              const confirm = syncMsg as ConfirmEntry;
+              const confirmerHex = confirm.confirmerPubkey;
+              if (!confirmerHex || confirmerHex.length !== 64 ||
+                  !confirm.entryHash || confirm.entryHash.length !== 64 ||
+                  !confirm.confirmationSignature || confirm.confirmationSignature.length !== 128) {
+                continue;
+              }
+              const confirmData = new TextEncoder().encode(`confirm:${confirm.entryHash}`);
+              let sigValid = false;
+              try {
+                sigValid = await verify(fromHex(confirmerHex), fromHex(confirm.confirmationSignature), confirmData);
+              } catch { /* malformed */ }
+              if (sigValid) {
+                await this.handleConfirmationForEntry(confirmerHex, confirm.entryIndex);
+                await this.ledger.addConfirmation(confirm.entryIndex, fromHex(confirmerHex));
+                this.events.onEntryConfirmed?.(confirm.entryIndex, confirmerHex);
+              }
+            }
+          }
+        },
       );
     } catch {
-      // Stream error
+      // Stream error or timeout
     } finally {
       try { stream.close(); } catch { /* already closed */ }
     }

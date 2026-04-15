@@ -47,6 +47,9 @@ export interface MagicNodeEvents {
   onDirectMessage?: (envelope: DirectEnvelope) => void;
   onPeerConnected?: (peerId: string) => void;
   onPeerDisconnected?: (peerId: string) => void;
+  onSeedConnectivityChange?: (connectedSeeds: number, totalSeeds: number) => void;
+  onDegraded?: (reason: string) => void;
+  onRecovered?: () => void;
 }
 
 export class MagicNode {
@@ -82,6 +85,12 @@ export class MagicNode {
   private pendingTimeouts = new Set<ReturnType<typeof setTimeout>>();
   /** Whether the node is in the process of stopping. */
   private stopping = false;
+  /** Timer for periodic seed connectivity monitoring. */
+  private seedMonitorTimer: ReturnType<typeof setInterval> | null = null;
+  /** Whether the node is currently in degraded mode (no seeds reachable). */
+  private degraded = false;
+  /** Parsed seed PeerIds for connectivity tracking. */
+  private seedPeerIds = new Set<string>();
 
   // --- Global inbound rate limiting (token burn protection) ---
   /** Timestamps of messages delivered to handlers in the current window. */
@@ -215,6 +224,18 @@ export class MagicNode {
     // Track peer connections — auto-fetch missed messages from seeds on connect
     this.peerConnectHandler = (evt: CustomEvent) => {
       const peerId = evt.detail.toString();
+
+      // Track seed PeerIds: if this connection came from bootstrap, remember the PeerId
+      if (this.config.seedNodes.length > 0 && this.libp2p) {
+        const conns = this.libp2p.getConnections(evt.detail);
+        for (const conn of conns) {
+          const remoteAddr = conn.remoteAddr.toString();
+          if (this.config.seedNodes.some((seed) => remoteAddr.includes(seed.split('/p2p/')[0]))) {
+            this.seedPeerIds.add(peerId);
+          }
+        }
+      }
+
       this.events.onPeerConnected?.(peerId);
 
       // When we connect to a peer, try to fetch any messages we missed while offline.
@@ -378,6 +399,14 @@ export class MagicNode {
       }, 30_000);
     }
 
+    // Seed connectivity monitoring: track which seeds are reachable, emit
+    // degraded/recovered events, and attempt manual re-dial when disconnected.
+    if (this.config.seedNodes.length > 0 && !this.config.isSeedNode) {
+      this.seedMonitorTimer = setInterval(() => {
+        this.checkSeedConnectivity();
+      }, 15_000);
+    }
+
     const fingerprint = getFingerprint(this.publicKey);
     const addrs = this.libp2p.getMultiaddrs().map((a) => a.toString());
     console.log(`[Magic] Node started: ${fingerprint} (v${LEYLINE_VERSION})`);
@@ -399,6 +428,10 @@ export class MagicNode {
     if (this.inboxPollTimer) {
       clearInterval(this.inboxPollTimer);
       this.inboxPollTimer = null;
+    }
+    if (this.seedMonitorTimer) {
+      clearInterval(this.seedMonitorTimer);
+      this.seedMonitorTimer = null;
     }
     for (const timer of this.pendingTimeouts) {
       clearTimeout(timer);
@@ -804,6 +837,73 @@ export class MagicNode {
   /** Get the peer reputation tracker. */
   getPeerReputation(): PeerReputation {
     return this.peerReputation;
+  }
+
+  /** Whether the node is currently degraded (no seeds reachable). */
+  isDegraded(): boolean {
+    return this.degraded;
+  }
+
+  /** Get the number of connected seed nodes. */
+  getConnectedSeedCount(): number {
+    if (!this.libp2p) return 0;
+    const connectedPeerIds = new Set(this.libp2p.getPeers().map((p) => p.toString()));
+    let count = 0;
+    for (const seedPeerId of this.seedPeerIds) {
+      if (connectedPeerIds.has(seedPeerId)) count++;
+    }
+    return count;
+  }
+
+  private checkSeedConnectivity(): void {
+    if (!this.libp2p || this.stopping) return;
+
+    const connectedPeerIds = new Set(this.libp2p.getPeers().map((p) => p.toString()));
+
+    // Build seedPeerIds from connected peers that match configured seed multiaddrs.
+    // libp2p bootstrap dials seed addrs and we discover their PeerIds from connections.
+    // Once we know a PeerId belongs to a seed, we track it persistently.
+    // On initial start before any connection, seedPeerIds is empty and we track via
+    // total connected peers as a fallback.
+    const totalPeers = connectedPeerIds.size;
+    const connectedSeeds = this.seedPeerIds.size > 0
+      ? [...this.seedPeerIds].filter((id) => connectedPeerIds.has(id)).length
+      : 0;
+
+    const totalSeeds = Math.max(this.seedPeerIds.size, this.config.seedNodes.length);
+
+    this.events.onSeedConnectivityChange?.(connectedSeeds, totalSeeds);
+
+    if (totalPeers === 0 && !this.degraded) {
+      this.degraded = true;
+      const reason = 'No peers connected — operating in degraded mode (messages will be queued locally)';
+      console.warn(`[Magic] ${reason}`);
+      this.events.onDegraded?.(reason);
+
+      // Attempt manual re-dial to seeds
+      this.redialSeeds();
+    } else if (totalPeers > 0 && this.degraded) {
+      this.degraded = false;
+      console.log('[Magic] Seed connectivity restored — recovered from degraded mode');
+      this.events.onRecovered?.();
+    }
+  }
+
+  private redialSeeds(): void {
+    if (!this.libp2p || this.stopping) return;
+
+    import('@multiformats/multiaddr').then(({ multiaddr }) => {
+      for (const seedAddr of this.config.seedNodes) {
+        if (!this.libp2p || this.stopping) return;
+        this.libp2p.dial(multiaddr(seedAddr)).then(() => {
+          console.log(`[Magic] Re-dial succeeded: ${seedAddr}`);
+        }).catch(() => {
+          // Expected — seed may still be unreachable
+        });
+      }
+    }).catch(() => {
+      // multiaddr module not available — shouldn't happen in practice
+    });
   }
 
   protected async handleIncomingMessage(topic: string, data: Uint8Array): Promise<void> {

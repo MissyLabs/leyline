@@ -328,6 +328,8 @@ export class DiscoveryProtocol {
       );
     } catch {
       // Stream errors are expected during peer churn; return what we have.
+    } finally {
+      try { stream.close(); } catch { /* already closed */ }
     }
 
     return collected;
