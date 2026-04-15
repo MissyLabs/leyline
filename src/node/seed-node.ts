@@ -6,6 +6,7 @@ import type { MagicConfig } from '../config/config.js';
 import { MessageBuffer } from './message-buffer.js';
 import { InboxServer } from './inbox-protocol.js';
 import { publicKeyToHex } from '../identity/keypair.js';
+import { HealthCheckServer } from './health-check.js';
 
 interface StoredPeer {
   peerId: string;
@@ -35,6 +36,7 @@ export class SeedNode extends MagicNode {
   private messageCaptureHandler: ((evt: CustomEvent) => void) | null = null;
   private topicMirrorHandler: ((evt: CustomEvent) => void) | null = null;
   private subscriptionTrackHandler: ((evt: CustomEvent) => void) | null = null;
+  private healthCheck: HealthCheckServer | null = null;
 
   constructor(config: Partial<MagicConfig>) {
     super(
@@ -102,6 +104,17 @@ export class SeedNode extends MagicNode {
     // reached even when the submitting bot disconnects immediately.
     this.startLedgerParticipation();
     console.log('[Seed] Ledger participation active — will auto-confirm entries');
+
+    if (this.config.healthCheckPort > 0) {
+      this.healthCheck = new HealthCheckServer(this.config.healthCheckPort, {
+        libp2p: this.libp2p!,
+        getTopicCount: () => this.mirroredTopics.size,
+        getBufferedMessageCount: () => this.messageBuffer.getCount(),
+        getKnownPeerCount: () => this.knownPeers.size,
+        getLedgerEntryCount: () => this.sharedLedger.getEntryCount(),
+      });
+      await this.healthCheck.start();
+    }
   }
 
   async stop(): Promise<void> {
@@ -131,6 +144,8 @@ export class SeedNode extends MagicNode {
       }
     }
 
+    await this.healthCheck?.stop();
+    this.healthCheck = null;
     this.messageBuffer.stop();
     await this.inboxServer?.stop();
     await this.peerDb?.close();

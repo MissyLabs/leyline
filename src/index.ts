@@ -99,6 +99,9 @@ export {
   type HandshakeEvents,
 } from './node/handshake-protocol.js';
 
+// Health Check
+export { HealthCheckServer, type HealthStatus, type HealthCheckDeps } from './node/health-check.js';
+
 // Store-and-Forward
 export { MessageBuffer, type BufferedMessage, type MessageBufferConfig } from './node/message-buffer.js';
 export { InboxServer, InboxClient, INBOX_PROTOCOL } from './node/inbox-protocol.js';

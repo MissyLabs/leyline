@@ -107,6 +107,9 @@ export interface MagicConfig {
 
   /** Port for the WebSocket listener */
   webSocketPort: number;
+
+  /** Port for the seed node HTTP health check endpoint. 0 to disable. */
+  healthCheckPort: number;
 }
 
 export const DEFAULT_CONFIG: MagicConfig = {
@@ -127,6 +130,7 @@ export const DEFAULT_CONFIG: MagicConfig = {
   enableWebSocket: true,
   enableRelay: true,
   webSocketPort: 9877,
+  healthCheckPort: 0,
 };
 
 export function mergeConfig(partial: Partial<MagicConfig>): MagicConfig {
