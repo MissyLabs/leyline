@@ -320,11 +320,18 @@ export function deserializeMessageJson(data: Uint8Array): MagicMessage {
     throw new TypeError("Malformed wire message: missing or incorrectly typed field(s)");
   }
 
+  const MAX_HEX_FIELD = MAX_PAYLOAD_SIZE * 2 + 128;
+  if (wire.id.length > 128 || wire.senderPubkey.length > 128 ||
+      wire.signature.length > 256 || wire.nonce.length > 128 ||
+      wire.payload.length > MAX_HEX_FIELD) {
+    throw new RangeError("Wire message field exceeds size limit");
+  }
+
   return {
     id: new Uint8Array(Buffer.from(wire.id, "hex")),
     senderPubkey: new Uint8Array(Buffer.from(wire.senderPubkey, "hex")),
     signature: new Uint8Array(Buffer.from(wire.signature, "hex")),
-    tags: wire.tags,
+    tags: wire.tags.filter((t): t is string => typeof t === 'string').slice(0, 50),
     payload: new Uint8Array(Buffer.from(wire.payload, "hex")),
     timestamp: wire.timestamp,
     nonce: new Uint8Array(Buffer.from(wire.nonce, "hex")),
