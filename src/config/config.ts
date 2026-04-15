@@ -117,6 +117,14 @@ export interface MagicConfig {
 
   /** Enable mDNS for automatic local network peer discovery. */
   enableMdns: boolean;
+
+  /**
+   * Maximum number of peer connections this node will maintain.
+   * Once reached, new inbound connections are rejected.
+   * Set to 0 for unlimited (not recommended for production).
+   * @defaultValue 100
+   */
+  maxConnections: number;
 }
 
 export const DEFAULT_CONFIG: MagicConfig = {
@@ -139,6 +147,7 @@ export const DEFAULT_CONFIG: MagicConfig = {
   webSocketPort: 9877,
   healthCheckPort: 0,
   enableMdns: false,
+  maxConnections: 100,
 };
 
 export function mergeConfig(partial: Partial<MagicConfig>): MagicConfig {

@@ -114,6 +114,7 @@ export { withTimeout, STREAM_TIMEOUT_MS, StreamAbortedError } from './utils/stre
 export { compressMessage, decompressMessage, isCompressedMessage } from './utils/compression.js';
 export { NodeMetrics, type MetricEvent, type MetricsSnapshot } from './utils/metrics.js';
 export { PartitionDetector, type PartitionEvent, type PartitionDetectorConfig } from './utils/partition-detector.js';
+export { PriorityQueue, MessagePriority } from './utils/priority-queue.js';
 export {
   Logger,
   LogLevel,

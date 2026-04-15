@@ -45,6 +45,7 @@ import { IdentityStore } from '../identity/store.js';
 import { NodeMetrics } from '../utils/metrics.js';
 import { Logger } from '../utils/logger.js';
 import { PartitionDetector, type PartitionEvent } from '../utils/partition-detector.js';
+import { PriorityQueue, MessagePriority } from '../utils/priority-queue.js';
 
 export interface MagicNodeEvents {
   onMessage?: (msg: MagicMessage, tag: string) => void;
@@ -196,6 +197,11 @@ export class MagicNode {
       connectionEncrypters: [noise()],
       streamMuxers: [yamux()],
       services,
+      ...(this.config.maxConnections > 0 ? {
+        connectionManager: {
+          maxConnections: this.config.maxConnections,
+        },
+      } : {}),
       ...(() => {
         const discoveryModules: unknown[] = [];
         if (this.config.seedNodes.length > 0) {
@@ -606,6 +612,42 @@ export class MagicNode {
         queue.shift(); // Drop oldest
       }
       queue.push({ msg, tag: t });
+      drain();
+    });
+  }
+
+  /**
+   * Like `onTagQueued`, but messages are processed in priority order.
+   * The `assignPriority` callback classifies each message. Lower number = higher precedence.
+   * When the queue is full, lowest-priority messages are dropped first.
+   */
+  onTagPriority(
+    tag: string,
+    handler: (msg: MagicMessage, tag: string) => Promise<void>,
+    assignPriority: (msg: MagicMessage) => MessagePriority = () => MessagePriority.NORMAL,
+    maxQueueSize: number = 50,
+  ): void {
+    const queue = new PriorityQueue<{ msg: MagicMessage; tag: string }>(maxQueueSize);
+    let processing = false;
+
+    const drain = async () => {
+      if (processing) return;
+      processing = true;
+      let item: { msg: MagicMessage; tag: string } | undefined;
+      while ((item = queue.pop()) !== undefined) {
+        try {
+          await handler(item.msg, item.tag);
+        } catch (err) {
+          this.log.error(`onTagPriority handler error`, { tag, error: (err as Error)?.message ?? String(err) });
+        }
+      }
+      processing = false;
+    };
+
+    this.tagPubSub?.onTag(tag, (data: Uint8Array, t: string) => {
+      const msg = deserializeMessage(data);
+      const priority = assignPriority(msg);
+      queue.push({ msg, tag: t }, priority);
       drain();
     });
   }
