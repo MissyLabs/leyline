@@ -79,6 +79,7 @@ export {
 export {
   DiscoveryProtocol,
   type DiscoveryTrustChecker,
+  type DiscoveryRateLimitConfig,
   DISCOVERY_PROTOCOL,
 } from './discovery/discovery-protocol.js';
 

@@ -123,6 +123,14 @@ export interface DiscoveryTrustChecker {
   isAllowed(pubkeyHex: string): boolean;
 }
 
+/** Per-peer rate limiting for discovery requests. */
+export interface DiscoveryRateLimitConfig {
+  /** Maximum requests per window per peer (default 30). */
+  maxRequestsPerWindow?: number;
+  /** Window duration in milliseconds (default 60_000). */
+  windowMs?: number;
+}
+
 export class DiscoveryProtocol {
   private readonly libp2p: Libp2p;
   private readonly registry: ServiceRegistry;
@@ -137,6 +145,10 @@ export class DiscoveryProtocol {
   /** How often to prune expired services (60 seconds). */
   private readonly pruneIntervalMs = 60_000;
 
+  /** Per-peer request timestamps for rate limiting. */
+  private readonly peerRequestTimes = new Map<string, number[]>();
+  private readonly rateLimitConfig: Required<DiscoveryRateLimitConfig>;
+
   constructor(
     libp2p: Libp2p,
     registry: ServiceRegistry,
@@ -144,6 +156,7 @@ export class DiscoveryProtocol {
     localPeerId: string,
     localPrivateKey: Uint8Array,
     trustChecker?: DiscoveryTrustChecker,
+    rateLimitConfig?: DiscoveryRateLimitConfig,
   ) {
     this.libp2p = libp2p;
     this.registry = registry;
@@ -151,6 +164,30 @@ export class DiscoveryProtocol {
     this.localPeerId = localPeerId;
     this.localPrivateKey = localPrivateKey;
     this.trustChecker = trustChecker;
+    this.rateLimitConfig = {
+      maxRequestsPerWindow: rateLimitConfig?.maxRequestsPerWindow ?? 30,
+      windowMs: rateLimitConfig?.windowMs ?? 60_000,
+    };
+  }
+
+  /** Check and record a request from a peer. Returns false if rate-limited. */
+  checkRateLimit(peerId: string): boolean {
+    const now = Date.now();
+    const windowStart = now - this.rateLimitConfig.windowMs;
+    let times = this.peerRequestTimes.get(peerId);
+    if (!times) {
+      times = [];
+      this.peerRequestTimes.set(peerId, times);
+    }
+    // Evict timestamps outside window
+    while (times.length > 0 && times[0] < windowStart) {
+      times.shift();
+    }
+    if (times.length >= this.rateLimitConfig.maxRequestsPerWindow) {
+      return false;
+    }
+    times.push(now);
+    return true;
   }
 
   /**
@@ -197,8 +234,9 @@ export class DiscoveryProtocol {
    * timer.
    */
   async start(): Promise<void> {
-    await this.libp2p.handle(DISCOVERY_PROTOCOL, async ({ stream }) => {
-      await this.handleIncoming(stream);
+    await this.libp2p.handle(DISCOVERY_PROTOCOL, async ({ stream, connection }) => {
+      const remotePeerId = connection.remotePeer.toString();
+      await this.handleIncoming(stream, remotePeerId);
     });
 
     this.pruneTimer = setInterval(() => {
@@ -217,6 +255,7 @@ export class DiscoveryProtocol {
       clearInterval(this.pruneTimer);
       this.pruneTimer = null;
     }
+    this.peerRequestTimes.clear();
 
     await this.libp2p.unhandle(DISCOVERY_PROTOCOL);
   }
@@ -385,7 +424,7 @@ export class DiscoveryProtocol {
    *   no reply.
    * - `result` — unexpected as an inbound opener; ignored.
    */
-  private async handleIncoming(stream: Stream): Promise<void> {
+  private async handleIncoming(stream: Stream, remotePeerId: string): Promise<void> {
     const self = this;
 
     try {
@@ -398,6 +437,10 @@ export class DiscoveryProtocol {
         ): AsyncIterable<Uint8Array> {
           for await (const chunk of source) {
             const msg = decodeMsg(chunk.subarray());
+
+            if (!self.checkRateLimit(remotePeerId)) {
+              break;
+            }
 
             if (msg.kind === 'query') {
               // Search local registry and respond, capped to prevent amplification
