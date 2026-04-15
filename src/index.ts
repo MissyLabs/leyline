@@ -35,6 +35,7 @@ export { TagPubSub } from './pubsub/tag-pubsub.js';
 // Trust
 export { TrustPolicy, SpamFilter } from './trust/policy.js';
 export { PersistentTrustPolicy, PersistentSpamFilter } from './trust/persistent-policy.js';
+export { PeerReputation, type PeerReputationRecord, type PeerReputationConfig } from './trust/peer-reputation.js';
 
 // Ledgers
 export { LocalLedger } from './ledger/local-log.js';
