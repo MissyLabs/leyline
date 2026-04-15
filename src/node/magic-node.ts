@@ -415,6 +415,8 @@ export class MagicNode {
     await this.trustPolicy.close();
     await this.spamFilter.close();
     this.peerReputation.clear();
+    this.payloadBudgets.clear();
+    this.inboundTimestamps = [];
 
     // Remove event listeners before stopping libp2p
     if (this.libp2p && this.gossipHandler) {
@@ -713,9 +715,9 @@ export class MagicNode {
   async waitForPeers(minPeers: number = 1, timeoutMs: number = 15_000): Promise<number> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
+      if (this.stopping) return this.getPeerCount();
       const count = this.getPeerCount();
       if (count >= minPeers) {
-        // Extra 2s for GossipSub mesh heartbeat to propagate subscriptions
         await new Promise((r) => setTimeout(r, 2000));
         return this.getPeerCount();
       }
