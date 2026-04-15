@@ -51,10 +51,10 @@ function makeMockPeer(
   };
 }
 
-function makeFakeEntry(index: number, hashFill: number, data: string, confirmations = 0): SharedLedgerEntry {
+function makeFakeEntry(index: number, hashFill: number, data: string, confirmations = 0, prevHash?: Uint8Array): SharedLedgerEntry {
   return {
     index,
-    prevHash: new Uint8Array(32).fill(0),
+    prevHash: prevHash ?? new Uint8Array(32).fill(0),
     hash: new Uint8Array(32).fill(hashFill),
     data: makeDummyData(data),
     submitterPubkey: dummyPubkey,
@@ -65,6 +65,16 @@ function makeFakeEntry(index: number, hashFill: number, data: string, confirmati
       ? Array.from({ length: confirmations }, (_, i) => new Uint8Array(32).fill(10 + i))
       : [],
   };
+}
+
+function makeFakeChain(entries: Array<{ index: number; hashFill: number; data: string; confirmations?: number }>): SharedLedgerEntry[] {
+  const result: SharedLedgerEntry[] = [];
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i];
+    const prevHash = i === 0 ? new Uint8Array(32).fill(0) : result[i - 1].hash;
+    result.push(makeFakeEntry(e.index, e.hashFill, e.data, e.confirmations ?? 0, prevHash));
+  }
+  return result;
 }
 
 describe('SharedLedger.rollbackTo', () => {
@@ -266,10 +276,10 @@ describe('ForkResolver.resolve', () => {
     const common = await buildChain(ledger, 3, 'common');
     await buildChain(ledger, 2, 'local-diverge');
 
-    const peerDivergent = [
-      makeFakeEntry(4, 0xaa, 'peer-4', 3),
-      makeFakeEntry(5, 0xbb, 'peer-5', 3),
-    ];
+    const peerDivergent = makeFakeChain([
+      { index: 4, hashFill: 0xaa, data: 'peer-4', confirmations: 3 },
+      { index: 5, hashFill: 0xbb, data: 'peer-5', confirmations: 3 },
+    ]);
     const peer = makeMockPeer(common, peerDivergent);
 
     const resolver = new ForkResolver(ledger);
@@ -313,11 +323,11 @@ describe('ForkResolver.resolve', () => {
     const common = await buildChain(ledger, 3, 'common');
     await buildChain(ledger, 1, 'local-short');
 
-    const peerDivergent = [
-      makeFakeEntry(4, 0xaa, 'peer-4'),
-      makeFakeEntry(5, 0xbb, 'peer-5'),
-      makeFakeEntry(6, 0xcc, 'peer-6'),
-    ];
+    const peerDivergent = makeFakeChain([
+      { index: 4, hashFill: 0xaa, data: 'peer-4' },
+      { index: 5, hashFill: 0xbb, data: 'peer-5' },
+      { index: 6, hashFill: 0xcc, data: 'peer-6' },
+    ]);
     const peer = makeMockPeer(common, peerDivergent);
 
     const resolver = new ForkResolver(ledger);
@@ -377,11 +387,11 @@ describe('ForkResolver.resolve', () => {
     const common = await buildChain(ledger, 5, 'common');
     await buildChain(ledger, 3, 'local-branch');
 
-    const peerDivergent = [
-      makeFakeEntry(6, 0xaa, 'peer-6', 5),
-      makeFakeEntry(7, 0xbb, 'peer-7', 5),
-      makeFakeEntry(8, 0xcc, 'peer-8', 5),
-    ];
+    const peerDivergent = makeFakeChain([
+      { index: 6, hashFill: 0xaa, data: 'peer-6', confirmations: 5 },
+      { index: 7, hashFill: 0xbb, data: 'peer-7', confirmations: 5 },
+      { index: 8, hashFill: 0xcc, data: 'peer-8', confirmations: 5 },
+    ]);
     const peer = makeMockPeer(common, peerDivergent);
 
     const resolver = new ForkResolver(ledger);

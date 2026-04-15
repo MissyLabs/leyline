@@ -41,20 +41,43 @@ export class ForkResolver {
   }
 
   async detectFork(peer: PeerChainQuerier): Promise<ForkInfo | null> {
-    const localCount = await this.ledger.getEntryCount();
-    const peerCount = await peer.getEntryCount();
+    let localCount: number;
+    let peerCount: number;
+    try {
+      localCount = await this.ledger.getEntryCount();
+      peerCount = await peer.getEntryCount();
+    } catch (err) {
+      this.log.warn('Failed to get entry counts during fork detection', { error: String(err) });
+      return null;
+    }
 
     if (localCount === 0 || peerCount === 0) return null;
+    if (!Number.isFinite(peerCount) || peerCount < 0) {
+      this.log.warn('Peer returned invalid entry count', { peerCount });
+      return null;
+    }
 
     const commonMax = Math.min(localCount, peerCount);
 
-    const tipHash = await peer.getEntryHash(commonMax);
-    const localTip = await this.ledger.getEntry(commonMax);
+    let tipHash: string | null;
+    let localTip: SharedLedgerEntry | null;
+    try {
+      tipHash = await peer.getEntryHash(commonMax);
+      localTip = await this.ledger.getEntry(commonMax);
+    } catch (err) {
+      this.log.warn('Failed to get tip entries during fork detection', { error: String(err) });
+      return null;
+    }
     if (!tipHash || !localTip) return null;
 
     if (toHex(localTip.hash) === tipHash) return null;
 
     const divergenceIndex = await this.binarySearchDivergence(peer, 1, commonMax);
+
+    if (divergenceIndex < 1 || divergenceIndex > commonMax) {
+      this.log.warn('Binary search returned out-of-bounds divergence index', { divergenceIndex, commonMax });
+      return null;
+    }
 
     return {
       divergenceIndex,
@@ -77,8 +100,20 @@ export class ForkResolver {
       return { ...fork, resolved: false, winner: 'none' };
     }
 
-    const localSuffix = await this.ledger.getRange(fork.divergenceIndex, fork.localLength);
-    const peerSuffix = await peer.getRange(fork.divergenceIndex, fork.peerLength);
+    let localSuffix: SharedLedgerEntry[];
+    let peerSuffix: SharedLedgerEntry[];
+    try {
+      localSuffix = await this.ledger.getRange(fork.divergenceIndex, fork.localLength);
+      peerSuffix = await peer.getRange(fork.divergenceIndex, fork.peerLength);
+    } catch (err) {
+      this.log.warn('Failed to get chain ranges during resolution', { error: String(err) });
+      return { ...fork, resolved: false, winner: 'none' };
+    }
+
+    if (!Array.isArray(peerSuffix)) {
+      this.log.warn('Peer returned non-array range response');
+      return { ...fork, resolved: false, winner: 'none' };
+    }
 
     const localConfs = totalConfirmations(localSuffix);
     const peerConfs = totalConfirmations(peerSuffix);
@@ -100,6 +135,16 @@ export class ForkResolver {
     fork.winner = winner;
 
     if (winner === 'peer') {
+      if (!validatePeerChainContinuity(peerSuffix, fork.divergenceIndex)) {
+        this.log.warn('Peer chain failed continuity check — refusing reorg', {
+          divergenceIndex: fork.divergenceIndex,
+          peerEntries: peerSuffix.length,
+        });
+        fork.winner = 'local';
+        fork.resolved = true;
+        return fork;
+      }
+
       await this.ledger.rollbackTo(fork.divergenceIndex - 1);
 
       for (const entry of peerSuffix) {
@@ -134,8 +179,16 @@ export class ForkResolver {
   ): Promise<number> {
     while (low < high) {
       const mid = Math.floor((low + high) / 2);
-      const peerHash = await peer.getEntryHash(mid);
-      const localEntry = await this.ledger.getEntry(mid);
+
+      let peerHash: string | null;
+      let localEntry: SharedLedgerEntry | null;
+      try {
+        peerHash = await peer.getEntryHash(mid);
+        localEntry = await this.ledger.getEntry(mid);
+      } catch {
+        high = mid;
+        continue;
+      }
 
       if (!peerHash || !localEntry) {
         high = mid;
@@ -159,4 +212,16 @@ function totalConfirmations(entries: SharedLedgerEntry[]): number {
     total += e.confirmations;
   }
   return total;
+}
+
+function validatePeerChainContinuity(entries: SharedLedgerEntry[], startIndex: number): boolean {
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (entry.index !== startIndex + i) return false;
+    if (i > 0) {
+      const prev = entries[i - 1];
+      if (toHex(entry.prevHash) !== toHex(prev.hash)) return false;
+    }
+  }
+  return true;
 }
