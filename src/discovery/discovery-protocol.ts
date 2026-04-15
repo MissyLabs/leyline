@@ -150,6 +150,7 @@ export class DiscoveryProtocol {
   private readonly peerRequestTimes = new Map<string, number[]>();
   private readonly rateLimitConfig: Required<DiscoveryRateLimitConfig>;
   private readonly log = new Logger('DiscoveryProtocol');
+  private readonly shutdownSignal?: AbortSignal;
 
   constructor(
     libp2p: Libp2p,
@@ -159,6 +160,7 @@ export class DiscoveryProtocol {
     localPrivateKey: Uint8Array,
     trustChecker?: DiscoveryTrustChecker,
     rateLimitConfig?: DiscoveryRateLimitConfig,
+    shutdownSignal?: AbortSignal,
   ) {
     this.libp2p = libp2p;
     this.registry = registry;
@@ -170,6 +172,7 @@ export class DiscoveryProtocol {
       maxRequestsPerWindow: rateLimitConfig?.maxRequestsPerWindow ?? 30,
       windowMs: rateLimitConfig?.windowMs ?? 60_000,
     };
+    this.shutdownSignal = shutdownSignal;
   }
 
   /** Check and record a request from a peer. Returns false if rate-limited. */
@@ -285,7 +288,7 @@ export class DiscoveryProtocol {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, DISCOVERY_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, DISCOVERY_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return []; // Peer unreachable or does not support the protocol.
     }
@@ -384,7 +387,7 @@ export class DiscoveryProtocol {
     const pushes = connectedPeers.map(async (peerIdObj) => {
       let stream: Stream;
       try {
-        stream = await this.libp2p.dialProtocol(peerIdObj, DISCOVERY_PROTOCOL);
+        stream = await this.libp2p.dialProtocol(peerIdObj, DISCOVERY_PROTOCOL, { signal: this.shutdownSignal });
       } catch {
         return; // Peer unreachable — skip silently.
       }

@@ -206,10 +206,12 @@ export interface DirectMessageOptions {
 export class DirectMessageProtocol {
   private readonly libp2p: Libp2p;
   private readonly opts: DirectMessageOptions;
+  private readonly shutdownSignal?: AbortSignal;
 
-  constructor(libp2p: Libp2p, opts: DirectMessageOptions = {}) {
+  constructor(libp2p: Libp2p, opts: DirectMessageOptions = {}, shutdownSignal?: AbortSignal) {
     this.libp2p = libp2p;
     this.opts = opts;
+    this.shutdownSignal = shutdownSignal;
   }
 
   // --------------------------------------------------------------------------
@@ -374,7 +376,7 @@ export class DirectMessageProtocol {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, DIRECT_MESSAGE_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, DIRECT_MESSAGE_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return false; // Peer doesn't support the protocol or connection failed
     }

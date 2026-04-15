@@ -149,6 +149,7 @@ export class LedgerSync {
   private pruneInterval: ReturnType<typeof setInterval> | null = null;
   private forkResolver: ForkResolver;
   private readonly log = new Logger('LedgerSync');
+  private readonly shutdownSignal?: AbortSignal;
 
   /** How often to attempt sync with peers (60 seconds) */
   private syncIntervalMs: number;
@@ -162,6 +163,7 @@ export class LedgerSync {
     opts: {
       syncIntervalMs?: number;
       events?: LedgerSyncEvents;
+      shutdownSignal?: AbortSignal;
     } = {},
   ) {
     this.libp2p = libp2p;
@@ -173,6 +175,7 @@ export class LedgerSync {
     this.localPrivkey = localPrivkey;
     this.syncIntervalMs = opts.syncIntervalMs ?? 60_000;
     this.events = opts.events ?? {};
+    this.shutdownSignal = opts.shutdownSignal;
     this.forkResolver = new ForkResolver(ledger);
   }
 
@@ -218,7 +221,7 @@ export class LedgerSync {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, LEDGER_SYNC_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, LEDGER_SYNC_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return [];
     }
@@ -270,7 +273,7 @@ export class LedgerSync {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, LEDGER_SYNC_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, LEDGER_SYNC_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return;
     }

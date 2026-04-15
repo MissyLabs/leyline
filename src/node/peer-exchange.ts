@@ -92,6 +92,7 @@ export class PeerExchange {
   /** Optional peer reputation tracker for weighted selection. */
   private reputation?: PeerReputation;
   private readonly log = new Logger('PeerExchange');
+  private readonly shutdownSignal?: AbortSignal;
 
   constructor(
     libp2p: Libp2p,
@@ -102,6 +103,7 @@ export class PeerExchange {
       localPrivateKey?: Uint8Array;
       localPubkeyHex?: string;
       reputation?: PeerReputation;
+      shutdownSignal?: AbortSignal;
     } = {},
   ) {
     this.libp2p = libp2p;
@@ -112,6 +114,7 @@ export class PeerExchange {
     this.localPrivateKey = opts.localPrivateKey;
     this.localPubkeyHex = opts.localPubkeyHex;
     this.reputation = opts.reputation;
+    this.shutdownSignal = opts.shutdownSignal;
   }
 
   /** Sign a peer record with the local private key. */
@@ -296,7 +299,7 @@ export class PeerExchange {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, PEER_EXCHANGE_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, PEER_EXCHANGE_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return []; // Peer doesn't support the protocol
     }

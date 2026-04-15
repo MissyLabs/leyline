@@ -243,7 +243,7 @@ export class MagicNode {
           this.log.warn(`Incompatible peer — messages will be rejected`, { peerId: peerId.slice(0, 16), version });
         }
       },
-    });
+    }, this.shutdownController.signal);
     await this.handshake.start();
 
     // Set up tag-based pub/sub
@@ -271,7 +271,7 @@ export class MagicNode {
     gs.addEventListener('gossipsub:message', this.gossipHandler);
 
     // Initialize inbox client for store-and-forward message retrieval
-    this.inboxClient = new InboxClient(this.libp2p);
+    this.inboxClient = new InboxClient(this.libp2p, this.shutdownController.signal);
 
     // Track peer connections — auto-fetch missed messages from seeds on connect
     this.peerConnectHandler = (evt: CustomEvent) => {
@@ -341,6 +341,7 @@ export class MagicNode {
       localPrivateKey: this.privateKey,
       localPubkeyHex: publicKeyToHex(this.publicKey),
       reputation: this.peerReputation,
+      shutdownSignal: this.shutdownController.signal,
     });
     await this.peerExchange.start();
 
@@ -351,6 +352,7 @@ export class MagicNode {
       this.ledgerConsensus,
       this.publicKey,
       this.privateKey,
+      { shutdownSignal: this.shutdownController.signal },
     );
     await this.ledgerSync.start();
 
@@ -368,7 +370,7 @@ export class MagicNode {
       localPrivateKey: this.privateKey,
       localPubkeyHex: publicKeyToHex(this.publicKey),
       trustChecker: dmTrustChecker,
-    });
+    }, this.shutdownController.signal);
     await this.directMessage.start();
 
     // Start discovery protocol.
@@ -394,6 +396,8 @@ export class MagicNode {
       localPeerId,
       this.privateKey,
       discoveryTrust,
+      undefined,
+      this.shutdownController.signal,
     );
     await this.discoveryProtocol.start();
 

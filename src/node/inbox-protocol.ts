@@ -207,11 +207,13 @@ export class InboxServer {
 export class InboxClient {
   private readonly libp2p: Libp2p;
   private readonly log = new Logger('InboxClient');
+  private readonly shutdownSignal?: AbortSignal;
   /** Timestamp of the last message we received (for "since" requests). */
   private lastReceivedAt: number = 0;
 
-  constructor(libp2p: Libp2p) {
+  constructor(libp2p: Libp2p, shutdownSignal?: AbortSignal) {
     this.libp2p = libp2p;
+    this.shutdownSignal = shutdownSignal;
   }
 
   /** Update the last-received timestamp. Called by MagicNode on each message. */
@@ -246,7 +248,7 @@ export class InboxClient {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, INBOX_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, INBOX_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return []; // Peer doesn't support inbox protocol
     }

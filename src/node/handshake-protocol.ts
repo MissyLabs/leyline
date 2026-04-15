@@ -110,10 +110,12 @@ export class HandshakeProtocol {
   private stopped = false;
 
   private connectHandler: ((evt: CustomEvent) => void) | null = null;
+  private readonly shutdownSignal?: AbortSignal;
 
-  constructor(libp2p: Libp2p, events: HandshakeEvents = {}) {
+  constructor(libp2p: Libp2p, events: HandshakeEvents = {}, shutdownSignal?: AbortSignal) {
     this.libp2p = libp2p;
     this.events = events;
+    this.shutdownSignal = shutdownSignal;
   }
 
   async start(): Promise<void> {
@@ -217,7 +219,7 @@ export class HandshakeProtocol {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, HANDSHAKE_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, HANDSHAKE_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return; // Peer doesn't support handshake
     }
