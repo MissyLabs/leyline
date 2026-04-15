@@ -136,8 +136,8 @@ export class PeerExchange {
 
     // Start periodic exchange with connected peers
     this.exchangeInterval = setInterval(() => {
-      this.exchangeWithPeers().catch(() => {
-        // Swallow exchange errors — they're expected during churn
+      this.exchangeWithPeers().catch((err) => {
+        console.warn('[PeerExchange] Exchange round failed:', (err as Error)?.message ?? err);
       });
     }, this.exchangeIntervalMs);
   }

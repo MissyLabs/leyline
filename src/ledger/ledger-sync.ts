@@ -177,7 +177,9 @@ export class LedgerSync {
 
     // Start periodic sync
     this.syncInterval = setInterval(() => {
-      this.syncWithAllPeers().catch(() => {});
+      this.syncWithAllPeers().catch((err) => {
+        console.warn('[LedgerSync] Periodic sync failed:', (err as Error)?.message ?? err);
+      });
     }, this.syncIntervalMs);
 
     // Periodically prune expired consensus proposals

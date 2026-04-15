@@ -333,11 +333,11 @@ export class MagicNode {
           const refreshed = { ...descriptor, advertisedAt: Date.now(), signature: undefined };
           dp.signDescriptor(refreshed).then((signed) => {
             this.serviceRegistry.updateDescriptor(signed);
-            dp.broadcastAdvertisement(signed).catch(() => {
-              // Best-effort re-advertisement
+            dp.broadcastAdvertisement(signed).catch((err) => {
+              console.warn('[Magic] Re-advertisement broadcast failed:', (err as Error)?.message ?? err);
             });
-          }).catch(() => {
-            // Signing failure — skip this cycle
+          }).catch((err) => {
+            console.warn('[Magic] Descriptor signing failed:', (err as Error)?.message ?? err);
           });
         }
       }, 4 * 60_000);
@@ -362,8 +362,8 @@ export class MagicNode {
               this.handleIncomingMessage(msg.topic, msg.data);
             }
           }
-        }).catch(() => {
-          // Poll failure — will retry next cycle
+        }).catch((err) => {
+          console.warn('[Magic] Inbox poll failed:', (err as Error)?.message ?? err);
         });
       }, 30_000);
     }
