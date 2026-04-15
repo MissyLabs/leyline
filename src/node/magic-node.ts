@@ -44,6 +44,7 @@ import {
 import { IdentityStore } from '../identity/store.js';
 import { NodeMetrics } from '../utils/metrics.js';
 import { Logger } from '../utils/logger.js';
+import { PartitionDetector, type PartitionEvent } from '../utils/partition-detector.js';
 
 export interface MagicNodeEvents {
   onMessage?: (msg: MagicMessage, tag: string) => void;
@@ -53,6 +54,7 @@ export interface MagicNodeEvents {
   onSeedConnectivityChange?: (connectedSeeds: number, totalSeeds: number) => void;
   onDegraded?: (reason: string) => void;
   onRecovered?: () => void;
+  onPartition?: (event: PartitionEvent) => void;
 }
 
 export class MagicNode {
@@ -73,6 +75,7 @@ export class MagicNode {
   protected ledgerConsensus: LedgerConsensus;
   protected peerReputation: PeerReputation;
   protected metrics: NodeMetrics;
+  protected partitionDetector: PartitionDetector;
   protected log: Logger;
   protected publicKey: Uint8Array = new Uint8Array(0);
   protected privateKey: Uint8Array = new Uint8Array(0);
@@ -117,8 +120,15 @@ export class MagicNode {
     this.ledgerConsensus = new LedgerConsensus();
     this.peerReputation = new PeerReputation();
     this.metrics = new NodeMetrics();
+    this.partitionDetector = new PartitionDetector();
     this.log = new Logger('MagicNode');
     this.events = events;
+
+    if (events.onPartition) {
+      this.partitionDetector.on('partition', (event: PartitionEvent) => {
+        this.events.onPartition?.(event);
+      });
+    }
   }
 
   async start(): Promise<void> {
@@ -255,6 +265,7 @@ export class MagicNode {
       }
 
       this.metrics.increment('peers.connected');
+      this.partitionDetector.updatePeerCount(this.libp2p?.getPeers().length ?? 0);
       this.events.onPeerConnected?.(peerId);
 
       // When we connect to a peer, try to fetch any messages we missed while offline.
@@ -290,6 +301,7 @@ export class MagicNode {
       const peerId = evt.detail.toString();
       this.handshake?.removePeer(peerId);
       this.metrics.increment('peers.disconnected');
+      this.partitionDetector.updatePeerCount(this.libp2p?.getPeers().length ?? 0);
       this.events.onPeerDisconnected?.(peerId);
     };
     this.libp2p.addEventListener('peer:disconnect', this.peerDisconnectHandler);
@@ -470,6 +482,7 @@ export class MagicNode {
     this.peerReputation.clear();
     this.payloadBudgets.clear();
     this.inboundTimestamps = [];
+    this.partitionDetector.reset();
 
     // Remove event listeners before stopping libp2p
     if (this.libp2p && this.gossipHandler) {
@@ -885,6 +898,11 @@ export class MagicNode {
     return this.metrics;
   }
 
+  /** Get the partition detector for network health monitoring. */
+  getPartitionDetector(): PartitionDetector {
+    return this.partitionDetector;
+  }
+
   /** Get the shutdown signal for cooperative cancellation. */
   getShutdownSignal(): AbortSignal {
     return this.shutdownController.signal;
@@ -923,6 +941,7 @@ export class MagicNode {
 
     const totalSeeds = Math.max(this.seedPeerIds.size, this.config.seedNodes.length);
 
+    this.partitionDetector.updateSeedConnectivity(connectedSeeds, totalSeeds);
     this.events.onSeedConnectivityChange?.(connectedSeeds, totalSeeds);
 
     if (totalPeers === 0 && !this.degraded) {
