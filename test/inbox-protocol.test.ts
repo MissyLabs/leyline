@@ -210,11 +210,20 @@ describe('InboxServer / InboxClient – integration', () => {
     server = new InboxServer(serverNode, buffer);
     client = new InboxClient(clientNode);
 
+    // Set up subscription tracker to simulate SeedNode behavior.
+    // In production, SeedNode tracks which topics each peer subscribes to.
+    const peerSubs = new Map<string, Set<string>>();
+    server.setSubscriptionTracker((peerId: string) => peerSubs.get(peerId) ?? new Set());
+
     await server.start();
 
     // Connect client to server
     await clientNode.dial(serverNode.getMultiaddrs()[0]);
     await sleep(500);
+
+    // Register the client's topic subscriptions (simulates GossipSub subscription-change events)
+    const clientPeerId = clientNode.peerId.toString();
+    peerSubs.set(clientPeerId, new Set([TOPIC_A, TOPIC_B]));
   }, 20000);
 
   afterAll(async () => {
@@ -281,6 +290,22 @@ describe('InboxServer / InboxClient – integration', () => {
     );
 
     expect(messages.length).toBe(1);
+  }, 10000);
+
+  it('rejects topic requests the peer is not subscribed to (H3 fix)', async () => {
+    // Add messages to a topic the client is NOT subscribed to
+    const SECRET_TOPIC = 'magic/tag/secret-channel';
+    buffer.push(SECRET_TOPIC, makeData('secret-msg'), makeId('secret-1'));
+
+    const messages = await client.fetch(
+      serverNode.peerId.toString(),
+      [SECRET_TOPIC],
+      0,
+      200,
+    );
+
+    // Client is only subscribed to TOPIC_A and TOPIC_B, not SECRET_TOPIC
+    expect(messages).toEqual([]);
   }, 10000);
 
   it('fetch returns empty array when the topic has no buffered messages', async () => {
