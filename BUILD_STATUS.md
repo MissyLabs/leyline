@@ -1,11 +1,11 @@
 # Build Status — Leyline
 
-**Last updated:** Session 5, 2026-04-15  
+**Last updated:** Session 7, 2026-04-15  
 **Branch:** loop_fix_04_15_2026
 
 ## Current State
 
-- **Tests:** 605 passing, 0 failing (42 test files)
+- **Tests:** 750 passing, 0 failing (50 test files)
 - **TypeScript:** Clean compilation (0 errors)
 - **Baseline:** 258 tests pre-loop
 
@@ -20,11 +20,13 @@
 
 **All critical and high severity findings are resolved.**
 
-### Session 5 work:
-- Added PersistentServiceRegistry (LevelDB-backed service discovery)
-- Added DM relay integration tests (3-node relay path verified)
-- Added adversarial peer simulation tests (DM, handshake, discovery)
-- Added cross-subsystem integration tests (reputation + trust + spam + consensus)
+### Session 7 work:
+- Implemented ledger fork detection and chain reorganization (ForkResolver)
+- Added SharedLedger.rollbackTo() for safe chain rollback
+- Integrated ForkResolver into LedgerSync for automatic fork resolution during sync
+- Fixed LocalLedger concurrency bug (missing serialization lock on append)
+- Added warn logging to remaining silent catch blocks (handshake hangUp, multiaddr import)
+- Added 46 new edge case tests (fork resolver, ledger sync, message buffer, local ledger)
 
 ## Features Added
 
@@ -37,6 +39,10 @@
 7. **Peer reputation scoring** (session 3) — Per-peer quality tracking with time-decay, bounded storage, configurable thresholds
 8. **Reputation integration** (session 4) — PeerReputation wired into MagicNode pipeline and PeerExchange peer selection
 9. **Persistent service discovery** (session 5) — LevelDB-backed ServiceRegistry survives node restarts
+10. **Graceful seed degradation** (session 6) — Automatic fallback when seeds unreachable
+11. **mDNS local discovery** (session 6) — Automatic peer discovery on local networks
+12. **NodeMetrics observability hooks** (session 6) — Event emitter for monitoring metrics
+13. **Ledger fork resolution** (session 7) — ForkResolver with binary search divergence detection and confirmation-weighted chain selection
 
 ## Test Coverage Growth
 
@@ -48,6 +54,8 @@
 | Session 3 | 527 | +127 |
 | Session 4 | 549 | +22 |
 | Session 5 | 605 | +56 |
+| Session 6 | 682 | +77 |
+| Session 7 | 750 | +68 |
 
 ## Implementation Gaps Addressed
 
@@ -62,41 +70,44 @@
 - Bounded data structures with LRU eviction
 - SpamFilter.#spamCounts bounded at 10k (session 3)
 - SeedNode.ledgerSubmitTimestamps bounded at 5k (session 3)
-- Silent catch blocks replaced with warn logging (session 3)
+- Silent catch blocks replaced with warn logging (session 3, 7)
 - Unhandled promise rejections fixed in MagicNode (session 4)
 - PeerReputation integrated into live message pipeline (session 4)
 - PeerExchange uses reputation-weighted peer selection (session 4)
 - MagicNode and SeedNode fully clean up resources on stop (session 4)
-- PersistentTrustPolicy/SpamFilter persistence verified via tests (session 4)
-- SeedNode lifecycle verified via tests (session 4)
 - PersistentServiceRegistry for durable service discovery (session 5)
-- DM relay path verified end-to-end with 3-node topology (session 5)
-- Adversarial wire message handling verified for all protocols (session 5)
-- Cross-subsystem interactions tested (reputation+trust+spam+consensus) (session 5)
+- DM relay path verified end-to-end (session 5)
+- Graceful seed degradation with automatic reconnection (session 6)
+- mDNS peer discovery for local networks (session 6)
+- NodeMetrics event emitter for observability (session 6)
+- Ledger fork detection via binary search (session 7)
+- Chain reorganization with confirmation-weighted resolution (session 7)
+- LocalLedger concurrency bug fixed (missing append serialization lock) (session 7)
+- SharedLedger rollbackTo() for safe chain surgery (session 7)
 
-## Next Steps for Session 6+
+## Next Steps for Session 8+
 
 1. **Deeper testing:**
-   - Ledger fork detection and recovery
-   - Stress tests for concurrent message handling
-   - Fuzz testing for wire message deserialization
+   - Integration test: two-node ledger fork resolution over wire protocol
+   - Fuzz testing for ForkResolver edge cases
+   - Stress test: high-volume message throughput
 
 2. **New features to consider:**
-   - Graceful degradation when seeds unreachable
-   - Automatic local peer discovery via mDNS
-   - Chain reorganization for ledger forks
-   - Metrics/observability hooks (event emitter for monitoring)
+   - Structured logging (replace console.log/warn)
+   - Peer ban list persistence (LevelDB-backed)
+   - Message priority queuing
+   - Network partition detection
 
 3. **Hardening:**
-   - Add AbortController-based cancellation for all protocol streams
-   - Audit remaining catch blocks for improved diagnostics
+   - Audit ForkResolver for adversarial peer scenarios
+   - Add metrics tracking for fork resolution events
+   - Test rollbackTo under concurrent submit pressure
 
 4. **Documentation:**
-   - Document peer reputation system
-   - Document compression wire format
-   - Document persistent service registry
-   - Update CLAUDE.md with new modules
-   - API reference for PeerReputation
+   - Document fork resolution protocol
+   - Document mDNS discovery configuration
+   - Document NodeMetrics events
+   - API reference updates
 
 ## Recovery Notes
 

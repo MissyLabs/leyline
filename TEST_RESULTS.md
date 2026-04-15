@@ -2,9 +2,9 @@
 
 **Date:** 2026-04-15  
 **Branch:** loop_fix_04_15_2026  
-**Total Tests:** 605 passing (0 failures)  
+**Total Tests:** 750 passing (0 failures)  
 **Baseline:** 258 tests (pre-loop)  
-**Test Files:** 42
+**Test Files:** 50
 
 ## Test Coverage by Subsystem
 
@@ -32,8 +32,12 @@
 | Consensus Adversarial | consensus-adversarial.test.ts | 7 | Pass |
 | Consensus Validation | consensus-validation.test.ts | ~10 | Pass |
 | Ledger Sync | ledger-sync.test.ts | ~10 | Pass |
+| Ledger Sync Edge Cases | ledger-sync-edge-cases.test.ts | 21 | Pass |
 | Ledger Regression | ledger-regression.test.ts | 70 | Pass |
 | Ledger Confirmation Security | ledger-confirmation-security.test.ts | 8 | Pass |
+| Fork Resolver | fork-resolver.test.ts | 22 | Pass |
+| Local Ledger Edge Cases | local-ledger-edge-cases.test.ts | 12 | Pass |
+| Message Buffer Edge Cases | message-buffer-edge-cases.test.ts | 13 | Pass |
 | Service Registry | service-registry.test.ts | ~20 | Pass |
 | Persistent Registry | persistent-registry.test.ts | 18 | Pass |
 | Discovery Protocol | discovery-protocol.test.ts | ~15 | Pass |
@@ -53,6 +57,24 @@
 | Cross-Subsystem | cross-subsystem.test.ts | 16 | Pass |
 | Health Check | health-check.test.ts | 6 | Pass |
 | Deep Edge Cases | deep-edge-cases.test.ts | 11 | Pass |
+| Fuzz Deserialization | fuzz-deserialization.test.ts | 45 | Pass |
+| Concurrency Stress | concurrency-stress.test.ts | ~12 | Pass |
+| Seed Degradation | seed-degradation.test.ts | ~15 | Pass |
+| Metrics | metrics.test.ts | ~10 | Pass |
+
+## Tests Added — Session 7
+
+- **fork-resolver.test.ts**: 22 tests — Fork detection (binary search, divergence point), resolution (confirmation-weighted, length tie-break, maxReorgDepth), rollback integration
+- **ledger-sync-edge-cases.test.ts**: 21 tests — SharedLedger concurrent submit serialization, addConfirmation idempotency, LedgerConsensus edge cases (config validation, proposeRemote, ordering, pruning)
+- **message-buffer-edge-cases.test.ts**: 13 tests — Dedup, per-topic eviction, global eviction, TTL pruning, since filtering, zero-length data
+- **local-ledger-edge-cases.test.ts**: 12 tests — Empty ledger, persistence across reopen, concurrent append serialization, hash chain integrity, edge cases
+
+## Tests Added — Session 6
+
+- **fuzz-deserialization.test.ts**: 45 tests — Random byte floods, type confusion, oversized fields, deeply nested JSON for all protocol handlers
+- **concurrency-stress.test.ts**: ~12 tests — Concurrent message handling, mDNS config
+- **seed-degradation.test.ts**: ~15 tests — AbortSignal support, seed reconnection, graceful degradation
+- **metrics.test.ts**: ~10 tests — NodeMetrics event hooks
 
 ## Tests Added — Session 5
 

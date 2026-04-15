@@ -104,3 +104,42 @@
 3. Added adversarial peer simulation tests — malicious wire messages to DM, handshake, discovery handlers (14 tests)
 4. Added cross-subsystem integration tests — reputation+trust+spam pipeline, consensus mechanics, buffer+dedup (16 tests)
 5. Updated all report files
+
+## Session 6 — 2026-04-15
+
+| Metric | Value |
+|--------|-------|
+| Tests at start | 605 (0 failing) |
+| Tests at end | 682 (0 failing) |
+| TypeScript | Clean (0 errors) |
+| Commits | 5 |
+| New features | Graceful seed degradation, mDNS discovery, NodeMetrics observability |
+| Test files added | 4 (fuzz-deserialization, concurrency-stress, seed-degradation, metrics) |
+
+### Session Timeline
+1. Added graceful seed degradation with automatic reconnection and AbortSignal support
+2. Implemented mDNS local network peer discovery
+3. Added NodeMetrics event emitter for observability hooks
+4. Added 45 comprehensive fuzz tests for wire message deserialization across all protocols
+5. Added concurrency stress tests and mDNS config tests
+
+## Session 7 — 2026-04-15
+
+| Metric | Value |
+|--------|-------|
+| Tests at start | 682 (0 failing) |
+| Tests at end | 750 (0 failing) |
+| TypeScript | Clean (0 errors) |
+| Commits | 4 |
+| Security findings fixed | LocalLedger concurrency bug, 2 remaining silent catch blocks |
+| New features | Ledger fork detection and chain reorganization (ForkResolver) |
+| Test files added | 4 (fork-resolver, ledger-sync-edge-cases, message-buffer-edge-cases, local-ledger-edge-cases) |
+
+### Session Timeline
+1. Fixed remaining silent catch blocks with warn logging (handshake hangUp, multiaddr import)
+2. Implemented ForkResolver — binary search divergence detection, confirmation-weighted chain selection, maxReorgDepth safety limit
+3. Added SharedLedger.rollbackTo() for safe chain rollback during fork resolution
+4. Integrated ForkResolver into LedgerSync.syncWithAllPeers() for automatic fork resolution
+5. Fixed LocalLedger concurrency bug — added appendLock serialization (same pattern as SharedLedger)
+6. Added 68 new tests: fork resolver (22), ledger sync edge cases (21), message buffer edge cases (13), local ledger edge cases (12)
+7. Updated all report files
