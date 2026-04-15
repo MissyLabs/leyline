@@ -42,6 +42,7 @@ import {
   getFingerprint,
 } from '../identity/keypair.js';
 import { IdentityStore } from '../identity/store.js';
+import { NodeMetrics } from '../utils/metrics.js';
 
 export interface MagicNodeEvents {
   onMessage?: (msg: MagicMessage, tag: string) => void;
@@ -70,6 +71,7 @@ export class MagicNode {
   protected handshake: HandshakeProtocol | null = null;
   protected ledgerConsensus: LedgerConsensus;
   protected peerReputation: PeerReputation;
+  protected metrics: NodeMetrics;
   protected publicKey: Uint8Array = new Uint8Array(0);
   protected privateKey: Uint8Array = new Uint8Array(0);
   protected events: MagicNodeEvents;
@@ -112,6 +114,7 @@ export class MagicNode {
     this.serviceRegistry = new ServiceRegistry();
     this.ledgerConsensus = new LedgerConsensus();
     this.peerReputation = new PeerReputation();
+    this.metrics = new NodeMetrics();
     this.events = events;
   }
 
@@ -248,6 +251,7 @@ export class MagicNode {
         }
       }
 
+      this.metrics.increment('peers.connected');
       this.events.onPeerConnected?.(peerId);
 
       // When we connect to a peer, try to fetch any messages we missed while offline.
@@ -282,6 +286,7 @@ export class MagicNode {
     this.peerDisconnectHandler = (evt: CustomEvent) => {
       const peerId = evt.detail.toString();
       this.handshake?.removePeer(peerId);
+      this.metrics.increment('peers.disconnected');
       this.events.onPeerDisconnected?.(peerId);
     };
     this.libp2p.addEventListener('peer:disconnect', this.peerDisconnectHandler);
@@ -506,6 +511,7 @@ export class MagicNode {
     }
     const data = serializeMessage(msg);
     await this.tagPubSub.publish(tags, data);
+    this.metrics.increment('messages.sent');
 
     // Record in local ledger
     await this.localLedger.append(data, 'sent');
@@ -852,6 +858,11 @@ export class MagicNode {
     return this.peerReputation;
   }
 
+  /** Get the metrics tracker for observability. */
+  getMetrics(): NodeMetrics {
+    return this.metrics;
+  }
+
   /** Get the shutdown signal for cooperative cancellation. */
   getShutdownSignal(): AbortSignal {
     return this.shutdownController.signal;
@@ -941,6 +952,7 @@ export class MagicNode {
     const validation = validateMessage(msg);
     if (!validation.valid) {
       this.peerReputation.recordViolation(senderHex);
+      this.metrics.increment('messages.blocked', 1, { reason: 'validation' });
       await this.localLedger.append(data, 'blocked');
       return;
     }
@@ -956,6 +968,8 @@ export class MagicNode {
     if (this.spamFilter.isRateLimited(senderHex, this.config.rateLimitPerMinute)) {
       await this.spamFilter.reportSpam(senderHex);
       this.peerReputation.recordSpam(senderHex);
+      this.metrics.increment('ratelimit.hit');
+      this.metrics.increment('messages.blocked', 1, { reason: 'ratelimit' });
       await this.localLedger.append(data, 'blocked');
       // Auto-block agents that repeatedly hit rate limits
       if (this.config.autoBlockThreshold > 0 &&
@@ -1013,6 +1027,8 @@ export class MagicNode {
     // This prevents a DoS where a malicious peer sends millions of messages
     // from untrusted senders, forcing expensive Ed25519 verification on each.
     if (!this.trustPolicy.isAllowed(senderHex, msg.tags)) {
+      this.metrics.increment('trust.denied');
+      this.metrics.increment('messages.blocked', 1, { reason: 'trust' });
       await this.localLedger.append(data, 'blocked');
       return;
     }
@@ -1027,12 +1043,15 @@ export class MagicNode {
     if (!sigValid) {
       await this.spamFilter.reportSpam(senderHex);
       this.peerReputation.recordViolation(senderHex);
+      this.metrics.increment('signature.failed');
+      this.metrics.increment('messages.blocked', 1, { reason: 'signature' });
       await this.localLedger.append(data, 'blocked');
       return;
     }
 
     // Message passed all checks — record and deliver
     this.peerReputation.recordSuccess(senderHex);
+    this.metrics.increment('messages.received');
     await this.localLedger.append(data, 'received');
 
     // Track last-received timestamp for inbox sync
