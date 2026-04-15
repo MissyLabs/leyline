@@ -406,6 +406,8 @@ export class DiscoveryProtocol {
         );
       } catch {
         // Ignore individual stream errors.
+      } finally {
+        try { stream.close(); } catch { /* already closed */ }
       }
     });
 
