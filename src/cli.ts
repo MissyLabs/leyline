@@ -49,9 +49,13 @@ const config: Partial<MagicConfig> = {
 async function main() {
   const node = isSeed ? new SeedNode(config) : new MagicNode(config);
 
+  const activeTimers: ReturnType<typeof setInterval>[] = [];
+
   // Graceful shutdown
   const shutdown = async () => {
     console.log('\n[Magic] Shutting down...');
+    for (const t of activeTimers) clearInterval(t);
+    activeTimers.length = 0;
     await node.stop();
     process.exit(0);
   };
@@ -88,14 +92,14 @@ async function main() {
     console.log(`[Magic] Open tags: ${node.getOpenTags().join(', ') || '(none)'}`);
 
     // Health probe every 30 seconds
-    setInterval(() => {
+    activeTimers.push(setInterval(() => {
       console.log(`[health] peers: ${node.getPeerCount()} | open tags: ${node.getOpenTags().join(', ')} | paused: ${node.isPaused()}`);
-    }, 30_000);
+    }, 30_000));
 
     if (sendTriggerFile) {
       console.log(`[Magic] Send trigger watching: ${sendTriggerFile} (poll ${sendPollMs}ms)`);
 
-      setInterval(async () => {
+      activeTimers.push(setInterval(async () => {
         try {
           const raw = await fs.readFile(sendTriggerFile, 'utf8');
           const req = JSON.parse(raw);
@@ -110,7 +114,7 @@ async function main() {
         } catch {
           // Ignore missing/invalid trigger file and keep polling.
         }
-      }, sendPollMs);
+      }, sendPollMs));
     }
   }
 }
