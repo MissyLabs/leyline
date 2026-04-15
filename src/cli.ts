@@ -3,7 +3,10 @@ import { SeedNode } from './node/seed-node.js';
 import { type MagicConfig, DEFAULT_SEED_NODES } from './config/config.js';
 import { publicKeyToHex } from './identity/keypair.js';
 import { MessageType } from './messages/message.js';
+import { Logger } from './utils/logger.js';
 import { promises as fs } from 'node:fs';
+
+const log = new Logger('CLI');
 
 const args = process.argv.slice(2);
 const isSeed = args.includes('--seed');
@@ -55,7 +58,7 @@ async function main() {
 
   // Graceful shutdown
   const shutdown = async () => {
-    console.log('\n[Magic] Shutting down...');
+    log.info('Shutting down...');
     for (const t of activeTimers) clearInterval(t);
     activeTimers.length = 0;
     await node.stop();
@@ -82,24 +85,22 @@ async function main() {
         } catch {
           payload = `<binary ${msg.payload.length} bytes>`;
         }
-        console.log(`[${t}] ${sender}...: ${payload}`);
+        log.info(`[${t}] ${sender}...: ${payload}`);
       });
     }
 
     // Wait for mesh formation
     const peers = await node.waitForPeers(1, 10_000);
 
-    console.log(`[Magic] Node is ready — ${peers} peer(s) connected`);
-    console.log(`[Magic] Listening for messages on: ${tags.join(', ') || '(no tags)'}`);
-    console.log(`[Magic] Open tags: ${node.getOpenTags().join(', ') || '(none)'}`);
+    log.info('Node is ready', { peers, tags, openTags: node.getOpenTags() });
 
-    // Health probe every 30 seconds
+    const health = log.child('health');
     activeTimers.push(setInterval(() => {
-      console.log(`[health] peers: ${node.getPeerCount()} | open tags: ${node.getOpenTags().join(', ')} | paused: ${node.isPaused()}`);
+      health.info('Status', { peers: node.getPeerCount(), openTags: node.getOpenTags(), paused: node.isPaused() });
     }, 30_000));
 
     if (sendTriggerFile) {
-      console.log(`[Magic] Send trigger watching: ${sendTriggerFile} (poll ${sendPollMs}ms)`);
+      log.info('Send trigger watching', { file: sendTriggerFile, pollMs: sendPollMs });
 
       activeTimers.push(setInterval(async () => {
         try {
@@ -110,7 +111,7 @@ async function main() {
           const bytes = new TextEncoder().encode(JSON.stringify(payloadObj));
 
           await node.broadcast([tag], bytes, MessageType.BROADCAST);
-          console.log(`[Magic][SEND][${tag}] ${JSON.stringify(payloadObj)}`);
+          log.info('Message sent', { tag, payload: payloadObj });
 
           await fs.unlink(sendTriggerFile).catch(() => {});
         } catch {
@@ -122,6 +123,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('[Magic] Fatal error:', err);
+  log.error('Fatal error', { error: String(err) });
   process.exit(1);
 });
