@@ -108,6 +108,7 @@ export { InboxServer, InboxClient, INBOX_PROTOCOL } from './node/inbox-protocol.
 
 // Utilities
 export { withTimeout, STREAM_TIMEOUT_MS } from './utils/stream-timeout.js';
+export { compressMessage, decompressMessage, isCompressedMessage } from './utils/compression.js';
 
 // Crypto
 export {
