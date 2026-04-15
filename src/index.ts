@@ -1,5 +1,5 @@
 // Core node
-export { MagicNode, type MagicNodeEvents } from './node/magic-node.js';
+export { MagicNode, type MagicNodeEvents, type NodeStatus } from './node/magic-node.js';
 export { SeedNode } from './node/seed-node.js';
 
 // Identity

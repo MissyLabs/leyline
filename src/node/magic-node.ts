@@ -58,6 +58,24 @@ export interface MagicNodeEvents {
   onPartition?: (event: PartitionEvent) => void;
 }
 
+export interface NodeStatus {
+  running: boolean;
+  degraded: boolean;
+  peerId: string;
+  fingerprint: string;
+  peerCount: number;
+  connectedSeeds: number;
+  totalSeeds: number;
+  subscribedTags: string[];
+  openTags: string[];
+  localServices: number;
+  remoteServices: number;
+  ledgerEntries: number;
+  paused: boolean;
+  uptime: number;
+  version: string;
+}
+
 export class MagicNode {
   protected config: MagicConfig;
   protected libp2p: Libp2p | null = null;
@@ -953,6 +971,36 @@ export class MagicNode {
   /** Whether the node is currently degraded (no seeds reachable). */
   isDegraded(): boolean {
     return this.degraded;
+  }
+
+  /** Comprehensive node status for operational monitoring. */
+  getNodeStatus(): NodeStatus {
+    const peers = this.libp2p?.getPeers() ?? [];
+    const connectedSeeds = this.getConnectedSeedCount();
+    return {
+      running: this.libp2p !== null && !this.stopping,
+      degraded: this.degraded,
+      peerId: this.libp2p?.peerId?.toString() ?? '',
+      fingerprint: this.publicKey.length > 0 ? getFingerprint(this.publicKey) : '',
+      peerCount: peers.length,
+      connectedSeeds,
+      totalSeeds: Math.max(this.seedPeerIds.size, this.config.seedNodes.length),
+      subscribedTags: this.tagPubSub?.getSubscribedTags() ?? [],
+      openTags: this.trustPolicy.getOpenTags(),
+      localServices: this.serviceRegistry.getLocal().length,
+      remoteServices: this.serviceRegistry.getAll().length - this.serviceRegistry.getLocal().length,
+      ledgerEntries: 0, // filled async
+      paused: this.paused,
+      uptime: 0,
+      version: LEYLINE_VERSION,
+    };
+  }
+
+  /** Async variant that includes ledger entry count. */
+  async getNodeStatusAsync(): Promise<NodeStatus> {
+    const status = this.getNodeStatus();
+    try { status.ledgerEntries = await this.sharedLedger.getEntryCount(); } catch { /* */ }
+    return status;
   }
 
   /** Get the number of connected seed nodes. */
