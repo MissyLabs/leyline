@@ -602,9 +602,29 @@ export class MagicNode {
     await this.trustPolicy.allowAgent(pubkeyHex);
   }
 
-  /** Block a specific agent (by public key hex). */
+  /** Block a specific agent permanently (by public key hex). */
   async blockAgent(pubkeyHex: string): Promise<void> {
     await this.trustPolicy.blockAgent(pubkeyHex);
+  }
+
+  /** Block a specific agent until `expiresAt` (epoch ms). Auto-expires. */
+  async blockAgentUntil(pubkeyHex: string, expiresAt: number): Promise<void> {
+    await this.trustPolicy.blockAgentUntil(pubkeyHex, expiresAt);
+  }
+
+  /** Remove a block from a specific agent. Does not auto-allow them. */
+  async unblockAgent(pubkeyHex: string): Promise<void> {
+    await this.trustPolicy.unblockAgent(pubkeyHex);
+  }
+
+  /** Get the block expiry for an agent, or undefined if permanent/not blocked. */
+  getBlockExpiry(pubkeyHex: string): number | undefined {
+    return this.trustPolicy.getBlockExpiry(pubkeyHex);
+  }
+
+  /** Get all currently blocked agents. */
+  getBlockedAgents(): string[] {
+    return this.trustPolicy.getBlockedAgents();
   }
 
   /** Allow a specific agent on a specific tag. */

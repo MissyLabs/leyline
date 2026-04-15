@@ -19,6 +19,7 @@ interface SenderWindow {
 interface AgentPolicy {
   allowed: boolean;
   blocked: boolean;
+  blockExpiry?: number;
   allowedTags: Set<string>;
   blockedTags: Set<string>;
 }
@@ -45,6 +46,7 @@ export class TrustPolicy {
       policy = {
         allowed: false,
         blocked: false,
+        blockExpiry: undefined,
         allowedTags: new Set(),
         blockedTags: new Set(),
       };
@@ -62,13 +64,38 @@ export class TrustPolicy {
   }
 
   /**
-   * Blacklist an agent.
+   * Blacklist an agent permanently.
    * Overrides any prior or future `allowAgent` call for the same key.
    */
   blockAgent(pubkeyHex: string): void {
     const policy = this.#getOrCreate(pubkeyHex);
     policy.blocked = true;
     policy.allowed = false;
+    policy.blockExpiry = undefined;
+  }
+
+  /**
+   * Blacklist an agent until `expiresAt` (epoch ms).
+   * After expiry, `isAllowed` treats the agent as unblocked.
+   * Unlike permanent `blockAgent`, this preserves the prior `allowed` state
+   * so that the agent's access is fully restored when the ban expires.
+   */
+  blockAgentUntil(pubkeyHex: string, expiresAt: number): void {
+    const policy = this.#getOrCreate(pubkeyHex);
+    policy.blocked = true;
+    policy.blockExpiry = expiresAt;
+  }
+
+  /**
+   * Remove a block from an agent, restoring them to deny-first default.
+   * Does NOT automatically allow the agent — they must be re-allowed separately.
+   */
+  unblockAgent(pubkeyHex: string): void {
+    const policy = this.#agents.get(pubkeyHex);
+    if (policy) {
+      policy.blocked = false;
+      policy.blockExpiry = undefined;
+    }
   }
 
   /** Allow an agent to send messages carrying a specific tag. */
@@ -131,7 +158,15 @@ export class TrustPolicy {
     const policy = this.#agents.get(pubkeyHex);
 
     // Agent-level block overrides everything — even open tags.
-    if (policy?.blocked) return false;
+    // Time-bounded blocks auto-expire.
+    if (policy?.blocked) {
+      if (policy.blockExpiry !== undefined && Date.now() >= policy.blockExpiry) {
+        policy.blocked = false;
+        policy.blockExpiry = undefined;
+      } else {
+        return false;
+      }
+    }
 
     // If agent is explicitly allowed, use the per-agent tag rules
     if (policy?.allowed) {
@@ -171,13 +206,27 @@ export class TrustPolicy {
     return false;
   }
 
-  /** Return a snapshot of all explicitly blocked agent public keys. */
+  /** Return a snapshot of all currently blocked agent public keys (excludes expired bans). */
   getBlockedAgents(): string[] {
+    const now = Date.now();
     const result: string[] = [];
     for (const [key, policy] of this.#agents) {
-      if (policy.blocked) result.push(key);
+      if (policy.blocked) {
+        if (policy.blockExpiry !== undefined && now >= policy.blockExpiry) {
+          policy.blocked = false;
+          policy.blockExpiry = undefined;
+        } else {
+          result.push(key);
+        }
+      }
     }
     return result;
+  }
+
+  /** Return the block expiry timestamp for an agent, or undefined if not time-bounded. */
+  getBlockExpiry(pubkeyHex: string): number | undefined {
+    const policy = this.#agents.get(pubkeyHex);
+    return policy?.blocked ? policy.blockExpiry : undefined;
   }
 
   /** Return a snapshot of all explicitly allowed (and not blocked) agent public keys. */
@@ -187,6 +236,11 @@ export class TrustPolicy {
       if (policy.allowed && !policy.blocked) result.push(key);
     }
     return result;
+  }
+
+  /** Return the raw `allowed` flag for an agent, regardless of block state. */
+  isAgentAllowed(pubkeyHex: string): boolean {
+    return this.#agents.get(pubkeyHex)?.allowed ?? false;
   }
 }
 

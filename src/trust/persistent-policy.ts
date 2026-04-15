@@ -28,6 +28,7 @@ const log = new Logger('PersistentTrustPolicy');
 interface AgentPolicyRecord {
   allowed: boolean;
   blocked: boolean;
+  blockExpiry?: number;
   allowedTags: string[];
   blockedTags: string[];
 }
@@ -140,6 +141,24 @@ export class PersistentTrustPolicy {
   }
 
   /**
+   * Blacklist an agent until `expiresAt` (epoch ms) and persist the updated policy entry.
+   */
+  async blockAgentUntil(pubkeyHex: string, expiresAt: number): Promise<void> {
+    this.#policy.blockAgentUntil(pubkeyHex, expiresAt);
+    this.#shadowEntry(pubkeyHex);
+    await this.#persistAgent(pubkeyHex);
+  }
+
+  /**
+   * Remove a block from an agent and persist the updated policy entry.
+   */
+  async unblockAgent(pubkeyHex: string): Promise<void> {
+    this.#policy.unblockAgent(pubkeyHex);
+    this.#shadowEntry(pubkeyHex);
+    await this.#persistAgent(pubkeyHex);
+  }
+
+  /**
    * Allow a specific tag for an agent and persist the updated policy entry.
    *
    * @param pubkeyHex - Hex-encoded public key of the target agent.
@@ -234,6 +253,13 @@ export class PersistentTrustPolicy {
     return this.#policy.getAllowedAgents();
   }
 
+  /**
+   * Return the block expiry for an agent, or undefined if permanent or not blocked.
+   */
+  getBlockExpiry(pubkeyHex: string): number | undefined {
+    return this.#policy.getBlockExpiry(pubkeyHex);
+  }
+
   // -------------------------------------------------------------------------
   // Private helpers
   // -------------------------------------------------------------------------
@@ -284,11 +310,14 @@ export class PersistentTrustPolicy {
     };
 
     const blocked = this.#policy.getBlockedAgents().includes(pubkeyHex);
-    const allowed = this.#policy.getAllowedAgents().includes(pubkeyHex);
+    const allowed = this.#policy.isAgentAllowed(pubkeyHex);
+
+    const expiry = this.#policy.getBlockExpiry(pubkeyHex);
 
     return {
       allowed,
       blocked,
+      ...(expiry !== undefined ? { blockExpiry: expiry } : {}),
       allowedTags: [...shadow.allowedTags],
       blockedTags: [...shadow.blockedTags],
     };
@@ -327,7 +356,11 @@ export class PersistentTrustPolicy {
       this.#policy.allowAgent(pubkeyHex);
     }
     if (record.blocked) {
-      this.#policy.blockAgent(pubkeyHex);
+      if (record.blockExpiry !== undefined) {
+        this.#policy.blockAgentUntil(pubkeyHex, record.blockExpiry);
+      } else {
+        this.#policy.blockAgent(pubkeyHex);
+      }
     }
 
     const shadow = this.#shadowEntry(pubkeyHex);
