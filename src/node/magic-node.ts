@@ -293,6 +293,7 @@ export class MagicNode {
       }
 
       this.metrics.increment('peers.connected');
+      this.metrics.gauge('peers.current', this.libp2p?.getPeers().length ?? 0);
       this.partitionDetector.updatePeerCount(this.libp2p?.getPeers().length ?? 0);
       this.events.onPeerConnected?.(peerId);
 
@@ -329,6 +330,7 @@ export class MagicNode {
       const peerId = evt.detail.toString();
       this.handshake?.removePeer(peerId);
       this.metrics.increment('peers.disconnected');
+      this.metrics.gauge('peers.current', this.libp2p?.getPeers().length ?? 0);
       this.partitionDetector.updatePeerCount(this.libp2p?.getPeers().length ?? 0);
       this.events.onPeerDisconnected?.(peerId);
     };
@@ -1085,6 +1087,7 @@ export class MagicNode {
   protected async handleIncomingMessage(topic: string, data: Uint8Array): Promise<void> {
     // If paused, drop all inbound messages silently
     if (this.paused) return;
+    const startMs = performance.now();
 
     let msg: MagicMessage;
     try {
@@ -1208,6 +1211,9 @@ export class MagicNode {
     // These are distinct from the global onMessage event — a consumer may
     // listen to both without receiving duplicate notifications.
     this.tagPubSub?.handleMessage(topic, data);
+
+    // Track message processing latency
+    this.metrics.observe('message.latency.ms', performance.now() - startMs);
 
     // Fire global event
     this.events.onMessage?.(msg, topic);
