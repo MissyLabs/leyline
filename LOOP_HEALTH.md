@@ -45,3 +45,44 @@
 5. Implemented message compression (gzip with zip bomb protection)
 6. Added 32 new tests across 4 new test files + 1 inbox auth test
 7. Updated all report files
+
+## Session 3 — 2026-04-15
+
+| Metric | Value |
+|--------|-------|
+| Tests at start | 400 (0 failing) |
+| Tests at end | 527 (0 failing) |
+| TypeScript | Clean (0 errors) |
+| Commits | 4 |
+| Security findings fixed | Bounded spamCounts + ledgerSubmitTimestamps, silent catch blocks |
+| New features | Peer reputation scoring system |
+| Test files added | 11 (tag-pubsub, config, compat, spam-filter-bounds, magic-node-pipeline, magic-node-queued, peer-reputation, consensus-adversarial, trust-adversarial, handshake-edge-cases, peer-exchange-validation) |
+
+### Session Timeline
+1. Added 127 new tests across 11 test files
+2. Bounded SpamFilter.#spamCounts map (10k cap with 25% LRU eviction)
+3. Bounded SeedNode.ledgerSubmitTimestamps map (5k cap with stale eviction)
+4. Replaced 5 silent catch blocks with warn-level logging
+5. Implemented peer reputation scoring system (time-decayed, configurable, LRU-bounded)
+
+## Session 4 — 2026-04-15
+
+| Metric | Value |
+|--------|-------|
+| Tests at start | 527 (0 failing) |
+| Tests at end | 549 (0 failing) |
+| TypeScript | Clean (0 errors) |
+| Commits | 5 |
+| Security findings fixed | 3 unhandled promise rejections, resource cleanup on stop |
+| New features | PeerReputation integrated into MagicNode + PeerExchange |
+| Test files added | 2 (reputation-integration, deep-edge-cases) |
+
+### Session Timeline
+1. Fixed 3 unhandled promise rejections in MagicNode handleIncomingMessage call sites
+2. Integrated PeerReputation into MagicNode message pipeline (success/spam/violation signals)
+3. Integrated PeerReputation into PeerExchange (reputation-weighted peer selection)
+4. Fixed SeedNode stop() to unsubscribe mirrored topics and clear rate limit map
+5. Fixed MagicNode stop() to clear payloadBudgets and inboundTimestamps
+6. Added waitForPeers early exit when node is stopping
+7. Exported PeerReputation types from package index
+8. Added 11 reputation integration tests + 11 deep edge case tests

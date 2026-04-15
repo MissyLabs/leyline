@@ -2,8 +2,8 @@
 
 **Date:** 2026-04-15  
 **Branch:** loop_fix_04_15_2026  
-**Last updated:** Session 2  
-**Tests at last update:** 400 passing
+**Last updated:** Session 4  
+**Tests at last update:** 549 passing
 
 ## CRITICAL
 
@@ -67,6 +67,18 @@
 **File:** `src/ledger/shared-ledger.ts`  
 **Status:** LOW RISK — LedgerSync handler caps range requests at 100 entries.
 
+### M8. Unhandled promise rejections in MagicNode message handling
+**File:** `src/node/magic-node.ts`  
+**Status:** FIXED (session 4) — All three `handleIncomingMessage` call sites (GossipSub handler, inbox fetch, inbox poll) now have `.catch()` handlers with warn-level logging.
+
+### M9. SeedNode stop() does not unsubscribe mirrored topics
+**File:** `src/node/seed-node.ts`  
+**Status:** FIXED (session 4) — Mirrored GossipSub topics are unsubscribed before clearing the set. `ledgerSubmitTimestamps` rate limit map is also cleared.
+
+### M10. MagicNode stop() does not clear rate limit state
+**File:** `src/node/magic-node.ts`  
+**Status:** FIXED (session 4) — `payloadBudgets` map and `inboundTimestamps` array are cleared in `stop()`.
+
 ## LOW
 
 ### L1. `Math.random()` for peer shuffling — not crypto-secure
@@ -91,7 +103,7 @@
 |----------|-------|-------|------|
 | CRITICAL | 2 | 2 | 0 |
 | HIGH | 5 | 5 | 0 |
-| MEDIUM | 7 | 6 | 1 (mitigated) |
+| MEDIUM | 10 | 9 | 1 (mitigated) |
 | LOW | 4 | 3 | 1 (acceptable) |
 
 **All critical and high severity findings have been resolved.**
