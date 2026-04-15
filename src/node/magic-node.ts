@@ -24,6 +24,7 @@ import { DirectMessageProtocol, type DirectEnvelope, type DirectMessageTrustChec
 import { ServiceRegistry, type ServiceDescriptor } from '../discovery/service-registry.js';
 import { DiscoveryProtocol } from '../discovery/discovery-protocol.js';
 import { PersistentTrustPolicy, PersistentSpamFilter } from '../trust/persistent-policy.js';
+import { PeerReputation } from '../trust/peer-reputation.js';
 import { LedgerConsensus } from '../ledger/consensus.js';
 import {
   type MagicMessage,
@@ -64,6 +65,7 @@ export class MagicNode {
   protected inboxClient: InboxClient | null = null;
   protected handshake: HandshakeProtocol | null = null;
   protected ledgerConsensus: LedgerConsensus;
+  protected peerReputation: PeerReputation;
   protected publicKey: Uint8Array = new Uint8Array(0);
   protected privateKey: Uint8Array = new Uint8Array(0);
   protected events: MagicNodeEvents;
@@ -97,6 +99,7 @@ export class MagicNode {
     this.sharedLedger = new SharedLedger(`${this.config.dataDir}/shared-ledger`);
     this.serviceRegistry = new ServiceRegistry();
     this.ledgerConsensus = new LedgerConsensus();
+    this.peerReputation = new PeerReputation();
     this.events = events;
   }
 
@@ -200,7 +203,9 @@ export class MagicNode {
       if (this.handshake && msg.from && this.handshake.isIncompatible(msg.from.toString())) {
         return; // Drop messages from incompatible peers
       }
-      this.handleIncomingMessage(msg.topic, msg.data);
+      this.handleIncomingMessage(msg.topic, msg.data).catch((err) => {
+        console.warn('[Magic] Error handling incoming message:', (err as Error)?.message ?? err);
+      });
     };
     gs.addEventListener('gossipsub:message', this.gossipHandler);
 
@@ -226,7 +231,9 @@ export class MagicNode {
               if (messages.length > 0) {
                 console.log(`[Magic] Inbox: fetched ${messages.length} missed message(s) from ${peerId.slice(0, 16)}...`);
                 for (const msg of messages) {
-                  this.handleIncomingMessage(msg.topic, msg.data);
+                  this.handleIncomingMessage(msg.topic, msg.data).catch((err) => {
+                    console.warn('[Magic] Error handling inbox message:', (err as Error)?.message ?? err);
+                  });
                 }
               }
             }).catch(() => {
@@ -256,6 +263,7 @@ export class MagicNode {
     this.peerExchange = new PeerExchange(this.libp2p, {
       localPrivateKey: this.privateKey,
       localPubkeyHex: publicKeyToHex(this.publicKey),
+      reputation: this.peerReputation,
     });
     await this.peerExchange.start();
 
@@ -359,7 +367,9 @@ export class MagicNode {
           if (messages.length > 0) {
             console.log(`[Magic] Inbox poll: ${messages.length} new message(s)`);
             for (const msg of messages) {
-              this.handleIncomingMessage(msg.topic, msg.data);
+              this.handleIncomingMessage(msg.topic, msg.data).catch((err) => {
+                console.warn('[Magic] Error handling polled inbox message:', (err as Error)?.message ?? err);
+              });
             }
           }
         }).catch((err) => {
@@ -404,6 +414,7 @@ export class MagicNode {
     await this.sharedLedger.close();
     await this.trustPolicy.close();
     await this.spamFilter.close();
+    this.peerReputation.clear();
 
     // Remove event listeners before stopping libp2p
     if (this.libp2p && this.gossipHandler) {
@@ -788,6 +799,11 @@ export class MagicNode {
     return this.ledgerConsensus;
   }
 
+  /** Get the peer reputation tracker. */
+  getPeerReputation(): PeerReputation {
+    return this.peerReputation;
+  }
+
   protected async handleIncomingMessage(topic: string, data: Uint8Array): Promise<void> {
     // If paused, drop all inbound messages silently
     if (this.paused) return;
@@ -804,6 +820,7 @@ export class MagicNode {
     // Validate message structure
     const validation = validateMessage(msg);
     if (!validation.valid) {
+      this.peerReputation.recordViolation(senderHex);
       await this.localLedger.append(data, 'blocked');
       return;
     }
@@ -818,6 +835,7 @@ export class MagicNode {
     // Check rate limiting (per-sender)
     if (this.spamFilter.isRateLimited(senderHex, this.config.rateLimitPerMinute)) {
       await this.spamFilter.reportSpam(senderHex);
+      this.peerReputation.recordSpam(senderHex);
       await this.localLedger.append(data, 'blocked');
       // Auto-block agents that repeatedly hit rate limits
       if (this.config.autoBlockThreshold > 0 &&
@@ -888,11 +906,13 @@ export class MagicNode {
     }
     if (!sigValid) {
       await this.spamFilter.reportSpam(senderHex);
+      this.peerReputation.recordViolation(senderHex);
       await this.localLedger.append(data, 'blocked');
       return;
     }
 
     // Message passed all checks — record and deliver
+    this.peerReputation.recordSuccess(senderHex);
     await this.localLedger.append(data, 'received');
 
     // Track last-received timestamp for inbox sync
