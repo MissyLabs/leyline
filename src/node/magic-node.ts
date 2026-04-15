@@ -46,6 +46,7 @@ import { NodeMetrics } from '../utils/metrics.js';
 import { Logger } from '../utils/logger.js';
 import { PartitionDetector, type PartitionEvent } from '../utils/partition-detector.js';
 import { PriorityQueue, MessagePriority } from '../utils/priority-queue.js';
+import { CircuitBreaker } from '../utils/circuit-breaker.js';
 
 export interface MagicNodeEvents {
   onMessage?: (msg: MagicMessage, tag: string) => void;
@@ -120,6 +121,8 @@ export class MagicNode {
   private degraded = false;
   /** Parsed seed PeerIds for connectivity tracking. */
   private seedPeerIds = new Set<string>();
+  /** Circuit breaker for outbound peer dials — prevents hammering unreachable peers. */
+  protected circuitBreaker = new CircuitBreaker();
 
   // --- Global inbound rate limiting (token burn protection) ---
   /** Timestamps of messages delivered to handlers in the current window. */
@@ -342,6 +345,7 @@ export class MagicNode {
       localPubkeyHex: publicKeyToHex(this.publicKey),
       reputation: this.peerReputation,
       shutdownSignal: this.shutdownController.signal,
+      circuitBreaker: this.circuitBreaker,
     });
     await this.peerExchange.start();
 
@@ -511,6 +515,7 @@ export class MagicNode {
     this.payloadBudgets.clear();
     this.inboundTimestamps = [];
     this.partitionDetector.reset();
+    this.circuitBreaker.clear();
 
     // Remove event listeners before stopping libp2p
     if (this.libp2p && this.gossipHandler) {
@@ -970,6 +975,11 @@ export class MagicNode {
   /** Get the shutdown signal for cooperative cancellation. */
   getShutdownSignal(): AbortSignal {
     return this.shutdownController.signal;
+  }
+
+  /** Get the circuit breaker for outbound peer dials. */
+  getCircuitBreaker(): CircuitBreaker {
+    return this.circuitBreaker;
   }
 
   /** Whether the node is currently degraded (no seeds reachable). */

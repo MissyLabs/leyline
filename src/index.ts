@@ -124,6 +124,7 @@ export {
   getGlobalLogLevel,
   setGlobalLogHandler,
 } from './utils/logger.js';
+export { CircuitBreaker, type CircuitBreakerConfig } from './utils/circuit-breaker.js';
 
 // Crypto
 export {

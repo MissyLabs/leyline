@@ -93,6 +93,7 @@ export class PeerExchange {
   private reputation?: PeerReputation;
   private readonly log = new Logger('PeerExchange');
   private readonly shutdownSignal?: AbortSignal;
+  private circuitBreaker?: import('../utils/circuit-breaker.js').CircuitBreaker;
 
   constructor(
     libp2p: Libp2p,
@@ -104,6 +105,7 @@ export class PeerExchange {
       localPubkeyHex?: string;
       reputation?: PeerReputation;
       shutdownSignal?: AbortSignal;
+      circuitBreaker?: import('../utils/circuit-breaker.js').CircuitBreaker;
     } = {},
   ) {
     this.libp2p = libp2p;
@@ -115,6 +117,7 @@ export class PeerExchange {
     this.localPubkeyHex = opts.localPubkeyHex;
     this.reputation = opts.reputation;
     this.shutdownSignal = opts.shutdownSignal;
+    this.circuitBreaker = opts.circuitBreaker;
   }
 
   /** Sign a peer record with the local private key. */
@@ -247,16 +250,20 @@ export class PeerExchange {
     const alreadyConnected = this.libp2p.getPeers().some((p) => p.toString() === record.peerId);
     if (alreadyConnected) return;
 
+    if (this.circuitBreaker?.isOpen(record.peerId)) return;
+
     const { multiaddr } = await import('@multiformats/multiaddr');
     for (const addr of record.multiaddrs) {
       try {
         const ma = multiaddr(addr);
         await this.libp2p.dial(ma);
-        return; // Success — stop trying other addrs
+        this.circuitBreaker?.recordSuccess(record.peerId);
+        return;
       } catch {
         // Try next addr
       }
     }
+    this.circuitBreaker?.recordFailure(record.peerId);
   }
 
   /** Remove a peer from the table. */
@@ -355,7 +362,8 @@ export class PeerExchange {
     const connectedPeers = this.libp2p.getPeers();
     if (connectedPeers.length === 0) return;
 
-    let selected = connectedPeers.map((p) => p.toString());
+    let selected = connectedPeers.map((p) => p.toString())
+      .filter((p) => !this.circuitBreaker?.isOpen(p));
     if (selected.length > PeerExchange.MAX_CONCURRENT_EXCHANGES) {
       if (this.reputation) {
         selected.sort((a, b) => this.reputation!.getScore(b) - this.reputation!.getScore(a));
