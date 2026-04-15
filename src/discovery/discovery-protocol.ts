@@ -29,6 +29,9 @@ import {
   ServiceRegistry,
 } from './service-registry.js';
 import { sign, verify, hexToPublicKey } from '../identity/keypair.js';
+import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+
+const MAX_RESULT_SERVICES = 100;
 
 // ---------------------------------------------------------------------------
 // Protocol ID
@@ -263,12 +266,13 @@ export class DiscoveryProtocol {
         (source) => lp.encode(source),
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async (source) => {
           for await (const chunk of source) {
             const msg = decodeMsg(chunk.subarray());
             if (msg.kind === 'result' && msg.requestId === requestId) {
-              // Merge received descriptors into local registry, verifying signatures and trust.
-              for (const descriptor of msg.result.services) {
+              const services = msg.result.services.slice(0, MAX_RESULT_SERVICES);
+              for (const descriptor of services) {
                 // Skip services from blocked providers
                 if (this.trustChecker && !this.trustChecker.isAllowed(descriptor.providerPubkey)) {
                   continue;
@@ -354,7 +358,7 @@ export class DiscoveryProtocol {
           [encodeMsg(adMsg)],
           (source) => lp.encode(source),
           stream,
-          // Drain any bytes the remote might send (none expected for ads).
+          (source) => withTimeout(source, STREAM_TIMEOUT_MS),
           async (source) => {
             for await (const _ of source) { /* intentional no-op */ }
           },
@@ -388,6 +392,7 @@ export class DiscoveryProtocol {
       await pipe(
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async function* (
           source: AsyncIterable<{ subarray(): Uint8Array }>,
         ): AsyncIterable<Uint8Array> {

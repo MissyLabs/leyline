@@ -23,6 +23,7 @@ import {
   checkCompat,
   type CompatResult,
 } from '../config/compat.js';
+import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
 
 export const HANDSHAKE_PROTOCOL = '/leyline/handshake/1.0.0';
 
@@ -194,6 +195,7 @@ export class HandshakeProtocol {
         (source) => lp.encode(source),
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async (source) => {
           for await (const msg of source) {
             const resp = decode(msg.subarray()) as HandshakeResponse;
@@ -238,6 +240,7 @@ export class HandshakeProtocol {
       await pipe(
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async function* (source: AsyncIterable<{ subarray(): Uint8Array }>) {
           for await (const msg of source) {
             const req = decode(msg.subarray()) as HandshakeRequest;

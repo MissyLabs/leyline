@@ -20,6 +20,7 @@ import type { GossipSub } from '@chainsafe/libp2p-gossipsub';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { type BufferedMessage, type MessageBuffer } from './message-buffer.js';
+import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
 
 export const INBOX_PROTOCOL = '/leyline/inbox/1.0.0';
 
@@ -156,6 +157,7 @@ export class InboxServer {
       await pipe(
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async function* (this: InboxServer, source: AsyncIterable<{ subarray(): Uint8Array }>) {
           for await (const msg of source) {
             const req = decode(msg.subarray());
@@ -267,6 +269,7 @@ export class InboxClient {
         (source) => lp.encode(source),
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async (source) => {
           for await (const msg of source) {
             const resp = decode(msg.subarray()) as InboxResponse;

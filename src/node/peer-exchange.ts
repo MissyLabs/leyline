@@ -3,6 +3,7 @@ import type { Stream } from '@libp2p/interface';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { sign as edSign, verify as edVerify, hexToPublicKey } from '../identity/keypair.js';
+import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
 
 /**
  * Peer Exchange Protocol for the Leyline network.
@@ -307,6 +308,7 @@ export class PeerExchange {
         (source) => lp.encode(source),
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async (source) => {
           for await (const msg of source) {
             const response = decode(msg.subarray());
@@ -364,6 +366,7 @@ export class PeerExchange {
       await pipe(
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async function* (source: AsyncIterable<{ subarray(): Uint8Array }>) {
           for await (const msg of source) {
             const request = decode(msg.subarray());

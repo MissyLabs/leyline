@@ -5,6 +5,7 @@ import * as lp from 'it-length-prefixed';
 import { createHash } from 'node:crypto';
 import { encryptPayload, decryptPayload } from '../crypto/envelope.js';
 import { hexToPublicKey, sign as edSign, verify as edVerify } from '../identity/keypair.js';
+import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
 
 /**
  * Direct Message Protocol for the Leyline network.
@@ -416,6 +417,7 @@ export class DirectMessageProtocol {
       await pipe(
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async (source: AsyncIterable<{ subarray(): Uint8Array }>) => {
           for await (const msg of source) {
             let envelope: DirectEnvelope;
