@@ -86,3 +86,21 @@
 6. Added waitForPeers early exit when node is stopping
 7. Exported PeerReputation types from package index
 8. Added 11 reputation integration tests + 11 deep edge case tests
+
+## Session 5 — 2026-04-15
+
+| Metric | Value |
+|--------|-------|
+| Tests at start | 549 (0 failing) |
+| Tests at end | 605 (0 failing) |
+| TypeScript | Clean (0 errors) |
+| Commits | 4 |
+| New features | Persistent service discovery (LevelDB-backed ServiceRegistry) |
+| Test files added | 4 (persistent-registry, dm-relay, adversarial-peer, cross-subsystem) |
+
+### Session Timeline
+1. Implemented PersistentServiceRegistry with LevelDB persistence (18 tests)
+2. Added DM relay integration tests — 3-node relay path, signature preservation, unsigned rejection (8 tests)
+3. Added adversarial peer simulation tests — malicious wire messages to DM, handshake, discovery handlers (14 tests)
+4. Added cross-subsystem integration tests — reputation+trust+spam pipeline, consensus mechanics, buffer+dedup (16 tests)
+5. Updated all report files

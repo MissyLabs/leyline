@@ -1,11 +1,11 @@
 # Build Status — Leyline
 
-**Last updated:** Session 4, 2026-04-15  
+**Last updated:** Session 5, 2026-04-15  
 **Branch:** loop_fix_04_15_2026
 
 ## Current State
 
-- **Tests:** 549 passing, 0 failing (38 test files)
+- **Tests:** 605 passing, 0 failing (42 test files)
 - **TypeScript:** Clean compilation (0 errors)
 - **Baseline:** 258 tests pre-loop
 
@@ -15,16 +15,16 @@
 |----------|-------|-------|------|
 | CRITICAL | 2 | 2 | 0 |
 | HIGH | 5 | 5 | 0 |
-| MEDIUM | 7 | 6 | 1 (mitigated) |
+| MEDIUM | 10 | 9 | 1 (mitigated) |
 | LOW | 4 | 3 | 1 (acceptable) |
 
 **All critical and high severity findings are resolved.**
 
-### Session 4 hardening:
-- Fixed 3 unhandled promise rejections in MagicNode message handling
-- Added `waitForPeers` early exit when node is stopping
-- Cleaned up MagicNode resources on stop (payloadBudgets, inboundTimestamps)
-- SeedNode stop now unsubscribes mirrored topics and clears ledgerSubmitTimestamps
+### Session 5 work:
+- Added PersistentServiceRegistry (LevelDB-backed service discovery)
+- Added DM relay integration tests (3-node relay path verified)
+- Added adversarial peer simulation tests (DM, handshake, discovery)
+- Added cross-subsystem integration tests (reputation + trust + spam + consensus)
 
 ## Features Added
 
@@ -36,6 +36,7 @@
 6. **Message compression** (session 2) — Transparent gzip for messages > 256 bytes with zip bomb protection
 7. **Peer reputation scoring** (session 3) — Per-peer quality tracking with time-decay, bounded storage, configurable thresholds
 8. **Reputation integration** (session 4) — PeerReputation wired into MagicNode pipeline and PeerExchange peer selection
+9. **Persistent service discovery** (session 5) — LevelDB-backed ServiceRegistry survives node restarts
 
 ## Test Coverage Growth
 
@@ -46,6 +47,7 @@
 | Session 2 | 400 | +32 |
 | Session 3 | 527 | +127 |
 | Session 4 | 549 | +22 |
+| Session 5 | 605 | +56 |
 
 ## Implementation Gaps Addressed
 
@@ -67,31 +69,32 @@
 - MagicNode and SeedNode fully clean up resources on stop (session 4)
 - PersistentTrustPolicy/SpamFilter persistence verified via tests (session 4)
 - SeedNode lifecycle verified via tests (session 4)
+- PersistentServiceRegistry for durable service discovery (session 5)
+- DM relay path verified end-to-end with 3-node topology (session 5)
+- Adversarial wire message handling verified for all protocols (session 5)
+- Cross-subsystem interactions tested (reputation+trust+spam+consensus) (session 5)
 
-## Next Steps for Session 5+
+## Next Steps for Session 6+
 
 1. **Deeper testing:**
-   - DM relay path (3-node relay test)
    - Ledger fork detection and recovery
    - Stress tests for concurrent message handling
-   - Cross-subsystem integration tests (reputation + trust + spam filter)
+   - Fuzz testing for wire message deserialization
 
 2. **New features to consider:**
-   - Persistent service discovery (LevelDB-backed ServiceRegistry)
    - Graceful degradation when seeds unreachable
    - Automatic local peer discovery via mDNS
    - Chain reorganization for ledger forks
    - Metrics/observability hooks (event emitter for monitoring)
 
 3. **Hardening:**
-   - Audit remaining catch blocks for improved diagnostics
    - Add AbortController-based cancellation for all protocol streams
-   - Fuzz testing for wire message deserialization
-   - Adversarial peer simulation tests
+   - Audit remaining catch blocks for improved diagnostics
 
 4. **Documentation:**
    - Document peer reputation system
    - Document compression wire format
+   - Document persistent service registry
    - Update CLAUDE.md with new modules
    - API reference for PeerReputation
 

@@ -2,9 +2,9 @@
 
 **Date:** 2026-04-15  
 **Branch:** loop_fix_04_15_2026  
-**Total Tests:** 549 passing (0 failures)  
+**Total Tests:** 605 passing (0 failures)  
 **Baseline:** 258 tests (pre-loop)  
-**Test Files:** 38
+**Test Files:** 42
 
 ## Test Coverage by Subsystem
 
@@ -35,11 +35,13 @@
 | Ledger Regression | ledger-regression.test.ts | 70 | Pass |
 | Ledger Confirmation Security | ledger-confirmation-security.test.ts | 8 | Pass |
 | Service Registry | service-registry.test.ts | ~20 | Pass |
+| Persistent Registry | persistent-registry.test.ts | 18 | Pass |
 | Discovery Protocol | discovery-protocol.test.ts | ~15 | Pass |
 | Discovery Rate Limit | discovery-ratelimit.test.ts | ~10 | Pass |
 | Discovery Regression | discovery-regression.test.ts | 54 | Pass |
 | Rate Limiting Edge Cases | rate-limiting-edge-cases.test.ts | 6 | Pass |
 | Direct Message | direct-message.test.ts | ~15 | Pass |
+| DM Relay | dm-relay.test.ts | 8 | Pass |
 | Crypto Envelope | crypto-envelope.test.ts | ~10 | Pass |
 | Handshake Edge Cases | handshake-edge-cases.test.ts | 11 | Pass |
 | Peer Exchange | peer-exchange.test.ts | 21 | Pass |
@@ -47,8 +49,17 @@
 | Inbox Protocol | inbox-protocol.test.ts | 20 | Pass |
 | Integration | integration.test.ts | 8 | Pass |
 | Security Regression | security-regression.test.ts | 46 | Pass |
+| Adversarial Peer | adversarial-peer.test.ts | 14 | Pass |
+| Cross-Subsystem | cross-subsystem.test.ts | 16 | Pass |
 | Health Check | health-check.test.ts | 6 | Pass |
 | Deep Edge Cases | deep-edge-cases.test.ts | 11 | Pass |
+
+## Tests Added — Session 5
+
+- **persistent-registry.test.ts**: 18 tests — LevelDB persistence, restart survival, TTL pruning on open, corrupted record handling, update persistence
+- **dm-relay.test.ts**: 8 tests — 3-node relay delivery, signature preservation, unsigned envelope rejection, loop prevention, hop exhaustion, direct fallback
+- **adversarial-peer.test.ts**: 14 tests — Malicious wire messages to DM (7), handshake (3), discovery (4) protocol handlers
+- **cross-subsystem.test.ts**: 16 tests — Reputation+trust+spam pipeline (8), registry+trust filtering (2), consensus mechanics (4), buffer+dedup (2)
 
 ## Tests Added — Session 4
 
