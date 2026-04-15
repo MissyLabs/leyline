@@ -77,6 +77,7 @@ export {
   type DiscoveryResult,
   DEFAULT_SERVICE_TTL,
 } from './discovery/service-registry.js';
+export { PersistentServiceRegistry } from './discovery/persistent-registry.js';
 export {
   DiscoveryProtocol,
   type DiscoveryTrustChecker,
