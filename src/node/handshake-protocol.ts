@@ -179,6 +179,14 @@ export class HandshakeProtocol {
     return this.incompatiblePeers.has(peerId);
   }
 
+  /** Disconnect an incompatible peer by closing all connections. */
+  private disconnectPeer(peerId: string): void {
+    const peerIdObj = this.libp2p.getPeers().find((p) => p.toString() === peerId);
+    if (peerIdObj) {
+      this.libp2p.hangUp(peerIdObj).catch(() => {});
+    }
+  }
+
   /** Remove tracking for a disconnected peer. */
   removePeer(peerId: string): void {
     this.peerVersions.delete(peerId);
@@ -231,6 +239,7 @@ export class HandshakeProtocol {
               if (!ourCheck.compatible) {
                 this.incompatiblePeers.add(peerId);
                 console.warn(`[Handshake] Peer ${peerId.slice(0, 16)}... version ${resp.version} is incompatible: ${ourCheck.message}`);
+                this.disconnectPeer(peerId);
               } else if (ourCheck.deprecated) {
                 console.log(`[Handshake] Peer ${peerId.slice(0, 16)}... version ${resp.version} is deprecated`);
               }
@@ -271,6 +280,7 @@ export class HandshakeProtocol {
               if (!result.compatible) {
                 self.incompatiblePeers.add(remotePeerId);
                 console.warn(`[Handshake] Incompatible peer ${remotePeerId.slice(0, 16)}... version ${req.version}: ${result.message}`);
+                self.disconnectPeer(remotePeerId);
               } else if (result.deprecated) {
                 console.log(`[Handshake] Deprecated peer ${remotePeerId.slice(0, 16)}... version ${req.version}`);
               }

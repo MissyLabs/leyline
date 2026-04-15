@@ -197,6 +197,9 @@ export class MagicNode {
     // Handle incoming messages (store handler for cleanup in stop())
     this.gossipHandler = (evt: CustomEvent) => {
       const { msg } = evt.detail;
+      if (this.handshake && msg.from && this.handshake.isIncompatible(msg.from.toString())) {
+        return; // Drop messages from incompatible peers
+      }
       this.handleIncomingMessage(msg.topic, msg.data);
     };
     gs.addEventListener('gossipsub:message', this.gossipHandler);
