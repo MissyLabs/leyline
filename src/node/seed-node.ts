@@ -31,6 +31,10 @@ export class SeedNode extends MagicNode {
   private inboxServer: InboxServer | null = null;
   /** Track which GossipSub topics each peer is subscribed to, for topic-addressed mailbox delivery. */
   private peerSubscriptions = new Map<string, Set<string>>();
+  /** Stored event listener references for cleanup in stop(). */
+  private messageCaptureHandler: ((evt: CustomEvent) => void) | null = null;
+  private topicMirrorHandler: ((evt: CustomEvent) => void) | null = null;
+  private subscriptionTrackHandler: ((evt: CustomEvent) => void) | null = null;
 
   constructor(config: Partial<MagicConfig>) {
     super(
@@ -109,10 +113,30 @@ export class SeedNode extends MagicNode {
       clearInterval(this.ledgerConfirmTimer);
       this.ledgerConfirmTimer = null;
     }
+
+    // Remove GossipSub event listeners to prevent leaks
+    if (this.libp2p) {
+      const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
+      if (this.messageCaptureHandler) {
+        gs.removeEventListener('gossipsub:message', this.messageCaptureHandler);
+        this.messageCaptureHandler = null;
+      }
+      if (this.topicMirrorHandler) {
+        gs.removeEventListener('subscription-change', this.topicMirrorHandler);
+        this.topicMirrorHandler = null;
+      }
+      if (this.subscriptionTrackHandler) {
+        gs.removeEventListener('subscription-change', this.subscriptionTrackHandler);
+        this.subscriptionTrackHandler = null;
+      }
+    }
+
     this.messageBuffer.stop();
     await this.inboxServer?.stop();
     await this.peerDb?.close();
     this.peerDb = null;
+    this.peerSubscriptions.clear();
+    this.mirroredTopics.clear();
     await super.stop();
   }
 
@@ -135,12 +159,12 @@ export class SeedNode extends MagicNode {
   }
 
   private markPeerDisconnected(peerId: string): void {
-    // Keep in known peers but update last seen
     const peer = this.knownPeers.get(peerId);
     if (peer) {
       peer.lastSeen = Date.now();
       this.persistPeer(peerId, { peerId, multiaddrs: peer.multiaddrs, lastSeen: peer.lastSeen });
     }
+    this.peerSubscriptions.delete(peerId);
     console.log(`[Seed] Peer disconnected: ${peerId}`);
   }
 
@@ -196,7 +220,7 @@ export class SeedNode extends MagicNode {
     const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
     const buffer = this.messageBuffer;
 
-    gs.addEventListener('gossipsub:message', (evt: CustomEvent) => {
+    this.messageCaptureHandler = (evt: CustomEvent) => {
       const { msg } = evt.detail;
       const topic = msg.topic as string;
       const data = msg.data as Uint8Array;
@@ -209,13 +233,13 @@ export class SeedNode extends MagicNode {
 
       const stored = buffer.push(topic, data, id);
       if (stored) {
-        // Log occasionally, not every message
         const count = buffer.getCount();
         if (count === 1 || count % 100 === 0) {
           console.log(`[Seed] Message buffer: ${count} messages across ${buffer.getBufferedTopics().length} topics`);
         }
       }
-    });
+    };
+    gs.addEventListener('gossipsub:message', this.messageCaptureHandler);
   }
 
   private startPeerExchange(): void {
@@ -257,18 +281,15 @@ export class SeedNode extends MagicNode {
 
     const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
 
-    // Listen for peer subscription changes in real-time
-    gs.addEventListener('subscription-change', (evt: CustomEvent) => {
+    this.topicMirrorHandler = (evt: CustomEvent) => {
       const { subscriptions } = evt.detail;
       if (!Array.isArray(subscriptions)) return;
 
       for (const sub of subscriptions) {
-        // sub has { topic: string, subscribe: boolean }
         const topic = (sub as { topic: string; subscribe: boolean }).topic;
         const subscribing = (sub as { topic: string; subscribe: boolean }).subscribe;
 
         if (subscribing && !this.mirroredTopics.has(topic)) {
-          // Cap total mirrored topics to prevent memory exhaustion from malicious peers
           if (this.mirroredTopics.size >= 500) {
             console.warn(`[Seed] Topic mirror cap reached (500) — ignoring: ${topic}`);
             continue;
@@ -278,7 +299,8 @@ export class SeedNode extends MagicNode {
           console.log(`[Seed] Mirroring topic: ${topic} (${this.mirroredTopics.size} total)`);
         }
       }
-    });
+    };
+    gs.addEventListener('subscription-change', this.topicMirrorHandler);
 
     console.log('[Seed] Topic mirroring active — will relay all peer topics');
   }
@@ -293,7 +315,7 @@ export class SeedNode extends MagicNode {
 
     const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
 
-    gs.addEventListener('subscription-change', (evt: CustomEvent) => {
+    this.subscriptionTrackHandler = (evt: CustomEvent) => {
       const { peerId, subscriptions } = evt.detail;
       const peerIdStr = peerId?.toString();
       if (!peerIdStr || !Array.isArray(subscriptions)) return;
@@ -313,7 +335,8 @@ export class SeedNode extends MagicNode {
           subs.delete(topic);
         }
       }
-    });
+    };
+    gs.addEventListener('subscription-change', this.subscriptionTrackHandler);
   }
 
   /**
