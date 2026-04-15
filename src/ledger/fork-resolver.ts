@@ -1,4 +1,5 @@
 import type { SharedLedger, SharedLedgerEntry } from './shared-ledger.js';
+import { Logger } from '../utils/logger.js';
 
 function toHex(arr: Uint8Array): string {
   return Buffer.from(arr).toString('hex');
@@ -32,6 +33,7 @@ export interface PeerChainQuerier {
 export class ForkResolver {
   private readonly ledger: SharedLedger;
   private readonly maxReorgDepth: number;
+  private readonly log = new Logger('ForkResolver');
 
   constructor(ledger: SharedLedger, opts?: { maxReorgDepth?: number }) {
     this.ledger = ledger;
@@ -71,9 +73,7 @@ export class ForkResolver {
 
     const reorgDepth = fork.localLength - fork.divergenceIndex + 1;
     if (reorgDepth > this.maxReorgDepth) {
-      console.warn(
-        `[ForkResolver] Reorg depth ${reorgDepth} exceeds max ${this.maxReorgDepth} — refusing to resolve`,
-      );
+      this.log.warn('Reorg depth exceeds max — refusing to resolve', { reorgDepth, maxReorgDepth: this.maxReorgDepth });
       return { ...fork, resolved: false, winner: 'none' };
     }
 
@@ -110,16 +110,18 @@ export class ForkResolver {
       }
 
       fork.resolved = true;
-      console.log(
-        `[ForkResolver] Resolved fork at index ${fork.divergenceIndex}: ` +
-        `adopted peer chain (${peerConfs} confs vs local ${localConfs} confs)`,
-      );
+      this.log.info('Resolved fork: adopted peer chain', {
+        divergenceIndex: fork.divergenceIndex,
+        peerConfs,
+        localConfs,
+      });
     } else {
       fork.resolved = true;
-      console.log(
-        `[ForkResolver] Fork at index ${fork.divergenceIndex}: ` +
-        `keeping local chain (${localConfs} confs vs peer ${peerConfs} confs)`,
-      );
+      this.log.info('Fork resolved: keeping local chain', {
+        divergenceIndex: fork.divergenceIndex,
+        localConfs,
+        peerConfs,
+      });
     }
 
     return fork;

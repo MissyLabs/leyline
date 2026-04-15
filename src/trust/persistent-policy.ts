@@ -16,6 +16,9 @@
 
 import { Level } from 'level';
 import { TrustPolicy, SpamFilter } from './policy.js';
+import { Logger } from '../utils/logger.js';
+
+const log = new Logger('PersistentTrustPolicy');
 
 // ---------------------------------------------------------------------------
 // Internal serialisation types
@@ -81,7 +84,7 @@ export class PersistentTrustPolicy {
         const record: AgentPolicyRecord = JSON.parse(raw) as AgentPolicyRecord;
         this.#rehydrateAgent(pubkeyHex, record);
       } catch {
-        console.warn(`[TrustPolicy] Skipping corrupted record for ${pubkeyHex}`);
+        log.warn('Skipping corrupted record', { pubkeyHex });
       }
     }
 

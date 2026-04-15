@@ -113,6 +113,15 @@ export { InboxServer, InboxClient, INBOX_PROTOCOL } from './node/inbox-protocol.
 export { withTimeout, STREAM_TIMEOUT_MS, StreamAbortedError } from './utils/stream-timeout.js';
 export { compressMessage, decompressMessage, isCompressedMessage } from './utils/compression.js';
 export { NodeMetrics, type MetricEvent, type MetricsSnapshot } from './utils/metrics.js';
+export {
+  Logger,
+  LogLevel,
+  type LogEntry,
+  type LogHandler,
+  setGlobalLogLevel,
+  getGlobalLogLevel,
+  setGlobalLogHandler,
+} from './utils/logger.js';
 
 // Crypto
 export {

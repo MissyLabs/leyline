@@ -24,6 +24,7 @@ import {
   type CompatResult,
 } from '../config/compat.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { Logger } from '../utils/logger.js';
 
 export const HANDSHAKE_PROTOCOL = '/leyline/handshake/1.0.0';
 
@@ -97,6 +98,7 @@ export interface HandshakeEvents {
 export class HandshakeProtocol {
   private readonly libp2p: Libp2p;
   private readonly events: HandshakeEvents;
+  private readonly log = new Logger('HandshakeProtocol');
 
   /** Tracked peer versions: peerId → version string */
   private readonly peerVersions = new Map<string, string>();
@@ -194,7 +196,7 @@ export class HandshakeProtocol {
     const peerIdObj = this.libp2p.getPeers().find((p) => p.toString() === peerId);
     if (peerIdObj) {
       this.libp2p.hangUp(peerIdObj).catch((err) => {
-        console.warn(`[Handshake] hangUp failed for ${peerId}: ${err}`);
+        this.log.warn('hangUp failed', { peer: peerId, error: String(err) });
       });
     }
   }
@@ -241,19 +243,19 @@ export class HandshakeProtocol {
 
               // Check if THEY think WE'RE compatible
               if (!resp.compatible) {
-                console.error(`[Handshake] REJECTED by ${peerId.slice(0, 16)}...: ${resp.message}`);
+                this.log.error('REJECTED by peer', { peer: peerId.slice(0, 16), message: resp.message });
               } else if (resp.deprecated) {
-                console.warn(`[Handshake] DEPRECATION WARNING from ${peerId.slice(0, 16)}...: ${resp.message}`);
+                this.log.warn('DEPRECATION WARNING from peer', { peer: peerId.slice(0, 16), message: resp.message });
               }
 
               // Check if WE think THEY'RE compatible
               const ourCheck = checkCompat(resp.version);
               if (!ourCheck.compatible) {
                 this.incompatiblePeers.add(peerId);
-                console.warn(`[Handshake] Peer ${peerId.slice(0, 16)}... version ${resp.version} is incompatible: ${ourCheck.message}`);
+                this.log.warn('Peer version is incompatible', { peer: peerId.slice(0, 16), version: resp.version, message: ourCheck.message });
                 this.disconnectPeer(peerId);
               } else if (ourCheck.deprecated) {
-                console.log(`[Handshake] Peer ${peerId.slice(0, 16)}... version ${resp.version} is deprecated`);
+                this.log.info('Peer version is deprecated', { peer: peerId.slice(0, 16), version: resp.version });
               }
 
               this.events.onPeerVersion?.(peerId, resp.version, ourCheck);
@@ -291,10 +293,10 @@ export class HandshakeProtocol {
 
               if (!result.compatible) {
                 self.incompatiblePeers.add(remotePeerId);
-                console.warn(`[Handshake] Incompatible peer ${remotePeerId.slice(0, 16)}... version ${req.version}: ${result.message}`);
+                self.log.warn('Incompatible peer', { peer: remotePeerId.slice(0, 16), version: req.version, message: result.message });
                 self.disconnectPeer(remotePeerId);
               } else if (result.deprecated) {
-                console.log(`[Handshake] Deprecated peer ${remotePeerId.slice(0, 16)}... version ${req.version}`);
+                self.log.info('Deprecated peer', { peer: remotePeerId.slice(0, 16), version: req.version });
               }
 
               self.events.onPeerVersion?.(remotePeerId, req.version, result);

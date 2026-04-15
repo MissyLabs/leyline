@@ -21,6 +21,7 @@ import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { type BufferedMessage, type MessageBuffer } from './message-buffer.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { Logger } from '../utils/logger.js';
 
 export const INBOX_PROTOCOL = '/leyline/inbox/1.0.0';
 
@@ -205,6 +206,7 @@ export class InboxServer {
  */
 export class InboxClient {
   private readonly libp2p: Libp2p;
+  private readonly log = new Logger('InboxClient');
   /** Timestamp of the last message we received (for "since" requests). */
   private lastReceivedAt: number = 0;
 
@@ -278,7 +280,7 @@ export class InboxClient {
                 });
               }
               if (resp.totalAvailable > resp.messages.length) {
-                console.log(`[Inbox] ${resp.messages.length}/${resp.totalAvailable} messages fetched (limit: ${limit})`);
+                this.log.info('Partial inbox fetch', { fetched: resp.messages.length, available: resp.totalAvailable, limit });
               }
             }
           }

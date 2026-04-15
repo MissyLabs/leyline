@@ -7,6 +7,7 @@ import { LedgerConsensus } from './consensus.js';
 import { ForkResolver, type PeerChainQuerier } from './fork-resolver.js';
 import { sign, verify, publicKeyToHex } from '../identity/keypair.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { Logger } from '../utils/logger.js';
 
 /**
  * Shared Ledger Sync Protocol for the Leyline network.
@@ -145,6 +146,7 @@ export class LedgerSync {
   private syncInterval: ReturnType<typeof setInterval> | null = null;
   private pruneInterval: ReturnType<typeof setInterval> | null = null;
   private forkResolver: ForkResolver;
+  private readonly log = new Logger('LedgerSync');
 
   /** How often to attempt sync with peers (60 seconds) */
   private syncIntervalMs: number;
@@ -181,7 +183,7 @@ export class LedgerSync {
     // Start periodic sync
     this.syncInterval = setInterval(() => {
       this.syncWithAllPeers().catch((err) => {
-        console.warn('[LedgerSync] Periodic sync failed:', (err as Error)?.message ?? err);
+        this.log.warn('Periodic sync failed', { error: String((err as Error)?.message ?? err) });
       });
     }, this.syncIntervalMs);
 
@@ -491,7 +493,7 @@ export class LedgerSync {
       proposal.signature,
     );
     const count = await this.ledger.getEntryCount();
-    console.log(`[LedgerSync] Committed entry to ledger (${count} total, ${proposal.confirmations.size} confirmations)`);
+    this.log.info('Committed entry to ledger', { total: count, confirmations: proposal.confirmations.size });
     return true;
   }
 
@@ -544,7 +546,7 @@ export class LedgerSync {
                 const push = syncMsg as PushEntry;
                 const entry = deserializeEntry(push.entry);
                 const valid = await self.validateReceivedEntry(entry);
-                console.log(`[LedgerSync] Received push-entry #${entry.index} (valid: ${valid}) from ${push.senderPeerId.slice(0, 16)}...`);
+                self.log.info('Received push-entry', { index: entry.index, valid, peer: push.senderPeerId.slice(0, 16) });
 
                 if (valid) {
                   // Propose through consensus. The submitter signed the entry,

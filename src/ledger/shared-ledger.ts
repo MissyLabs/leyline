@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { Level } from 'level';
+import { Logger } from '../utils/logger.js';
 
 export interface SharedLedgerEntry {
   index: number;
@@ -94,6 +95,7 @@ export class SharedLedger {
   private latestHash: Uint8Array = new Uint8Array(0);
   /** Serialization lock for submit() and addConfirmation() to prevent concurrent corruption. */
   private submitLock: Promise<void> = Promise.resolve();
+  private readonly log = new Logger('SharedLedger');
 
   constructor(dataDir: string) {
     this.db = new Level(dataDir, { valueEncoding: 'utf8' });
@@ -116,7 +118,7 @@ export class SharedLedger {
         (err as { code?: string }).code === 'LEVEL_NOT_FOUND'
       );
       if (!isExpectedEmpty) {
-        console.warn('[SharedLedger] Failed to load metadata — resetting to empty state. This may indicate data corruption:', err);
+        this.log.warn('Failed to load metadata — resetting to empty state. This may indicate data corruption', { error: String(err) });
       }
       this.currentIndex = 0;
       this.latestHash = new Uint8Array(0);

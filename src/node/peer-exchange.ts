@@ -5,6 +5,7 @@ import * as lp from 'it-length-prefixed';
 import { sign as edSign, verify as edVerify, hexToPublicKey } from '../identity/keypair.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
 import type { PeerReputation } from '../trust/peer-reputation.js';
+import { Logger } from '../utils/logger.js';
 
 /**
  * Peer Exchange Protocol for the Leyline network.
@@ -90,6 +91,7 @@ export class PeerExchange {
 
   /** Optional peer reputation tracker for weighted selection. */
   private reputation?: PeerReputation;
+  private readonly log = new Logger('PeerExchange');
 
   constructor(
     libp2p: Libp2p,
@@ -143,7 +145,7 @@ export class PeerExchange {
     // Start periodic exchange with connected peers
     this.exchangeInterval = setInterval(() => {
       this.exchangeWithPeers().catch((err) => {
-        console.warn('[PeerExchange] Exchange round failed:', (err as Error)?.message ?? err);
+        this.log.warn('Exchange round failed', { error: String((err as Error)?.message ?? err) });
       });
     }, this.exchangeIntervalMs);
   }
@@ -369,7 +371,7 @@ export class PeerExchange {
       (r) => r.status === 'fulfilled' && r.value.length > 0,
     ).length;
     if (succeeded === 0 && selected.length > 0) {
-      console.warn(`[PeerExchange] All ${selected.length} peer exchange(s) returned no results`);
+      this.log.warn('All peer exchanges returned no results', { attempted: selected.length });
     }
   }
 

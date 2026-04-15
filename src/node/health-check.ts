@@ -1,6 +1,7 @@
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { Libp2p } from 'libp2p';
 import { LEYLINE_VERSION } from '../config/compat.js';
+import { Logger } from '../utils/logger.js';
 
 export interface HealthStatus {
   status: 'ok' | 'degraded' | 'error';
@@ -26,6 +27,7 @@ export class HealthCheckServer {
   private readonly port: number;
   private readonly deps: HealthCheckDeps;
   private readonly startedAt = Date.now();
+  private readonly log = new Logger('HealthCheckServer');
 
   constructor(port: number, deps: HealthCheckDeps) {
     this.port = port;
@@ -44,7 +46,7 @@ export class HealthCheckServer {
       this.server!.once('error', reject);
     });
 
-    console.log(`[Health] HTTP health check listening on port ${this.port}`);
+    this.log.info('HTTP health check listening', { port: this.port });
   }
 
   async stop(): Promise<void> {

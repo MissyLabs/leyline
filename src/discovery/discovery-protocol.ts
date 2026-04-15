@@ -30,6 +30,7 @@ import {
 } from './service-registry.js';
 import { sign, verify, hexToPublicKey } from '../identity/keypair.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { Logger } from '../utils/logger.js';
 
 const MAX_RESULT_SERVICES = 100;
 
@@ -148,6 +149,7 @@ export class DiscoveryProtocol {
   /** Per-peer request timestamps for rate limiting. */
   private readonly peerRequestTimes = new Map<string, number[]>();
   private readonly rateLimitConfig: Required<DiscoveryRateLimitConfig>;
+  private readonly log = new Logger('DiscoveryProtocol');
 
   constructor(
     libp2p: Libp2p,
@@ -242,7 +244,7 @@ export class DiscoveryProtocol {
     this.pruneTimer = setInterval(() => {
       const pruned = this.registry.pruneExpired();
       if (pruned > 0) {
-        console.log(`[Discovery] Pruned ${pruned} expired service(s)`);
+        this.log.info('Pruned expired services', { count: pruned });
       }
     }, this.pruneIntervalMs);
   }

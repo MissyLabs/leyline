@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Level } from "level";
+import { Logger } from "../utils/logger.js";
 
 export interface LedgerEntry {
   index: number;
@@ -82,6 +83,7 @@ export class LocalLedger {
   private latestEntry: LedgerEntry | null = null;
   private entryCount: number = 0;
   private appendLock: Promise<void> = Promise.resolve();
+  private readonly log = new Logger('LocalLedger');
 
   /**
    * @param dataDir - Filesystem path used by LevelDB for persistent storage.
@@ -110,7 +112,7 @@ export class LocalLedger {
         (err as { code?: string }).code === 'LEVEL_NOT_FOUND'
       );
       if (!isNotFound) {
-        console.warn('[LocalLedger] Failed to load entry count — resetting to empty state. This may indicate data corruption:', err);
+        this.log.warn('Failed to load entry count — resetting to empty state. This may indicate data corruption', { error: String(err) });
       }
       this.entryCount = 0;
     }
@@ -122,7 +124,7 @@ export class LocalLedger {
         const stored: StoredEntry = JSON.parse(raw) as StoredEntry;
         this.latestEntry = storedToEntry(stored);
       } catch (err) {
-        console.warn('[LocalLedger] Failed to load latest entry — starting from empty. This may indicate data corruption:', err);
+        this.log.warn('Failed to load latest entry — starting from empty. This may indicate data corruption', { error: String(err) });
         this.entryCount = 0;
         this.latestEntry = null;
       }

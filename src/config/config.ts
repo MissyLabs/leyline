@@ -1,3 +1,7 @@
+import { Logger } from '../utils/logger.js';
+
+const log = new Logger('Config');
+
 /** Default seed node port for the Leyline network. */
 export const DEFAULT_SEED_PORT = 9876;
 
@@ -158,7 +162,7 @@ export function mergeConfig(partial: Partial<MagicConfig>): MagicConfig {
 
   // Warn about isSeedNode — should only be set via SeedNode constructor
   if (partial.isSeedNode) {
-    console.warn('[Config] isSeedNode is set — use the SeedNode class instead of MagicNode to avoid misconfiguration');
+    log.warn('isSeedNode is set — use the SeedNode class instead of MagicNode to avoid misconfiguration');
   }
 
   return merged;

@@ -7,6 +7,7 @@ import { MessageBuffer } from './message-buffer.js';
 import { InboxServer } from './inbox-protocol.js';
 import { publicKeyToHex, verify } from '../identity/keypair.js';
 import { HealthCheckServer } from './health-check.js';
+import { Logger } from '../utils/logger.js';
 
 interface StoredPeer {
   peerId: string;
@@ -45,6 +46,8 @@ export class SeedNode extends MagicNode {
   private static readonly MAX_LEDGER_RATE_ENTRIES = 5_000;
   private ledgerRateLimitCallCount = 0;
 
+  private readonly seedLog: Logger;
+
   constructor(config: Partial<MagicConfig>) {
     super(
       {
@@ -58,11 +61,13 @@ export class SeedNode extends MagicNode {
         onPeerDisconnected: (peerId) => this.markPeerDisconnected(peerId),
       },
     );
+    this.seedLog = new Logger('SeedNode');
+    this.log = new Logger('SeedNode');
   }
 
   async start(): Promise<void> {
     await super.start();
-    console.log('[Magic] Running as SEED NODE — peer discovery only');
+    this.seedLog.info('Running as SEED NODE — peer discovery only');
 
     // Open persistent peer store and hydrate in-memory map
     this.peerDb = new Level(`${this.config.dataDir}/seed-peers`, { valueEncoding: 'utf8' });
@@ -76,7 +81,7 @@ export class SeedNode extends MagicNode {
       });
     }
     if (this.knownPeers.size > 0) {
-      console.log(`[Seed] Restored ${this.knownPeers.size} persisted peer(s)`);
+      this.seedLog.info('Restored persisted peers', { count: this.knownPeers.size });
     }
 
     // Start message buffer for store-and-forward
@@ -90,7 +95,7 @@ export class SeedNode extends MagicNode {
       this.peerSubscriptions.get(peerId) ?? new Set(),
     );
     await this.inboxServer.start();
-    console.log(`[Seed] Inbox server active — buffering messages for offline peers`);
+    this.seedLog.info('Inbox server active — buffering messages for offline peers');
 
     // Buffer all incoming GossipSub messages for store-and-forward
     this.startMessageCapture();
@@ -110,7 +115,7 @@ export class SeedNode extends MagicNode {
     // and broadcast confirmed entries to other seeds. This ensures quorum is
     // reached even when the submitting bot disconnects immediately.
     this.startLedgerParticipation();
-    console.log('[Seed] Ledger participation active — will auto-confirm entries');
+    this.seedLog.info('Ledger participation active — will auto-confirm entries');
 
     if (this.config.healthCheckPort > 0) {
       this.healthCheck = new HealthCheckServer(this.config.healthCheckPort, {
@@ -201,7 +206,7 @@ export class SeedNode extends MagicNode {
     }
 
     this.persistPeer(peerId, { peerId, multiaddrs: addrs, lastSeen });
-    console.log(`[Seed] Peer connected: ${peerId} (total: ${this.knownPeers.size})`);
+    this.seedLog.info('Peer connected', { peerId, total: this.knownPeers.size });
   }
 
   private markPeerDisconnected(peerId: string): void {
@@ -211,18 +216,18 @@ export class SeedNode extends MagicNode {
       this.persistPeer(peerId, { peerId, multiaddrs: peer.multiaddrs, lastSeen: peer.lastSeen });
     }
     this.peerSubscriptions.delete(peerId);
-    console.log(`[Seed] Peer disconnected: ${peerId}`);
+    this.seedLog.info('Peer disconnected', { peerId });
   }
 
   private persistPeer(peerId: string, data: StoredPeer): void {
     this.peerDb?.put(`peer:${peerId}`, JSON.stringify(data)).catch((err) => {
-      console.error(`[Seed] Failed to persist peer ${peerId}:`, err);
+      this.seedLog.error('Failed to persist peer', { peerId, error: String(err) });
     });
   }
 
   private deletePeer(peerId: string): void {
     this.peerDb?.del(`peer:${peerId}`).catch((err) => {
-      console.error(`[Seed] Failed to delete peer ${peerId}:`, err);
+      this.seedLog.error('Failed to delete peer', { peerId, error: String(err) });
     });
   }
 
@@ -251,7 +256,7 @@ export class SeedNode extends MagicNode {
       }
     }
     if (pruned > 0) {
-      console.log(`[Seed] Pruned ${pruned} stale peers`);
+      this.seedLog.info('Pruned stale peers', { count: pruned });
     }
     return pruned;
   }
@@ -281,7 +286,7 @@ export class SeedNode extends MagicNode {
       if (stored) {
         const count = buffer.getCount();
         if (count === 1 || count % 100 === 0) {
-          console.log(`[Seed] Message buffer: ${count} messages across ${buffer.getBufferedTopics().length} topics`);
+          this.seedLog.info('Message buffer status', { count, topics: buffer.getBufferedTopics().length });
         }
       }
     };
@@ -296,11 +301,7 @@ export class SeedNode extends MagicNode {
       // Log version distribution every cycle
       const stats = this.getVersionStats();
       if (stats.size > 0) {
-        const parts: string[] = [];
-        for (const [version, count] of stats) {
-          parts.push(`v${version}: ${count}`);
-        }
-        console.log(`[Seed] Version stats: ${parts.join(' | ')} (${this.getPeerCount()} peers)`);
+        this.seedLog.info('Version stats', { versions: Object.fromEntries(stats), peers: this.getPeerCount() });
       }
 
       const peerList = this.getKnownPeers();
@@ -337,18 +338,18 @@ export class SeedNode extends MagicNode {
 
         if (subscribing && !this.mirroredTopics.has(topic)) {
           if (this.mirroredTopics.size >= 500) {
-            console.warn(`[Seed] Topic mirror cap reached (500) — ignoring: ${topic}`);
+            this.seedLog.warn('Topic mirror cap reached (500)', { topic });
             continue;
           }
           gs.subscribe(topic);
           this.mirroredTopics.add(topic);
-          console.log(`[Seed] Mirroring topic: ${topic} (${this.mirroredTopics.size} total)`);
+          this.seedLog.info('Mirroring topic', { topic, total: this.mirroredTopics.size });
         }
       }
     };
     gs.addEventListener('subscription-change', this.topicMirrorHandler);
 
-    console.log('[Seed] Topic mirroring active — will relay all peer topics');
+    this.seedLog.info('Topic mirroring active — will relay all peer topics');
   }
 
   /**
@@ -426,7 +427,7 @@ export class SeedNode extends MagicNode {
           }
           if (!sigValid) {
             consensus.reject(proposal.hash);
-            console.warn(`[Seed] Rejected proposal with invalid submitter signature`);
+            this.seedLog.warn('Rejected proposal with invalid submitter signature');
             continue;
           }
 
@@ -434,7 +435,7 @@ export class SeedNode extends MagicNode {
           const submitterHex = publicKeyToHex(proposal.submitterPubkey);
           if (!this.checkLedgerRateLimit(submitterHex)) {
             consensus.reject(proposal.hash);
-            console.warn(`[Seed] Rate-limited ledger submission from ${submitterHex.slice(0, 16)}...`);
+            this.seedLog.warn('Rate-limited ledger submission', { submitter: submitterHex.slice(0, 16) });
             continue;
           }
 
@@ -450,20 +451,20 @@ export class SeedNode extends MagicNode {
               );
 
               const count = await sharedLedger.getEntryCount();
-              console.log(`[Seed] Ledger: confirmed entry (${count} total)`);
+              this.seedLog.info('Ledger: confirmed entry', { total: count });
 
               if (ledgerSync) {
                 const entry = await sharedLedger.getLatest();
                 if (entry) {
                   await ledgerSync.broadcastEntry(entry);
-                  console.log(`[Seed] Ledger: broadcast confirmed entry to peers`);
+                  this.seedLog.info('Ledger: broadcast confirmed entry to peers');
                 }
               }
             }
           }
         }
       } catch (err) {
-        console.error('[Seed] Ledger participation error:', err);
+        this.seedLog.error('Ledger participation error', { error: (err as Error)?.message ?? String(err) });
       }
     }, 5_000);
   }

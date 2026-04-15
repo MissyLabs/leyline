@@ -4,6 +4,9 @@ import {
   type ServiceDescriptor,
   type DiscoveryQuery,
 } from './service-registry.js';
+import { Logger } from '../utils/logger.js';
+
+const log = new Logger('PersistentServiceRegistry');
 
 interface StoredDescriptor {
   descriptor: ServiceDescriptor;
@@ -67,7 +70,7 @@ export class PersistentServiceRegistry {
           this.#persistedLocalIds.add(d.id);
         }
       } catch {
-        console.warn(`[PersistentServiceRegistry] Skipping corrupted record: ${key}`);
+        log.warn('Skipping corrupted record', { key });
         batch.del(key);
       }
     }
@@ -114,7 +117,7 @@ export class PersistentServiceRegistry {
     const isLocal = this.#persistedLocalIds.has(descriptor.id);
     const record: StoredDescriptor = { descriptor, isLocal };
     db.put(`svc:${descriptor.id}`, JSON.stringify(record)).catch((err: unknown) => {
-      console.warn(`[PersistentServiceRegistry] Failed to persist update: ${err}`);
+      log.warn('Failed to persist update', { error: String(err) });
     });
   }
 
