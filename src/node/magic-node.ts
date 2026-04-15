@@ -85,6 +85,8 @@ export class MagicNode {
   private pendingTimeouts = new Set<ReturnType<typeof setTimeout>>();
   /** Whether the node is in the process of stopping. */
   private stopping = false;
+  /** AbortController for cancelling in-flight operations on shutdown. */
+  protected shutdownController = new AbortController();
   /** Timer for periodic seed connectivity monitoring. */
   private seedMonitorTimer: ReturnType<typeof setInterval> | null = null;
   /** Whether the node is currently in degraded mode (no seeds reachable). */
@@ -419,6 +421,7 @@ export class MagicNode {
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.shutdownController.abort();
 
     // Clear all tracked timers
     if (this.reAdvertiseTimer) {
@@ -837,6 +840,11 @@ export class MagicNode {
   /** Get the peer reputation tracker. */
   getPeerReputation(): PeerReputation {
     return this.peerReputation;
+  }
+
+  /** Get the shutdown signal for cooperative cancellation. */
+  getShutdownSignal(): AbortSignal {
+    return this.shutdownController.signal;
   }
 
   /** Whether the node is currently degraded (no seeds reachable). */
