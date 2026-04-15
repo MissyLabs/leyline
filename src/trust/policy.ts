@@ -204,6 +204,7 @@ export class SpamFilter {
 
   readonly #senderWindows: Map<string, SenderWindow> = new Map();
   readonly #spamCounts: Map<string, number> = new Map();
+  static readonly #MAX_SPAM_ENTRIES = 10_000;
 
   /**
    * @param maxSeenSize - Maximum number of message IDs to retain before
@@ -331,6 +332,15 @@ export class SpamFilter {
       pubkeyHex,
       (this.#spamCounts.get(pubkeyHex) ?? 0) + 1,
     );
+    if (this.#spamCounts.size > SpamFilter.#MAX_SPAM_ENTRIES) {
+      const quarter = Math.ceil(SpamFilter.#MAX_SPAM_ENTRIES / 4);
+      let removed = 0;
+      for (const key of this.#spamCounts.keys()) {
+        if (removed >= quarter) break;
+        this.#spamCounts.delete(key);
+        removed++;
+      }
+    }
   }
 
   /**

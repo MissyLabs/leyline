@@ -42,6 +42,8 @@ export class SeedNode extends MagicNode {
   /** Max ledger submissions per submitter per window */
   private static readonly LEDGER_RATE_LIMIT = 10;
   private static readonly LEDGER_RATE_WINDOW_MS = 60_000;
+  private static readonly MAX_LEDGER_RATE_ENTRIES = 5_000;
+  private ledgerRateLimitCallCount = 0;
 
   constructor(config: Partial<MagicConfig>) {
     super(
@@ -474,6 +476,26 @@ export class SeedNode extends MagicNode {
 
     if (timestamps.length >= SeedNode.LEDGER_RATE_LIMIT) return false;
     timestamps.push(now);
+
+    this.ledgerRateLimitCallCount++;
+    if (this.ledgerRateLimitCallCount >= 500) {
+      this.ledgerRateLimitCallCount = 0;
+      for (const [key, ts] of this.ledgerSubmitTimestamps) {
+        if (ts.length === 0 || ts[ts.length - 1]! <= cutoff) {
+          this.ledgerSubmitTimestamps.delete(key);
+        }
+      }
+      if (this.ledgerSubmitTimestamps.size > SeedNode.MAX_LEDGER_RATE_ENTRIES) {
+        const excess = this.ledgerSubmitTimestamps.size - SeedNode.MAX_LEDGER_RATE_ENTRIES;
+        let removed = 0;
+        for (const key of this.ledgerSubmitTimestamps.keys()) {
+          if (removed >= excess) break;
+          this.ledgerSubmitTimestamps.delete(key);
+          removed++;
+        }
+      }
+    }
+
     return true;
   }
 
