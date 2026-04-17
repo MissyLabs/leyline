@@ -5,6 +5,7 @@ import * as lp from 'it-length-prefixed';
 import { createHash } from 'node:crypto';
 import { encryptPayload, decryptPayload } from '../crypto/envelope.js';
 import { hexToPublicKey, sign as edSign, verify as edVerify } from '../identity/keypair.js';
+import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
 
 /**
  * Direct Message Protocol for the Leyline network.
@@ -107,6 +108,10 @@ function encodeEnvelope(envelope: DirectEnvelope): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(wire));
 }
 
+const MAX_DM_PAYLOAD_BASE64_LEN = 341_334; // ~256KB after base64 decode
+const MAX_DM_PEER_ID_LEN = 128;
+const MAX_DM_PUBKEY_HEX_LEN = 128;
+
 function decodeEnvelope(data: Uint8Array): DirectEnvelope {
   const wire = JSON.parse(new TextDecoder().decode(data)) as WireEnvelope;
 
@@ -119,6 +124,16 @@ function decodeEnvelope(data: Uint8Array): DirectEnvelope {
     typeof wire.hopsRemaining !== 'number'
   ) {
     throw new TypeError('Malformed DirectEnvelope: missing or incorrectly typed field(s)');
+  }
+
+  if (wire.payload.length > MAX_DM_PAYLOAD_BASE64_LEN) {
+    throw new TypeError('DirectEnvelope payload exceeds maximum size');
+  }
+  if (wire.targetPeerId.length > MAX_DM_PEER_ID_LEN || wire.senderPeerId.length > MAX_DM_PEER_ID_LEN) {
+    throw new TypeError('DirectEnvelope peer ID exceeds maximum length');
+  }
+  if (wire.senderPubkeyHex && wire.senderPubkeyHex.length > MAX_DM_PUBKEY_HEX_LEN) {
+    throw new TypeError('DirectEnvelope pubkey hex exceeds maximum length');
   }
 
   // Validate and sanitize fields to prevent type confusion from malicious peers
@@ -191,10 +206,12 @@ export interface DirectMessageOptions {
 export class DirectMessageProtocol {
   private readonly libp2p: Libp2p;
   private readonly opts: DirectMessageOptions;
+  private readonly shutdownSignal?: AbortSignal;
 
-  constructor(libp2p: Libp2p, opts: DirectMessageOptions = {}) {
+  constructor(libp2p: Libp2p, opts: DirectMessageOptions = {}, shutdownSignal?: AbortSignal) {
     this.libp2p = libp2p;
     this.opts = opts;
+    this.shutdownSignal = shutdownSignal;
   }
 
   // --------------------------------------------------------------------------
@@ -359,7 +376,7 @@ export class DirectMessageProtocol {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, DIRECT_MESSAGE_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, DIRECT_MESSAGE_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return false; // Peer doesn't support the protocol or connection failed
     }
@@ -373,6 +390,8 @@ export class DirectMessageProtocol {
       return true;
     } catch {
       return false;
+    } finally {
+      try { stream.close(); } catch { /* already closed */ }
     }
   }
 
@@ -416,6 +435,7 @@ export class DirectMessageProtocol {
       await pipe(
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async (source: AsyncIterable<{ subarray(): Uint8Array }>) => {
           for await (const msg of source) {
             let envelope: DirectEnvelope;
@@ -462,7 +482,8 @@ export class DirectMessageProtocol {
 
                 const checker = this.opts.trustChecker;
                 // Dedup check using a hash of sender+timestamp+target as envelope ID
-                const envelopeId = `dm:${envelope.senderPubkeyHex}:${envelope.timestamp}:${envelope.targetPeerId}`;
+                const payloadDigest = createHash('sha256').update(envelope.payload).digest('hex').slice(0, 16);
+                const envelopeId = `dm:${envelope.senderPubkeyHex}:${envelope.timestamp}:${envelope.targetPeerId}:${payloadDigest}`;
                 if (checker.isDuplicate(envelopeId)) continue;
                 // Rate limit check
                 if (checker.isRateLimited(envelope.senderPubkeyHex)) {
@@ -491,7 +512,31 @@ export class DirectMessageProtocol {
               }
               this.opts.onMessage?.(envelope);
             } else if (envelope.isRelay && envelope.hopsRemaining > 0) {
-              // We are an intermediate relay hop.
+              // Verify envelope signature before relaying to prevent amplification of forged envelopes
+              if (envelope.senderPubkeyHex && envelope.envelopeSignature) {
+                try {
+                  const senderPub = hexToPublicKey(envelope.senderPubkeyHex);
+                  const wireForVerify: WireEnvelope = {
+                    payload: Buffer.from(envelope.payload).toString('base64'),
+                    targetPeerId: envelope.targetPeerId,
+                    senderPeerId: envelope.senderPeerId,
+                    timestamp: envelope.timestamp,
+                    isRelay: envelope.isRelay,
+                    hopsRemaining: envelope.hopsRemaining,
+                    encrypted: envelope.encrypted,
+                    senderPubkeyHex: envelope.senderPubkeyHex,
+                  };
+                  const signable = computeEnvelopeSignableBytes(wireForVerify);
+                  const sigBytes = new Uint8Array(Buffer.from(envelope.envelopeSignature, 'hex'));
+                  if (!await edVerify(senderPub, sigBytes, signable)) {
+                    continue; // Forged relay envelope — drop
+                  }
+                } catch {
+                  continue; // Malformed key/sig — drop
+                }
+              } else {
+                continue; // Unsigned relay envelope — drop to prevent amplification
+              }
               this.relay(envelope).catch(() => {
                 // Relay failures are expected during churn — swallow
               });

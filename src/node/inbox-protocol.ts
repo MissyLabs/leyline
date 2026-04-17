@@ -20,6 +20,8 @@ import type { GossipSub } from '@chainsafe/libp2p-gossipsub';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { type BufferedMessage, type MessageBuffer } from './message-buffer.js';
+import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { Logger } from '../utils/logger.js';
 
 export const INBOX_PROTOCOL = '/leyline/inbox/1.0.0';
 
@@ -144,37 +146,33 @@ export class InboxServer {
 
   private async handleRequest(stream: Stream, remotePeerId: string): Promise<void> {
     // Get the topics this peer is subscribed to for authorization.
-    // For peers that just reconnected, GossipSub may not have their
-    // subscriptions yet. We allow the request if the peer is connected
-    // and requesting topics that exist in the buffer — this is a practical
-    // compromise between security (no harvesting) and usability (inbox
-    // works immediately on reconnect).
+    // Uses both GossipSub state and the external subscription tracker
+    // (provided by SeedNode) which persists subscriptions across reconnects.
     const peerTopics = this.getPeerSubscriptions(remotePeerId);
-    const bufferedTopics = new Set(this.buffer.getBufferedTopics());
 
     try {
       await pipe(
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async function* (this: InboxServer, source: AsyncIterable<{ subarray(): Uint8Array }>) {
           for await (const msg of source) {
             const req = decode(msg.subarray());
             if (req.type === 'fetch') {
-              // Authorization: serve topics the peer is subscribed to,
-              // OR topics that exist in the buffer (for just-reconnected peers
-              // whose GossipSub subscriptions haven't propagated yet).
-              // Cap at the topics that actually have buffered messages to
-              // prevent enumeration of all possible topic names.
+              // Authorization: only serve topics the peer is subscribed to.
+              // The subscription tracker (set by SeedNode) persists across
+              // reconnects, so this covers the "just reconnected" case without
+              // the security hole of allowing access to all buffered topics.
               const authorizedTopics = req.topics.filter((t: string) =>
-                peerTopics.has(t) || bufferedTopics.has(t),
+                peerTopics.has(t),
               );
 
-              const messages = this.buffer.getForTopics(authorizedTopics, req.since);
-              const limited = messages.slice(0, Math.min(req.limit, 500));
+              const cap = Math.min(req.limit, 500);
+              const messages = this.buffer.getForTopics(authorizedTopics, req.since, cap);
 
               const response: InboxResponse = {
                 type: 'messages',
-                messages: limited.map((m) => ({
+                messages: messages.map((m) => ({
                   data: Buffer.from(m.data).toString('base64'),
                   topic: m.topic,
                   receivedAt: m.receivedAt,
@@ -208,11 +206,14 @@ export class InboxServer {
  */
 export class InboxClient {
   private readonly libp2p: Libp2p;
+  private readonly log = new Logger('InboxClient');
+  private readonly shutdownSignal?: AbortSignal;
   /** Timestamp of the last message we received (for "since" requests). */
   private lastReceivedAt: number = 0;
 
-  constructor(libp2p: Libp2p) {
+  constructor(libp2p: Libp2p, shutdownSignal?: AbortSignal) {
     this.libp2p = libp2p;
+    this.shutdownSignal = shutdownSignal;
   }
 
   /** Update the last-received timestamp. Called by MagicNode on each message. */
@@ -247,7 +248,7 @@ export class InboxClient {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, INBOX_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, INBOX_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return []; // Peer doesn't support inbox protocol
     }
@@ -267,6 +268,7 @@ export class InboxClient {
         (source) => lp.encode(source),
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async (source) => {
           for await (const msg of source) {
             const resp = decode(msg.subarray()) as InboxResponse;
@@ -280,7 +282,7 @@ export class InboxClient {
                 });
               }
               if (resp.totalAvailable > resp.messages.length) {
-                console.log(`[Inbox] ${resp.messages.length}/${resp.totalAvailable} messages fetched (limit: ${limit})`);
+                this.log.info('Partial inbox fetch', { fetched: resp.messages.length, available: resp.totalAvailable, limit });
               }
             }
           }

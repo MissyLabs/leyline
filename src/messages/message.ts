@@ -22,6 +22,7 @@
 import { randomBytes, createHash } from "node:crypto";
 import { sign, verify } from "../identity/keypair.js";
 import { encodeMessage as protoEncode, decodeMessage as protoDecode } from "./proto.js";
+import { compressMessage, decompressMessage } from "../utils/compression.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -38,6 +39,9 @@ const MAX_TAG_LENGTH = 100;
 
 /** Maximum clock skew tolerated for incoming messages (5 minutes in ms). */
 const MAX_FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+/** Maximum age of a message before it's considered stale (10 minutes in ms). */
+const MAX_MESSAGE_AGE_MS = 10 * 60 * 1000;
 
 /** Required nonce length in bytes. */
 const NONCE_LENGTH = 16;
@@ -320,11 +324,18 @@ export function deserializeMessageJson(data: Uint8Array): MagicMessage {
     throw new TypeError("Malformed wire message: missing or incorrectly typed field(s)");
   }
 
+  const MAX_HEX_FIELD = MAX_PAYLOAD_SIZE * 2 + 128;
+  if (wire.id.length > 128 || wire.senderPubkey.length > 128 ||
+      wire.signature.length > 256 || wire.nonce.length > 128 ||
+      wire.payload.length > MAX_HEX_FIELD) {
+    throw new RangeError("Wire message field exceeds size limit");
+  }
+
   return {
     id: new Uint8Array(Buffer.from(wire.id, "hex")),
     senderPubkey: new Uint8Array(Buffer.from(wire.senderPubkey, "hex")),
     signature: new Uint8Array(Buffer.from(wire.signature, "hex")),
-    tags: wire.tags,
+    tags: wire.tags.filter((t): t is string => typeof t === 'string').slice(0, 50),
     payload: new Uint8Array(Buffer.from(wire.payload, "hex")),
     timestamp: wire.timestamp,
     nonce: new Uint8Array(Buffer.from(wire.nonce, "hex")),
@@ -372,7 +383,8 @@ export function serializeMessage(
   if (format === "json") {
     return serializeMessageJson(msg);
   }
-  return protoEncode(msg);
+  const raw = protoEncode(msg);
+  return compressMessage(raw);
 }
 
 /**
@@ -397,7 +409,8 @@ export function deserializeMessage(
   if (format === "json") {
     return deserializeMessageJson(data);
   }
-  return protoDecode(data);
+  const raw = decompressMessage(data);
+  return protoDecode(raw);
 }
 
 /**
@@ -442,6 +455,22 @@ export function validateMessage(msg: MagicMessage): ValidationResult {
     };
   }
 
+  // Cheap timestamp checks before expensive SHA-256 recomputation
+  const now = Date.now();
+  if (msg.timestamp > now + MAX_FUTURE_SKEW_MS) {
+    return {
+      valid: false,
+      error: `Timestamp is too far in the future: ${msg.timestamp - now}ms ahead`,
+    };
+  }
+
+  if (msg.timestamp < now - MAX_MESSAGE_AGE_MS) {
+    return {
+      valid: false,
+      error: `Message is too old: ${now - msg.timestamp}ms in the past (max ${MAX_MESSAGE_AGE_MS}ms)`,
+    };
+  }
+
   // Recompute message ID to prevent forgery (attacker changing ID to bypass dedup)
   const expectedId = computeId(msg.payload, msg.tags, msg.timestamp, msg.nonce);
   if (!buffersEqual(msg.id, expectedId)) {
@@ -480,14 +509,6 @@ export function validateMessage(msg: MagicMessage): ValidationResult {
 
   if (msg.ttl <= 0) {
     return { valid: false, error: `TTL must be greater than zero, got ${msg.ttl}` };
-  }
-
-  const now = Date.now();
-  if (msg.timestamp > now + MAX_FUTURE_SKEW_MS) {
-    return {
-      valid: false,
-      error: `Timestamp is too far in the future: ${msg.timestamp - now}ms ahead`,
-    };
   }
 
   if (msg.nonce.length !== NONCE_LENGTH) {

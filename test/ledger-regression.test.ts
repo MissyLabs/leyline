@@ -347,16 +347,17 @@ describe('LedgerConsensus — edge cases', () => {
 
 describe('LedgerConsensus — config validation gaps', () => {
   it('accepts proposalTimeoutMs=0 (no validation)', async () => {
-    // Documenting: no validation on proposalTimeoutMs
-    // With timeout=0, check is `age > 0` — not expired on same tick (age=0),
-    // but expires after 1ms when age becomes 1.
-    const consensus = new LedgerConsensus({ proposalTimeoutMs: 0 });
-    consensus.propose(makeData('t0'), makePubkey('t0'), makeSig('t0'));
-    // Same tick: age=0, 0 > 0 is false, so not pruned
-    expect(consensus.pruneExpired()).toBe(0);
-    // Wait 1ms so age > 0
-    await sleep(2);
-    expect(consensus.pruneExpired()).toBe(1);
+    const { vi } = await import('vitest');
+    vi.useFakeTimers();
+    try {
+      const consensus = new LedgerConsensus({ proposalTimeoutMs: 0 });
+      consensus.propose(makeData('t0'), makePubkey('t0'), makeSig('t0'));
+      expect(consensus.pruneExpired()).toBe(0);
+      vi.advanceTimersByTime(1);
+      expect(consensus.pruneExpired()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('rejects negative proposalTimeoutMs', () => {

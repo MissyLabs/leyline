@@ -3,6 +3,9 @@ import type { Stream } from '@libp2p/interface';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { sign as edSign, verify as edVerify, hexToPublicKey } from '../identity/keypair.js';
+import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import type { PeerReputation } from '../trust/peer-reputation.js';
+import { Logger } from '../utils/logger.js';
 
 /**
  * Peer Exchange Protocol for the Leyline network.
@@ -86,6 +89,12 @@ export class PeerExchange {
   /** How often to exchange peers (30 seconds) */
   private exchangeIntervalMs: number;
 
+  /** Optional peer reputation tracker for weighted selection. */
+  private reputation?: PeerReputation;
+  private readonly log = new Logger('PeerExchange');
+  private readonly shutdownSignal?: AbortSignal;
+  private circuitBreaker?: import('../utils/circuit-breaker.js').CircuitBreaker;
+
   constructor(
     libp2p: Libp2p,
     opts: {
@@ -94,6 +103,9 @@ export class PeerExchange {
       exchangeIntervalMs?: number;
       localPrivateKey?: Uint8Array;
       localPubkeyHex?: string;
+      reputation?: PeerReputation;
+      shutdownSignal?: AbortSignal;
+      circuitBreaker?: import('../utils/circuit-breaker.js').CircuitBreaker;
     } = {},
   ) {
     this.libp2p = libp2p;
@@ -103,6 +115,9 @@ export class PeerExchange {
     this.exchangeIntervalMs = opts.exchangeIntervalMs ?? 30_000;
     this.localPrivateKey = opts.localPrivateKey;
     this.localPubkeyHex = opts.localPubkeyHex;
+    this.reputation = opts.reputation;
+    this.shutdownSignal = opts.shutdownSignal;
+    this.circuitBreaker = opts.circuitBreaker;
   }
 
   /** Sign a peer record with the local private key. */
@@ -135,8 +150,8 @@ export class PeerExchange {
 
     // Start periodic exchange with connected peers
     this.exchangeInterval = setInterval(() => {
-      this.exchangeWithPeers().catch(() => {
-        // Swallow exchange errors — they're expected during churn
+      this.exchangeWithPeers().catch((err) => {
+        this.log.warn('Exchange round failed', { error: String((err as Error)?.message ?? err) });
       });
     }, this.exchangeIntervalMs);
   }
@@ -235,16 +250,20 @@ export class PeerExchange {
     const alreadyConnected = this.libp2p.getPeers().some((p) => p.toString() === record.peerId);
     if (alreadyConnected) return;
 
+    if (this.circuitBreaker?.isOpen(record.peerId)) return;
+
     const { multiaddr } = await import('@multiformats/multiaddr');
     for (const addr of record.multiaddrs) {
       try {
         const ma = multiaddr(addr);
         await this.libp2p.dial(ma);
-        return; // Success — stop trying other addrs
+        this.circuitBreaker?.recordSuccess(record.peerId);
+        return;
       } catch {
         // Try next addr
       }
     }
+    this.circuitBreaker?.recordFailure(record.peerId);
   }
 
   /** Remove a peer from the table. */
@@ -287,7 +306,7 @@ export class PeerExchange {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, PEER_EXCHANGE_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, PEER_EXCHANGE_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return []; // Peer doesn't support the protocol
     }
@@ -307,6 +326,7 @@ export class PeerExchange {
         (source) => lp.encode(source),
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async (source) => {
           for await (const msg of source) {
             const response = decode(msg.subarray());
@@ -320,9 +340,13 @@ export class PeerExchange {
         },
       );
     } catch {
-      // Stream error — expected during peer churn
+      this.reputation?.recordFailure(peerId);
     } finally {
       try { stream.close(); } catch { /* already closed */ }
+    }
+
+    if (receivedPeers.length > 0) {
+      this.reputation?.recordSuccess(peerId);
     }
 
     return receivedPeers;
@@ -338,10 +362,15 @@ export class PeerExchange {
     const connectedPeers = this.libp2p.getPeers();
     if (connectedPeers.length === 0) return;
 
-    // Select a random subset when there are more peers than our concurrency limit
-    let selected = connectedPeers.map((p) => p.toString());
+    let selected = connectedPeers.map((p) => p.toString())
+      .filter((p) => !this.circuitBreaker?.isOpen(p));
     if (selected.length > PeerExchange.MAX_CONCURRENT_EXCHANGES) {
-      selected = selected.sort(() => Math.random() - 0.5).slice(0, PeerExchange.MAX_CONCURRENT_EXCHANGES);
+      if (this.reputation) {
+        selected.sort((a, b) => this.reputation!.getScore(b) - this.reputation!.getScore(a));
+      } else {
+        selected.sort(() => Math.random() - 0.5);
+      }
+      selected = selected.slice(0, PeerExchange.MAX_CONCURRENT_EXCHANGES);
     }
 
     const exchanges = selected.map((peerId) =>
@@ -353,7 +382,7 @@ export class PeerExchange {
       (r) => r.status === 'fulfilled' && r.value.length > 0,
     ).length;
     if (succeeded === 0 && selected.length > 0) {
-      console.warn(`[PeerExchange] All ${selected.length} peer exchange(s) returned no results`);
+      this.log.warn('All peer exchanges returned no results', { attempted: selected.length });
     }
   }
 
@@ -364,6 +393,7 @@ export class PeerExchange {
       await pipe(
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async function* (source: AsyncIterable<{ subarray(): Uint8Array }>) {
           for await (const msg of source) {
             const request = decode(msg.subarray());
@@ -397,9 +427,11 @@ export class PeerExchange {
   /** Get a subset of peers suitable for exchange (limit to avoid huge messages). */
   private getPeersForExchange(): PeerRecord[] {
     const peers = this.getPeers();
-    // Send at most 50 peers per exchange
     if (peers.length <= 50) return peers;
-    // Shuffle and take 50
+    if (this.reputation) {
+      peers.sort((a, b) => this.reputation!.getScore(b.peerId) - this.reputation!.getScore(a.peerId));
+      return peers.slice(0, 50);
+    }
     const shuffled = peers.sort(() => Math.random() - 0.5);
     return shuffled.slice(0, 50);
   }

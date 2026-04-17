@@ -1,5 +1,5 @@
 // Core node
-export { MagicNode, type MagicNodeEvents } from './node/magic-node.js';
+export { MagicNode, type MagicNodeEvents, type NodeStatus } from './node/magic-node.js';
 export { SeedNode } from './node/seed-node.js';
 
 // Identity
@@ -35,6 +35,7 @@ export { TagPubSub } from './pubsub/tag-pubsub.js';
 // Trust
 export { TrustPolicy, SpamFilter } from './trust/policy.js';
 export { PersistentTrustPolicy, PersistentSpamFilter } from './trust/persistent-policy.js';
+export { PeerReputation, type PeerReputationRecord, type PeerReputationConfig } from './trust/peer-reputation.js';
 
 // Ledgers
 export { LocalLedger } from './ledger/local-log.js';
@@ -45,6 +46,7 @@ export {
   type ConsensusConfig,
   type EntryProposal,
 } from './ledger/consensus.js';
+export { ForkResolver, type ForkInfo, type PeerChainQuerier } from './ledger/fork-resolver.js';
 
 // Peer Exchange
 export { PeerExchange, type PeerRecord } from './node/peer-exchange.js';
@@ -76,9 +78,11 @@ export {
   type DiscoveryResult,
   DEFAULT_SERVICE_TTL,
 } from './discovery/service-registry.js';
+export { PersistentServiceRegistry } from './discovery/persistent-registry.js';
 export {
   DiscoveryProtocol,
   type DiscoveryTrustChecker,
+  type DiscoveryRateLimitConfig,
   DISCOVERY_PROTOCOL,
 } from './discovery/discovery-protocol.js';
 
@@ -98,9 +102,29 @@ export {
   type HandshakeEvents,
 } from './node/handshake-protocol.js';
 
+// Health Check
+export { HealthCheckServer, type HealthStatus, type HealthCheckDeps } from './node/health-check.js';
+
 // Store-and-Forward
 export { MessageBuffer, type BufferedMessage, type MessageBufferConfig } from './node/message-buffer.js';
 export { InboxServer, InboxClient, INBOX_PROTOCOL } from './node/inbox-protocol.js';
+
+// Utilities
+export { withTimeout, STREAM_TIMEOUT_MS, StreamAbortedError } from './utils/stream-timeout.js';
+export { compressMessage, decompressMessage, isCompressedMessage } from './utils/compression.js';
+export { NodeMetrics, type MetricEvent, type MetricsSnapshot, type HistogramStats } from './utils/metrics.js';
+export { PartitionDetector, type PartitionEvent, type PartitionDetectorConfig } from './utils/partition-detector.js';
+export { PriorityQueue, MessagePriority } from './utils/priority-queue.js';
+export {
+  Logger,
+  LogLevel,
+  type LogEntry,
+  type LogHandler,
+  setGlobalLogLevel,
+  getGlobalLogLevel,
+  setGlobalLogHandler,
+} from './utils/logger.js';
+export { CircuitBreaker, type CircuitBreakerConfig } from './utils/circuit-breaker.js';
 
 // Crypto
 export {

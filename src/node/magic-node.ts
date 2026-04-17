@@ -8,6 +8,7 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { gossipsub, type GossipSub } from '@chainsafe/libp2p-gossipsub';
 import { bootstrap } from '@libp2p/bootstrap';
 import { identify } from '@libp2p/identify';
+import { mdns } from '@libp2p/mdns';
 import { generateKeyPairFromSeed } from '@libp2p/crypto/keys';
 
 import { type MagicConfig, mergeConfig } from '../config/config.js';
@@ -24,6 +25,7 @@ import { DirectMessageProtocol, type DirectEnvelope, type DirectMessageTrustChec
 import { ServiceRegistry, type ServiceDescriptor } from '../discovery/service-registry.js';
 import { DiscoveryProtocol } from '../discovery/discovery-protocol.js';
 import { PersistentTrustPolicy, PersistentSpamFilter } from '../trust/persistent-policy.js';
+import { PeerReputation } from '../trust/peer-reputation.js';
 import { LedgerConsensus } from '../ledger/consensus.js';
 import {
   type MagicMessage,
@@ -40,12 +42,40 @@ import {
   getFingerprint,
 } from '../identity/keypair.js';
 import { IdentityStore } from '../identity/store.js';
+import { NodeMetrics } from '../utils/metrics.js';
+import { Logger } from '../utils/logger.js';
+import { PartitionDetector, type PartitionEvent } from '../utils/partition-detector.js';
+import { PriorityQueue, MessagePriority } from '../utils/priority-queue.js';
+import { CircuitBreaker } from '../utils/circuit-breaker.js';
 
 export interface MagicNodeEvents {
   onMessage?: (msg: MagicMessage, tag: string) => void;
   onDirectMessage?: (envelope: DirectEnvelope) => void;
   onPeerConnected?: (peerId: string) => void;
   onPeerDisconnected?: (peerId: string) => void;
+  onSeedConnectivityChange?: (connectedSeeds: number, totalSeeds: number) => void;
+  onDegraded?: (reason: string) => void;
+  onRecovered?: () => void;
+  onPartition?: (event: PartitionEvent) => void;
+}
+
+export interface NodeStatus {
+  running: boolean;
+  degraded: boolean;
+  peerId: string;
+  fingerprint: string;
+  peerCount: number;
+  connectedSeeds: number;
+  totalSeeds: number;
+  subscribedTags: string[];
+  openTags: string[];
+  localServices: number;
+  remoteServices: number;
+  ledgerEntries: number;
+  paused: boolean;
+  uptime: number;
+  version: string;
+  circuitBreakerOpen: number;
 }
 
 export class MagicNode {
@@ -64,6 +94,10 @@ export class MagicNode {
   protected inboxClient: InboxClient | null = null;
   protected handshake: HandshakeProtocol | null = null;
   protected ledgerConsensus: LedgerConsensus;
+  protected peerReputation: PeerReputation;
+  protected metrics: NodeMetrics;
+  protected partitionDetector: PartitionDetector;
+  protected log: Logger;
   protected publicKey: Uint8Array = new Uint8Array(0);
   protected privateKey: Uint8Array = new Uint8Array(0);
   protected events: MagicNodeEvents;
@@ -80,6 +114,16 @@ export class MagicNode {
   private pendingTimeouts = new Set<ReturnType<typeof setTimeout>>();
   /** Whether the node is in the process of stopping. */
   private stopping = false;
+  /** AbortController for cancelling in-flight operations on shutdown. */
+  protected shutdownController = new AbortController();
+  /** Timer for periodic seed connectivity monitoring. */
+  private seedMonitorTimer: ReturnType<typeof setInterval> | null = null;
+  /** Whether the node is currently in degraded mode (no seeds reachable). */
+  private degraded = false;
+  /** Parsed seed PeerIds for connectivity tracking. */
+  private seedPeerIds = new Set<string>();
+  /** Circuit breaker for outbound peer dials — prevents hammering unreachable peers. */
+  protected circuitBreaker = new CircuitBreaker();
 
   // --- Global inbound rate limiting (token burn protection) ---
   /** Timestamps of messages delivered to handlers in the current window. */
@@ -97,7 +141,17 @@ export class MagicNode {
     this.sharedLedger = new SharedLedger(`${this.config.dataDir}/shared-ledger`);
     this.serviceRegistry = new ServiceRegistry();
     this.ledgerConsensus = new LedgerConsensus();
+    this.peerReputation = new PeerReputation();
+    this.metrics = new NodeMetrics();
+    this.partitionDetector = new PartitionDetector();
+    this.log = new Logger('MagicNode');
     this.events = events;
+
+    if (events.onPartition) {
+      this.partitionDetector.on('partition', (event: PartitionEvent) => {
+        this.events.onPartition?.(event);
+      });
+    }
   }
 
   async start(): Promise<void> {
@@ -165,9 +219,23 @@ export class MagicNode {
       connectionEncrypters: [noise()],
       streamMuxers: [yamux()],
       services,
-      ...(this.config.seedNodes.length > 0
-        ? { peerDiscovery: [bootstrap({ list: this.config.seedNodes })] }
-        : {}),
+      ...(this.config.maxConnections > 0 ? {
+        connectionManager: {
+          maxConnections: this.config.maxConnections,
+        },
+      } : {}),
+      ...(() => {
+        const discoveryModules: unknown[] = [];
+        if (this.config.seedNodes.length > 0) {
+          discoveryModules.push(bootstrap({ list: this.config.seedNodes }));
+        }
+        if (this.config.enableMdns) {
+          discoveryModules.push(mdns());
+        }
+        return discoveryModules.length > 0
+          ? { peerDiscovery: discoveryModules }
+          : {};
+      })(),
     };
 
     this.libp2p = await createLibp2p(libp2pOptions as Parameters<typeof createLibp2p>[0]);
@@ -176,10 +244,10 @@ export class MagicNode {
     this.handshake = new HandshakeProtocol(this.libp2p, {
       onPeerVersion: (peerId, version, result) => {
         if (!result.compatible) {
-          console.warn(`[Magic] Incompatible peer ${peerId.slice(0, 16)}... (v${version}) — messages will be rejected`);
+          this.log.warn(`Incompatible peer — messages will be rejected`, { peerId: peerId.slice(0, 16), version });
         }
       },
-    });
+    }, this.shutdownController.signal);
     await this.handshake.start();
 
     // Set up tag-based pub/sub
@@ -197,16 +265,36 @@ export class MagicNode {
     // Handle incoming messages (store handler for cleanup in stop())
     this.gossipHandler = (evt: CustomEvent) => {
       const { msg } = evt.detail;
-      this.handleIncomingMessage(msg.topic, msg.data);
+      if (this.handshake && msg.from && this.handshake.isIncompatible(msg.from.toString())) {
+        return; // Drop messages from incompatible peers
+      }
+      this.handleIncomingMessage(msg.topic, msg.data).catch((err) => {
+        this.log.warn('Error handling incoming message', { error: (err as Error)?.message ?? String(err) });
+      });
     };
     gs.addEventListener('gossipsub:message', this.gossipHandler);
 
     // Initialize inbox client for store-and-forward message retrieval
-    this.inboxClient = new InboxClient(this.libp2p);
+    this.inboxClient = new InboxClient(this.libp2p, this.shutdownController.signal);
 
     // Track peer connections — auto-fetch missed messages from seeds on connect
     this.peerConnectHandler = (evt: CustomEvent) => {
       const peerId = evt.detail.toString();
+
+      // Track seed PeerIds: if this connection came from bootstrap, remember the PeerId
+      if (this.config.seedNodes.length > 0 && this.libp2p) {
+        const conns = this.libp2p.getConnections(evt.detail);
+        for (const conn of conns) {
+          const remoteAddr = conn.remoteAddr.toString();
+          if (this.config.seedNodes.some((seed) => remoteAddr.includes(seed.split('/p2p/')[0]))) {
+            this.seedPeerIds.add(peerId);
+          }
+        }
+      }
+
+      this.metrics.increment('peers.connected');
+      this.metrics.gauge('peers.current', this.libp2p?.getPeers().length ?? 0);
+      this.partitionDetector.updatePeerCount(this.libp2p?.getPeers().length ?? 0);
       this.events.onPeerConnected?.(peerId);
 
       // When we connect to a peer, try to fetch any messages we missed while offline.
@@ -221,9 +309,11 @@ export class MagicNode {
             if (this.stopping) return; // Node is shutting down
             this.inboxClient?.fetch(peerId, topics).then((messages) => {
               if (messages.length > 0) {
-                console.log(`[Magic] Inbox: fetched ${messages.length} missed message(s) from ${peerId.slice(0, 16)}...`);
+                this.log.info('Inbox: fetched missed messages', { count: messages.length, peer: peerId.slice(0, 16) });
                 for (const msg of messages) {
-                  this.handleIncomingMessage(msg.topic, msg.data);
+                  this.handleIncomingMessage(msg.topic, msg.data).catch((err) => {
+                    this.log.warn('Error handling inbox message', { error: (err as Error)?.message ?? String(err) });
+                  });
                 }
               }
             }).catch(() => {
@@ -239,6 +329,9 @@ export class MagicNode {
     this.peerDisconnectHandler = (evt: CustomEvent) => {
       const peerId = evt.detail.toString();
       this.handshake?.removePeer(peerId);
+      this.metrics.increment('peers.disconnected');
+      this.metrics.gauge('peers.current', this.libp2p?.getPeers().length ?? 0);
+      this.partitionDetector.updatePeerCount(this.libp2p?.getPeers().length ?? 0);
       this.events.onPeerDisconnected?.(peerId);
     };
     this.libp2p.addEventListener('peer:disconnect', this.peerDisconnectHandler);
@@ -253,6 +346,9 @@ export class MagicNode {
     this.peerExchange = new PeerExchange(this.libp2p, {
       localPrivateKey: this.privateKey,
       localPubkeyHex: publicKeyToHex(this.publicKey),
+      reputation: this.peerReputation,
+      shutdownSignal: this.shutdownController.signal,
+      circuitBreaker: this.circuitBreaker,
     });
     await this.peerExchange.start();
 
@@ -263,6 +359,7 @@ export class MagicNode {
       this.ledgerConsensus,
       this.publicKey,
       this.privateKey,
+      { shutdownSignal: this.shutdownController.signal },
     );
     await this.ledgerSync.start();
 
@@ -280,7 +377,7 @@ export class MagicNode {
       localPrivateKey: this.privateKey,
       localPubkeyHex: publicKeyToHex(this.publicKey),
       trustChecker: dmTrustChecker,
-    });
+    }, this.shutdownController.signal);
     await this.directMessage.start();
 
     // Start discovery protocol.
@@ -306,6 +403,8 @@ export class MagicNode {
       localPeerId,
       this.privateKey,
       discoveryTrust,
+      undefined,
+      this.shutdownController.signal,
     );
     await this.discoveryProtocol.start();
 
@@ -330,11 +429,11 @@ export class MagicNode {
           const refreshed = { ...descriptor, advertisedAt: Date.now(), signature: undefined };
           dp.signDescriptor(refreshed).then((signed) => {
             this.serviceRegistry.updateDescriptor(signed);
-            dp.broadcastAdvertisement(signed).catch(() => {
-              // Best-effort re-advertisement
+            dp.broadcastAdvertisement(signed).catch((err) => {
+              this.log.warn('Re-advertisement broadcast failed', { error: (err as Error)?.message ?? String(err) });
             });
-          }).catch(() => {
-            // Signing failure — skip this cycle
+          }).catch((err) => {
+            this.log.warn('Descriptor signing failed', { error: (err as Error)?.message ?? String(err) });
           });
         }
       }, 4 * 60_000);
@@ -354,29 +453,39 @@ export class MagicNode {
 
         this.inboxClient.fetchFromAllPeers(topics).then((messages) => {
           if (messages.length > 0) {
-            console.log(`[Magic] Inbox poll: ${messages.length} new message(s)`);
+            this.log.info('Inbox poll: new messages', { count: messages.length });
             for (const msg of messages) {
-              this.handleIncomingMessage(msg.topic, msg.data);
+              this.handleIncomingMessage(msg.topic, msg.data).catch((err) => {
+                this.log.warn('Error handling polled inbox message', { error: (err as Error)?.message ?? String(err) });
+              });
             }
           }
-        }).catch(() => {
-          // Poll failure — will retry next cycle
+        }).catch((err) => {
+          this.log.warn('Inbox poll failed', { error: (err as Error)?.message ?? String(err) });
         });
       }, 30_000);
     }
 
+    // Seed connectivity monitoring: track which seeds are reachable, emit
+    // degraded/recovered events, and attempt manual re-dial when disconnected.
+    if (this.config.seedNodes.length > 0 && !this.config.isSeedNode) {
+      this.seedMonitorTimer = setInterval(() => {
+        this.checkSeedConnectivity();
+      }, 15_000);
+    }
+
     const fingerprint = getFingerprint(this.publicKey);
     const addrs = this.libp2p.getMultiaddrs().map((a) => a.toString());
-    console.log(`[Magic] Node started: ${fingerprint} (v${LEYLINE_VERSION})`);
-    console.log(`[Magic] Listening on: ${addrs.join(', ')}`);
-    console.log(`[Magic] Subscribed tags: ${this.config.subscribedTags.join(', ') || '(none)'}`);
+    this.log.info('Node started', { fingerprint, version: LEYLINE_VERSION, addrs });
+    this.log.info('Subscribed tags', { tags: this.config.subscribedTags });
     if (this.config.advertisedTags.length > 0) {
-      console.log(`[Magic] Advertised tags: ${this.config.advertisedTags.join(', ')}`);
+      this.log.info('Advertised tags', { tags: this.config.advertisedTags });
     }
   }
 
   async stop(): Promise<void> {
     this.stopping = true;
+    this.shutdownController.abort();
 
     // Clear all tracked timers
     if (this.reAdvertiseTimer) {
@@ -386,6 +495,10 @@ export class MagicNode {
     if (this.inboxPollTimer) {
       clearInterval(this.inboxPollTimer);
       this.inboxPollTimer = null;
+    }
+    if (this.seedMonitorTimer) {
+      clearInterval(this.seedMonitorTimer);
+      this.seedMonitorTimer = null;
     }
     for (const timer of this.pendingTimeouts) {
       clearTimeout(timer);
@@ -401,6 +514,11 @@ export class MagicNode {
     await this.sharedLedger.close();
     await this.trustPolicy.close();
     await this.spamFilter.close();
+    this.peerReputation.clear();
+    this.payloadBudgets.clear();
+    this.inboundTimestamps = [];
+    this.partitionDetector.reset();
+    this.circuitBreaker.clear();
 
     // Remove event listeners before stopping libp2p
     if (this.libp2p && this.gossipHandler) {
@@ -418,9 +536,10 @@ export class MagicNode {
     }
 
     await this.libp2p?.stop();
+    this.tagPubSub?.clear();
     this.tagPubSub = null;
     this.libp2p = null;
-    console.log('[Magic] Node stopped');
+    this.log.info('Node stopped');
   }
 
   /** Broadcast a message to the given tags. */
@@ -443,6 +562,7 @@ export class MagicNode {
     }
     const data = serializeMessage(msg);
     await this.tagPubSub.publish(tags, data);
+    this.metrics.increment('messages.sent');
 
     // Record in local ledger
     await this.localLedger.append(data, 'sent');
@@ -510,7 +630,7 @@ export class MagicNode {
         try {
           await handler(item.msg, item.tag);
         } catch (err) {
-          console.error(`[Magic] onTagQueued handler error on tag "${tag}":`, err);
+          this.log.error(`onTagQueued handler error`, { tag, error: (err as Error)?.message ?? String(err) });
         }
       }
       processing = false;
@@ -526,14 +646,70 @@ export class MagicNode {
     });
   }
 
+  /**
+   * Like `onTagQueued`, but messages are processed in priority order.
+   * The `assignPriority` callback classifies each message. Lower number = higher precedence.
+   * When the queue is full, lowest-priority messages are dropped first.
+   */
+  onTagPriority(
+    tag: string,
+    handler: (msg: MagicMessage, tag: string) => Promise<void>,
+    assignPriority: (msg: MagicMessage) => MessagePriority = () => MessagePriority.NORMAL,
+    maxQueueSize: number = 50,
+  ): void {
+    const queue = new PriorityQueue<{ msg: MagicMessage; tag: string }>(maxQueueSize);
+    let processing = false;
+
+    const drain = async () => {
+      if (processing) return;
+      processing = true;
+      let item: { msg: MagicMessage; tag: string } | undefined;
+      while ((item = queue.pop()) !== undefined) {
+        try {
+          await handler(item.msg, item.tag);
+        } catch (err) {
+          this.log.error(`onTagPriority handler error`, { tag, error: (err as Error)?.message ?? String(err) });
+        }
+      }
+      processing = false;
+    };
+
+    this.tagPubSub?.onTag(tag, (data: Uint8Array, t: string) => {
+      const msg = deserializeMessage(data);
+      const priority = assignPriority(msg);
+      queue.push({ msg, tag: t }, priority);
+      drain();
+    });
+  }
+
   /** Allow a specific agent (by public key hex). */
   async allowAgent(pubkeyHex: string): Promise<void> {
     await this.trustPolicy.allowAgent(pubkeyHex);
   }
 
-  /** Block a specific agent (by public key hex). */
+  /** Block a specific agent permanently (by public key hex). */
   async blockAgent(pubkeyHex: string): Promise<void> {
     await this.trustPolicy.blockAgent(pubkeyHex);
+  }
+
+  /** Block a specific agent until `expiresAt` (epoch ms). Auto-expires. */
+  async blockAgentUntil(pubkeyHex: string, expiresAt: number): Promise<void> {
+    await this.trustPolicy.blockAgentUntil(pubkeyHex, expiresAt);
+  }
+
+  /** Remove a block from a specific agent. Does not auto-allow them. */
+  async unblockAgent(pubkeyHex: string): Promise<void> {
+    await this.trustPolicy.unblockAgent(pubkeyHex);
+  }
+
+  /** Get the block expiry for an agent, or undefined if permanent/not blocked. */
+  getBlockExpiry(pubkeyHex: string): number | undefined {
+    return this.trustPolicy.getBlockExpiry(pubkeyHex);
+  }
+
+  /** Get all currently blocked agents. */
+  getBlockedAgents(): string[] {
+    return this.trustPolicy.getBlockedAgents();
   }
 
   /** Allow a specific agent on a specific tag. */
@@ -644,9 +820,9 @@ export class MagicNode {
       // the push-entry, add their confirmation, and the entry gets committed
       // on the seed side. The bot doesn't need to stay online for this.
       const submitted = await this.sharedLedger.submit(data, this.publicKey, signature);
-      console.log(`[Magic] Ledger: submitted entry #${submitted.index}, broadcasting to ${this.libp2p?.getPeers().length ?? 0} peers...`);
+      this.log.info('Ledger: submitted entry, broadcasting', { index: submitted.index, peers: this.libp2p?.getPeers().length ?? 0 });
       await this.ledgerSync.broadcastEntry(submitted);
-      console.log(`[Magic] Ledger: broadcast complete`);
+      this.log.info('Ledger: broadcast complete');
     } else {
       // Fallback for nodes without ledger sync (e.g. before start())
       await this.sharedLedger.submit(data, this.publicKey, signature);
@@ -661,13 +837,13 @@ export class MagicNode {
    */
   pause(): void {
     this.paused = true;
-    console.log('[Magic] Inbound message delivery PAUSED');
+    this.log.info('Inbound message delivery PAUSED');
   }
 
   /** Resume inbound message delivery after a `pause()`. */
   resume(): void {
     this.paused = false;
-    console.log('[Magic] Inbound message delivery RESUMED');
+    this.log.info('Inbound message delivery RESUMED');
   }
 
   /** Returns true if inbound delivery is currently paused. */
@@ -698,9 +874,9 @@ export class MagicNode {
   async waitForPeers(minPeers: number = 1, timeoutMs: number = 15_000): Promise<number> {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
+      if (this.stopping) return this.getPeerCount();
       const count = this.getPeerCount();
       if (count >= minPeers) {
-        // Extra 2s for GossipSub mesh heartbeat to propagate subscriptions
         await new Promise((r) => setTimeout(r, 2000));
         return this.getPeerCount();
       }
@@ -784,9 +960,134 @@ export class MagicNode {
     return this.ledgerConsensus;
   }
 
+  /** Get the peer reputation tracker. */
+  getPeerReputation(): PeerReputation {
+    return this.peerReputation;
+  }
+
+  /** Get the metrics tracker for observability. */
+  getMetrics(): NodeMetrics {
+    return this.metrics;
+  }
+
+  /** Get the partition detector for network health monitoring. */
+  getPartitionDetector(): PartitionDetector {
+    return this.partitionDetector;
+  }
+
+  /** Get the shutdown signal for cooperative cancellation. */
+  getShutdownSignal(): AbortSignal {
+    return this.shutdownController.signal;
+  }
+
+  /** Get the circuit breaker for outbound peer dials. */
+  getCircuitBreaker(): CircuitBreaker {
+    return this.circuitBreaker;
+  }
+
+  /** Whether the node is currently degraded (no seeds reachable). */
+  isDegraded(): boolean {
+    return this.degraded;
+  }
+
+  /** Comprehensive node status for operational monitoring. */
+  getNodeStatus(): NodeStatus {
+    const peers = this.libp2p?.getPeers() ?? [];
+    const connectedSeeds = this.getConnectedSeedCount();
+    return {
+      running: this.libp2p !== null && !this.stopping,
+      degraded: this.degraded,
+      peerId: this.libp2p?.peerId?.toString() ?? '',
+      fingerprint: this.publicKey.length > 0 ? getFingerprint(this.publicKey) : '',
+      peerCount: peers.length,
+      connectedSeeds,
+      totalSeeds: Math.max(this.seedPeerIds.size, this.config.seedNodes.length),
+      subscribedTags: this.tagPubSub?.getSubscribedTags() ?? [],
+      openTags: this.trustPolicy.getOpenTags(),
+      localServices: this.serviceRegistry.getLocal().length,
+      remoteServices: this.serviceRegistry.getAll().length - this.serviceRegistry.getLocal().length,
+      ledgerEntries: 0, // filled async
+      paused: this.paused,
+      uptime: 0,
+      version: LEYLINE_VERSION,
+      circuitBreakerOpen: this.circuitBreaker.getOpenPeers().length,
+    };
+  }
+
+  /** Async variant that includes ledger entry count. */
+  async getNodeStatusAsync(): Promise<NodeStatus> {
+    const status = this.getNodeStatus();
+    try { status.ledgerEntries = await this.sharedLedger.getEntryCount(); } catch { /* */ }
+    return status;
+  }
+
+  /** Get the number of connected seed nodes. */
+  getConnectedSeedCount(): number {
+    if (!this.libp2p) return 0;
+    const connectedPeerIds = new Set(this.libp2p.getPeers().map((p) => p.toString()));
+    let count = 0;
+    for (const seedPeerId of this.seedPeerIds) {
+      if (connectedPeerIds.has(seedPeerId)) count++;
+    }
+    return count;
+  }
+
+  private checkSeedConnectivity(): void {
+    if (!this.libp2p || this.stopping) return;
+
+    const connectedPeerIds = new Set(this.libp2p.getPeers().map((p) => p.toString()));
+
+    // Build seedPeerIds from connected peers that match configured seed multiaddrs.
+    // libp2p bootstrap dials seed addrs and we discover their PeerIds from connections.
+    // Once we know a PeerId belongs to a seed, we track it persistently.
+    // On initial start before any connection, seedPeerIds is empty and we track via
+    // total connected peers as a fallback.
+    const totalPeers = connectedPeerIds.size;
+    const connectedSeeds = this.seedPeerIds.size > 0
+      ? [...this.seedPeerIds].filter((id) => connectedPeerIds.has(id)).length
+      : 0;
+
+    const totalSeeds = Math.max(this.seedPeerIds.size, this.config.seedNodes.length);
+
+    this.partitionDetector.updateSeedConnectivity(connectedSeeds, totalSeeds);
+    this.events.onSeedConnectivityChange?.(connectedSeeds, totalSeeds);
+
+    if (totalPeers === 0 && !this.degraded) {
+      this.degraded = true;
+      const reason = 'No peers connected — operating in degraded mode (messages will be queued locally)';
+      this.log.warn(reason);
+      this.events.onDegraded?.(reason);
+
+      // Attempt manual re-dial to seeds
+      this.redialSeeds();
+    } else if (totalPeers > 0 && this.degraded) {
+      this.degraded = false;
+      this.log.info('Seed connectivity restored — recovered from degraded mode');
+      this.events.onRecovered?.();
+    }
+  }
+
+  private redialSeeds(): void {
+    if (!this.libp2p || this.stopping) return;
+
+    import('@multiformats/multiaddr').then(({ multiaddr }) => {
+      for (const seedAddr of this.config.seedNodes) {
+        if (!this.libp2p || this.stopping) return;
+        this.libp2p.dial(multiaddr(seedAddr)).then(() => {
+          this.log.info('Re-dial succeeded', { seedAddr });
+        }).catch(() => {
+          // Expected — seed may still be unreachable
+        });
+      }
+    }).catch((err) => {
+      this.log.warn('multiaddr import failed in redialSeeds', { error: String(err) });
+    });
+  }
+
   protected async handleIncomingMessage(topic: string, data: Uint8Array): Promise<void> {
     // If paused, drop all inbound messages silently
     if (this.paused) return;
+    const startMs = performance.now();
 
     let msg: MagicMessage;
     try {
@@ -800,6 +1101,8 @@ export class MagicNode {
     // Validate message structure
     const validation = validateMessage(msg);
     if (!validation.valid) {
+      this.peerReputation.recordViolation(senderHex);
+      this.metrics.increment('messages.blocked', 1, { reason: 'validation' });
       await this.localLedger.append(data, 'blocked');
       return;
     }
@@ -814,12 +1117,15 @@ export class MagicNode {
     // Check rate limiting (per-sender)
     if (this.spamFilter.isRateLimited(senderHex, this.config.rateLimitPerMinute)) {
       await this.spamFilter.reportSpam(senderHex);
+      this.peerReputation.recordSpam(senderHex);
+      this.metrics.increment('ratelimit.hit');
+      this.metrics.increment('messages.blocked', 1, { reason: 'ratelimit' });
       await this.localLedger.append(data, 'blocked');
       // Auto-block agents that repeatedly hit rate limits
       if (this.config.autoBlockThreshold > 0 &&
           this.spamFilter.getSpamCount(senderHex) >= this.config.autoBlockThreshold) {
         await this.trustPolicy.blockAgent(senderHex);
-        console.warn(`[Magic] Auto-blocked agent ${senderHex.slice(0, 16)}... (spam count: ${this.spamFilter.getSpamCount(senderHex)})`);
+        this.log.warn('Auto-blocked agent', { agent: senderHex.slice(0, 16), spamCount: this.spamFilter.getSpamCount(senderHex) });
       }
       return;
     }
@@ -828,10 +1134,15 @@ export class MagicNode {
     if (this.config.maxInboundPerMinute > 0) {
       const now = Date.now();
       const cutoff = now - 60_000;
-      // Prune old timestamps
-      while (this.inboundTimestamps.length > 0 && this.inboundTimestamps[0] < cutoff) {
-        this.inboundTimestamps.shift();
+      // Prune old timestamps using binary search + slice (O(log n) vs O(n) shift loop)
+      let lo = 0;
+      let hi = this.inboundTimestamps.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (this.inboundTimestamps[mid] < cutoff) lo = mid + 1;
+        else hi = mid;
       }
+      if (lo > 0) this.inboundTimestamps = this.inboundTimestamps.slice(lo);
       if (this.inboundTimestamps.length >= this.config.maxInboundPerMinute) {
         // Global cap reached — drop silently (not the sender's fault, just backpressure)
         return;
@@ -866,6 +1177,8 @@ export class MagicNode {
     // This prevents a DoS where a malicious peer sends millions of messages
     // from untrusted senders, forcing expensive Ed25519 verification on each.
     if (!this.trustPolicy.isAllowed(senderHex, msg.tags)) {
+      this.metrics.increment('trust.denied');
+      this.metrics.increment('messages.blocked', 1, { reason: 'trust' });
       await this.localLedger.append(data, 'blocked');
       return;
     }
@@ -879,11 +1192,16 @@ export class MagicNode {
     }
     if (!sigValid) {
       await this.spamFilter.reportSpam(senderHex);
+      this.peerReputation.recordViolation(senderHex);
+      this.metrics.increment('signature.failed');
+      this.metrics.increment('messages.blocked', 1, { reason: 'signature' });
       await this.localLedger.append(data, 'blocked');
       return;
     }
 
     // Message passed all checks — record and deliver
+    this.peerReputation.recordSuccess(senderHex);
+    this.metrics.increment('messages.received');
     await this.localLedger.append(data, 'received');
 
     // Track last-received timestamp for inbox sync
@@ -893,6 +1211,9 @@ export class MagicNode {
     // These are distinct from the global onMessage event — a consumer may
     // listen to both without receiving duplicate notifications.
     this.tagPubSub?.handleMessage(topic, data);
+
+    // Track message processing latency
+    this.metrics.observe('message.latency.ms', performance.now() - startMs);
 
     // Fire global event
     this.events.onMessage?.(msg, topic);

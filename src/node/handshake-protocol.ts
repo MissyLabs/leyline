@@ -23,6 +23,8 @@ import {
   checkCompat,
   type CompatResult,
 } from '../config/compat.js';
+import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { Logger } from '../utils/logger.js';
 
 export const HANDSHAKE_PROTOCOL = '/leyline/handshake/1.0.0';
 
@@ -51,10 +53,27 @@ function encode(msg: HandshakeMessage): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(msg));
 }
 
+const MAX_HANDSHAKE_VERSION_LEN = 32;
+
 function decode(data: Uint8Array): HandshakeMessage {
   const parsed = JSON.parse(new TextDecoder().decode(data));
   if (typeof parsed.type !== 'string') {
     throw new TypeError('Malformed HandshakeMessage');
+  }
+  if (parsed.version !== undefined) {
+    if (typeof parsed.version !== 'string' || parsed.version.length > MAX_HANDSHAKE_VERSION_LEN) {
+      throw new TypeError('Malformed HandshakeMessage: invalid version field');
+    }
+  }
+  if (parsed.minVersion !== undefined) {
+    if (typeof parsed.minVersion !== 'string' || parsed.minVersion.length > MAX_HANDSHAKE_VERSION_LEN) {
+      throw new TypeError('Malformed HandshakeMessage: invalid minVersion field');
+    }
+  }
+  if (parsed.message !== undefined) {
+    if (typeof parsed.message !== 'string' || parsed.message.length > 256) {
+      throw new TypeError('Malformed HandshakeMessage: invalid message field');
+    }
   }
   return parsed;
 }
@@ -79,6 +98,7 @@ export interface HandshakeEvents {
 export class HandshakeProtocol {
   private readonly libp2p: Libp2p;
   private readonly events: HandshakeEvents;
+  private readonly log = new Logger('HandshakeProtocol');
 
   /** Tracked peer versions: peerId → version string */
   private readonly peerVersions = new Map<string, string>();
@@ -90,10 +110,12 @@ export class HandshakeProtocol {
   private stopped = false;
 
   private connectHandler: ((evt: CustomEvent) => void) | null = null;
+  private readonly shutdownSignal?: AbortSignal;
 
-  constructor(libp2p: Libp2p, events: HandshakeEvents = {}) {
+  constructor(libp2p: Libp2p, events: HandshakeEvents = {}, shutdownSignal?: AbortSignal) {
     this.libp2p = libp2p;
     this.events = events;
+    this.shutdownSignal = shutdownSignal;
   }
 
   async start(): Promise<void> {
@@ -161,6 +183,26 @@ export class HandshakeProtocol {
     return this.incompatiblePeers.has(peerId);
   }
 
+  /** Prune tracking data for peers no longer connected. */
+  pruneDisconnected(connectedPeerIds: Set<string>): void {
+    for (const peerId of this.peerVersions.keys()) {
+      if (!connectedPeerIds.has(peerId)) {
+        this.peerVersions.delete(peerId);
+        this.incompatiblePeers.delete(peerId);
+      }
+    }
+  }
+
+  /** Disconnect an incompatible peer by closing all connections. */
+  private disconnectPeer(peerId: string): void {
+    const peerIdObj = this.libp2p.getPeers().find((p) => p.toString() === peerId);
+    if (peerIdObj) {
+      this.libp2p.hangUp(peerIdObj).catch((err) => {
+        this.log.warn('hangUp failed', { peer: peerId, error: String(err) });
+      });
+    }
+  }
+
   /** Remove tracking for a disconnected peer. */
   removePeer(peerId: string): void {
     this.peerVersions.delete(peerId);
@@ -177,7 +219,7 @@ export class HandshakeProtocol {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, HANDSHAKE_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, HANDSHAKE_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return; // Peer doesn't support handshake
     }
@@ -194,6 +236,7 @@ export class HandshakeProtocol {
         (source) => lp.encode(source),
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async (source) => {
           for await (const msg of source) {
             const resp = decode(msg.subarray()) as HandshakeResponse;
@@ -202,18 +245,19 @@ export class HandshakeProtocol {
 
               // Check if THEY think WE'RE compatible
               if (!resp.compatible) {
-                console.error(`[Handshake] REJECTED by ${peerId.slice(0, 16)}...: ${resp.message}`);
+                this.log.error('REJECTED by peer', { peer: peerId.slice(0, 16), message: resp.message });
               } else if (resp.deprecated) {
-                console.warn(`[Handshake] DEPRECATION WARNING from ${peerId.slice(0, 16)}...: ${resp.message}`);
+                this.log.warn('DEPRECATION WARNING from peer', { peer: peerId.slice(0, 16), message: resp.message });
               }
 
               // Check if WE think THEY'RE compatible
               const ourCheck = checkCompat(resp.version);
               if (!ourCheck.compatible) {
                 this.incompatiblePeers.add(peerId);
-                console.warn(`[Handshake] Peer ${peerId.slice(0, 16)}... version ${resp.version} is incompatible: ${ourCheck.message}`);
+                this.log.warn('Peer version is incompatible', { peer: peerId.slice(0, 16), version: resp.version, message: ourCheck.message });
+                this.disconnectPeer(peerId);
               } else if (ourCheck.deprecated) {
-                console.log(`[Handshake] Peer ${peerId.slice(0, 16)}... version ${resp.version} is deprecated`);
+                this.log.info('Peer version is deprecated', { peer: peerId.slice(0, 16), version: resp.version });
               }
 
               this.events.onPeerVersion?.(peerId, resp.version, ourCheck);
@@ -238,6 +282,7 @@ export class HandshakeProtocol {
       await pipe(
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async function* (source: AsyncIterable<{ subarray(): Uint8Array }>) {
           for await (const msg of source) {
             const req = decode(msg.subarray()) as HandshakeRequest;
@@ -250,9 +295,10 @@ export class HandshakeProtocol {
 
               if (!result.compatible) {
                 self.incompatiblePeers.add(remotePeerId);
-                console.warn(`[Handshake] Incompatible peer ${remotePeerId.slice(0, 16)}... version ${req.version}: ${result.message}`);
+                self.log.warn('Incompatible peer', { peer: remotePeerId.slice(0, 16), version: req.version, message: result.message });
+                self.disconnectPeer(remotePeerId);
               } else if (result.deprecated) {
-                console.log(`[Handshake] Deprecated peer ${remotePeerId.slice(0, 16)}... version ${req.version}`);
+                self.log.info('Deprecated peer', { peer: remotePeerId.slice(0, 16), version: req.version });
               }
 
               self.events.onPeerVersion?.(remotePeerId, req.version, result);

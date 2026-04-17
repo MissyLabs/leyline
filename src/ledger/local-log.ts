@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Level } from "level";
+import { Logger } from "../utils/logger.js";
 
 export interface LedgerEntry {
   index: number;
@@ -81,6 +82,8 @@ export class LocalLedger {
   private db: Level<string, string>;
   private latestEntry: LedgerEntry | null = null;
   private entryCount: number = 0;
+  private appendLock: Promise<void> = Promise.resolve();
+  private readonly log = new Logger('LocalLedger');
 
   /**
    * @param dataDir - Filesystem path used by LevelDB for persistent storage.
@@ -109,7 +112,7 @@ export class LocalLedger {
         (err as { code?: string }).code === 'LEVEL_NOT_FOUND'
       );
       if (!isNotFound) {
-        console.warn('[LocalLedger] Failed to load entry count — resetting to empty state. This may indicate data corruption:', err);
+        this.log.warn('Failed to load entry count — resetting to empty state. This may indicate data corruption', { error: String(err) });
       }
       this.entryCount = 0;
     }
@@ -121,7 +124,7 @@ export class LocalLedger {
         const stored: StoredEntry = JSON.parse(raw) as StoredEntry;
         this.latestEntry = storedToEntry(stored);
       } catch (err) {
-        console.warn('[LocalLedger] Failed to load latest entry — starting from empty. This may indicate data corruption:', err);
+        this.log.warn('Failed to load latest entry — starting from empty. This may indicate data corruption', { error: String(err) });
         this.entryCount = 0;
         this.latestEntry = null;
       }
@@ -144,6 +147,19 @@ export class LocalLedger {
    * @returns The newly created {@link LedgerEntry}.
    */
   async append(message: Uint8Array, action: string): Promise<LedgerEntry> {
+    const prev = this.appendLock;
+    let resolve!: () => void;
+    this.appendLock = new Promise<void>((r) => { resolve = r; });
+
+    try {
+      await prev;
+      return await this.appendInner(message, action);
+    } finally {
+      resolve();
+    }
+  }
+
+  private async appendInner(message: Uint8Array, action: string): Promise<LedgerEntry> {
     const index = this.entryCount;
     const prevHash =
       this.latestEntry !== null ? this.latestEntry.hash : new Uint8Array(0);

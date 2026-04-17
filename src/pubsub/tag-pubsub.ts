@@ -133,4 +133,10 @@ export class TagPubSub {
     const peers = this.gossipsub.getSubscribers(topic);
     return peers.length;
   }
+
+  /** Remove all handlers and clear subscriptions. Call during node shutdown. */
+  clear(): void {
+    this.handlers.clear();
+    this.globalHandlers.clear();
+  }
 }

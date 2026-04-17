@@ -124,8 +124,9 @@ export class MessageBuffer {
    * Messages are returned in chronological order (oldest first).
    * They are NOT removed from the buffer — multiple peers can retrieve them.
    */
-  getForTopics(topics: string[], since: number = 0): BufferedMessage[] {
+  getForTopics(topics: string[], since: number = 0, limit?: number): BufferedMessage[] {
     const result: BufferedMessage[] = [];
+    const cap = limit && limit > 0 ? limit : Infinity;
     for (const topic of topics) {
       const topicBuf = this.topics.get(topic);
       if (!topicBuf) continue;
@@ -135,9 +136,8 @@ export class MessageBuffer {
         }
       }
     }
-    // Sort chronologically
     result.sort((a, b) => a.receivedAt - b.receivedAt);
-    return result;
+    return cap < result.length ? result.slice(0, cap) : result;
   }
 
   /** Get total buffered message count. */

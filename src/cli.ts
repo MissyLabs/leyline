@@ -3,11 +3,15 @@ import { SeedNode } from './node/seed-node.js';
 import { type MagicConfig, DEFAULT_SEED_NODES } from './config/config.js';
 import { publicKeyToHex } from './identity/keypair.js';
 import { MessageType } from './messages/message.js';
+import { Logger } from './utils/logger.js';
 import { promises as fs } from 'node:fs';
+
+const log = new Logger('CLI');
 
 const args = process.argv.slice(2);
 const isSeed = args.includes('--seed');
 const noSeeds = args.includes('--no-seeds');
+const enableMdns = args.includes('--mdns');
 const portFlag = args.indexOf('--port');
 const port = portFlag !== -1 ? parseInt(args[portFlag + 1], 10) : 9876;
 
@@ -44,14 +48,19 @@ const config: Partial<MagicConfig> = {
   ...(seedNodes !== undefined ? { seedNodes } : {}),
   subscribedTags: tags,
   dataDir: `./data/node-${port}`,
+  enableMdns,
 };
 
 async function main() {
   const node = isSeed ? new SeedNode(config) : new MagicNode(config);
 
+  const activeTimers: ReturnType<typeof setInterval>[] = [];
+
   // Graceful shutdown
   const shutdown = async () => {
-    console.log('\n[Magic] Shutting down...');
+    log.info('Shutting down...');
+    for (const t of activeTimers) clearInterval(t);
+    activeTimers.length = 0;
     await node.stop();
     process.exit(0);
   };
@@ -76,26 +85,24 @@ async function main() {
         } catch {
           payload = `<binary ${msg.payload.length} bytes>`;
         }
-        console.log(`[${t}] ${sender}...: ${payload}`);
+        log.info(`[${t}] ${sender}...: ${payload}`);
       });
     }
 
     // Wait for mesh formation
     const peers = await node.waitForPeers(1, 10_000);
 
-    console.log(`[Magic] Node is ready — ${peers} peer(s) connected`);
-    console.log(`[Magic] Listening for messages on: ${tags.join(', ') || '(no tags)'}`);
-    console.log(`[Magic] Open tags: ${node.getOpenTags().join(', ') || '(none)'}`);
+    log.info('Node is ready', { peers, tags, openTags: node.getOpenTags() });
 
-    // Health probe every 30 seconds
-    setInterval(() => {
-      console.log(`[health] peers: ${node.getPeerCount()} | open tags: ${node.getOpenTags().join(', ')} | paused: ${node.isPaused()}`);
-    }, 30_000);
+    const health = log.child('health');
+    activeTimers.push(setInterval(() => {
+      health.info('Status', { peers: node.getPeerCount(), openTags: node.getOpenTags(), paused: node.isPaused() });
+    }, 30_000));
 
     if (sendTriggerFile) {
-      console.log(`[Magic] Send trigger watching: ${sendTriggerFile} (poll ${sendPollMs}ms)`);
+      log.info('Send trigger watching', { file: sendTriggerFile, pollMs: sendPollMs });
 
-      setInterval(async () => {
+      activeTimers.push(setInterval(async () => {
         try {
           const raw = await fs.readFile(sendTriggerFile, 'utf8');
           const req = JSON.parse(raw);
@@ -104,18 +111,18 @@ async function main() {
           const bytes = new TextEncoder().encode(JSON.stringify(payloadObj));
 
           await node.broadcast([tag], bytes, MessageType.BROADCAST);
-          console.log(`[Magic][SEND][${tag}] ${JSON.stringify(payloadObj)}`);
+          log.info('Message sent', { tag, payload: payloadObj });
 
           await fs.unlink(sendTriggerFile).catch(() => {});
         } catch {
           // Ignore missing/invalid trigger file and keep polling.
         }
-      }, sendPollMs);
+      }, sendPollMs));
     }
   }
 }
 
 main().catch((err) => {
-  console.error('[Magic] Fatal error:', err);
+  log.error('Fatal error', { error: String(err) });
   process.exit(1);
 });

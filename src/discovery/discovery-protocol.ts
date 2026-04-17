@@ -29,6 +29,10 @@ import {
   ServiceRegistry,
 } from './service-registry.js';
 import { sign, verify, hexToPublicKey } from '../identity/keypair.js';
+import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { Logger } from '../utils/logger.js';
+
+const MAX_RESULT_SERVICES = 100;
 
 // ---------------------------------------------------------------------------
 // Protocol ID
@@ -120,6 +124,14 @@ export interface DiscoveryTrustChecker {
   isAllowed(pubkeyHex: string): boolean;
 }
 
+/** Per-peer rate limiting for discovery requests. */
+export interface DiscoveryRateLimitConfig {
+  /** Maximum requests per window per peer (default 30). */
+  maxRequestsPerWindow?: number;
+  /** Window duration in milliseconds (default 60_000). */
+  windowMs?: number;
+}
+
 export class DiscoveryProtocol {
   private readonly libp2p: Libp2p;
   private readonly registry: ServiceRegistry;
@@ -134,6 +146,12 @@ export class DiscoveryProtocol {
   /** How often to prune expired services (60 seconds). */
   private readonly pruneIntervalMs = 60_000;
 
+  /** Per-peer request timestamps for rate limiting. */
+  private readonly peerRequestTimes = new Map<string, number[]>();
+  private readonly rateLimitConfig: Required<DiscoveryRateLimitConfig>;
+  private readonly log = new Logger('DiscoveryProtocol');
+  private readonly shutdownSignal?: AbortSignal;
+
   constructor(
     libp2p: Libp2p,
     registry: ServiceRegistry,
@@ -141,6 +159,8 @@ export class DiscoveryProtocol {
     localPeerId: string,
     localPrivateKey: Uint8Array,
     trustChecker?: DiscoveryTrustChecker,
+    rateLimitConfig?: DiscoveryRateLimitConfig,
+    shutdownSignal?: AbortSignal,
   ) {
     this.libp2p = libp2p;
     this.registry = registry;
@@ -148,6 +168,31 @@ export class DiscoveryProtocol {
     this.localPeerId = localPeerId;
     this.localPrivateKey = localPrivateKey;
     this.trustChecker = trustChecker;
+    this.rateLimitConfig = {
+      maxRequestsPerWindow: rateLimitConfig?.maxRequestsPerWindow ?? 30,
+      windowMs: rateLimitConfig?.windowMs ?? 60_000,
+    };
+    this.shutdownSignal = shutdownSignal;
+  }
+
+  /** Check and record a request from a peer. Returns false if rate-limited. */
+  checkRateLimit(peerId: string): boolean {
+    const now = Date.now();
+    const windowStart = now - this.rateLimitConfig.windowMs;
+    let times = this.peerRequestTimes.get(peerId);
+    if (!times) {
+      times = [];
+      this.peerRequestTimes.set(peerId, times);
+    }
+    // Evict timestamps outside window
+    while (times.length > 0 && times[0] < windowStart) {
+      times.shift();
+    }
+    if (times.length >= this.rateLimitConfig.maxRequestsPerWindow) {
+      return false;
+    }
+    times.push(now);
+    return true;
   }
 
   /**
@@ -194,14 +239,15 @@ export class DiscoveryProtocol {
    * timer.
    */
   async start(): Promise<void> {
-    await this.libp2p.handle(DISCOVERY_PROTOCOL, async ({ stream }) => {
-      await this.handleIncoming(stream);
+    await this.libp2p.handle(DISCOVERY_PROTOCOL, async ({ stream, connection }) => {
+      const remotePeerId = connection.remotePeer.toString();
+      await this.handleIncoming(stream, remotePeerId);
     });
 
     this.pruneTimer = setInterval(() => {
       const pruned = this.registry.pruneExpired();
       if (pruned > 0) {
-        console.log(`[Discovery] Pruned ${pruned} expired service(s)`);
+        this.log.info('Pruned expired services', { count: pruned });
       }
     }, this.pruneIntervalMs);
   }
@@ -214,6 +260,7 @@ export class DiscoveryProtocol {
       clearInterval(this.pruneTimer);
       this.pruneTimer = null;
     }
+    this.peerRequestTimes.clear();
 
     await this.libp2p.unhandle(DISCOVERY_PROTOCOL);
   }
@@ -241,7 +288,7 @@ export class DiscoveryProtocol {
 
     let stream: Stream;
     try {
-      stream = await this.libp2p.dialProtocol(peerIdObj, DISCOVERY_PROTOCOL);
+      stream = await this.libp2p.dialProtocol(peerIdObj, DISCOVERY_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
       return []; // Peer unreachable or does not support the protocol.
     }
@@ -263,12 +310,13 @@ export class DiscoveryProtocol {
         (source) => lp.encode(source),
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async (source) => {
           for await (const chunk of source) {
             const msg = decodeMsg(chunk.subarray());
             if (msg.kind === 'result' && msg.requestId === requestId) {
-              // Merge received descriptors into local registry, verifying signatures and trust.
-              for (const descriptor of msg.result.services) {
+              const services = msg.result.services.slice(0, MAX_RESULT_SERVICES);
+              for (const descriptor of services) {
                 // Skip services from blocked providers
                 if (this.trustChecker && !this.trustChecker.isAllowed(descriptor.providerPubkey)) {
                   continue;
@@ -285,6 +333,8 @@ export class DiscoveryProtocol {
       );
     } catch {
       // Stream errors are expected during peer churn; return what we have.
+    } finally {
+      try { stream.close(); } catch { /* already closed */ }
     }
 
     return collected;
@@ -337,7 +387,7 @@ export class DiscoveryProtocol {
     const pushes = connectedPeers.map(async (peerIdObj) => {
       let stream: Stream;
       try {
-        stream = await this.libp2p.dialProtocol(peerIdObj, DISCOVERY_PROTOCOL);
+        stream = await this.libp2p.dialProtocol(peerIdObj, DISCOVERY_PROTOCOL, { signal: this.shutdownSignal });
       } catch {
         return; // Peer unreachable — skip silently.
       }
@@ -354,13 +404,15 @@ export class DiscoveryProtocol {
           [encodeMsg(adMsg)],
           (source) => lp.encode(source),
           stream,
-          // Drain any bytes the remote might send (none expected for ads).
+          (source) => withTimeout(source, STREAM_TIMEOUT_MS),
           async (source) => {
             for await (const _ of source) { /* intentional no-op */ }
           },
         );
       } catch {
         // Ignore individual stream errors.
+      } finally {
+        try { stream.close(); } catch { /* already closed */ }
       }
     });
 
@@ -381,18 +433,23 @@ export class DiscoveryProtocol {
    *   no reply.
    * - `result` — unexpected as an inbound opener; ignored.
    */
-  private async handleIncoming(stream: Stream): Promise<void> {
+  private async handleIncoming(stream: Stream, remotePeerId: string): Promise<void> {
     const self = this;
 
     try {
       await pipe(
         stream,
         (source) => lp.decode(source),
+        (source) => withTimeout(source, STREAM_TIMEOUT_MS),
         async function* (
           source: AsyncIterable<{ subarray(): Uint8Array }>,
         ): AsyncIterable<Uint8Array> {
           for await (const chunk of source) {
             const msg = decodeMsg(chunk.subarray());
+
+            if (!self.checkRateLimit(remotePeerId)) {
+              break;
+            }
 
             if (msg.kind === 'query') {
               // Search local registry and respond, capped to prevent amplification

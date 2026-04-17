@@ -189,7 +189,7 @@ export function decodeMessage(data: Uint8Array): MagicMessage {
     id: ensureUint8Array(obj["id"]),
     senderPubkey: ensureUint8Array(obj["senderPubkey"]),
     signature: ensureUint8Array(obj["signature"]),
-    tags: obj["tags"] as string[],
+    tags: Array.isArray(obj["tags"]) ? (obj["tags"] as string[]).slice(0, 50) : [],
     payload: ensureUint8Array(obj["payload"]),
     timestamp: obj["timestamp"] as number,
     nonce: ensureUint8Array(obj["nonce"]),

@@ -1,3 +1,7 @@
+import { Logger } from '../utils/logger.js';
+
+const log = new Logger('Config');
+
 /** Default seed node port for the Leyline network. */
 export const DEFAULT_SEED_PORT = 9876;
 
@@ -107,6 +111,20 @@ export interface MagicConfig {
 
   /** Port for the WebSocket listener */
   webSocketPort: number;
+
+  /** Port for the seed node HTTP health check endpoint. 0 to disable. */
+  healthCheckPort: number;
+
+  /** Enable mDNS for automatic local network peer discovery. */
+  enableMdns: boolean;
+
+  /**
+   * Maximum number of peer connections this node will maintain.
+   * Once reached, new inbound connections are rejected.
+   * Set to 0 for unlimited (not recommended for production).
+   * @defaultValue 100
+   */
+  maxConnections: number;
 }
 
 export const DEFAULT_CONFIG: MagicConfig = {
@@ -127,6 +145,9 @@ export const DEFAULT_CONFIG: MagicConfig = {
   enableWebSocket: true,
   enableRelay: true,
   webSocketPort: 9877,
+  healthCheckPort: 0,
+  enableMdns: false,
+  maxConnections: 100,
 };
 
 export function mergeConfig(partial: Partial<MagicConfig>): MagicConfig {
@@ -150,7 +171,7 @@ export function mergeConfig(partial: Partial<MagicConfig>): MagicConfig {
 
   // Warn about isSeedNode — should only be set via SeedNode constructor
   if (partial.isSeedNode) {
-    console.warn('[Config] isSeedNode is set — use the SeedNode class instead of MagicNode to avoid misconfiguration');
+    log.warn('isSeedNode is set — use the SeedNode class instead of MagicNode to avoid misconfiguration');
   }
 
   return merged;
