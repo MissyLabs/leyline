@@ -38,6 +38,16 @@ interface HandshakeRequest {
   minVersion: string;
 }
 
+/**
+ * Structured rejection code carried on the wire so that connecting clients
+ * can distinguish the cause of an incompatibility without parsing the human-
+ * readable `message` string.
+ */
+export type HandshakeRejectionCode =
+  | 'version_below_min'
+  | 'version_unknown'
+  | 'protocol_mismatch';
+
 interface HandshakeResponse {
   type: 'welcome';
   version: string;
@@ -45,6 +55,8 @@ interface HandshakeResponse {
   compatible: boolean;
   deprecated: boolean;
   message: string;
+  /** Set when compatible === false to give machine-readable rejection context. */
+  rejectionCode?: HandshakeRejectionCode;
 }
 
 type HandshakeMessage = HandshakeRequest | HandshakeResponse;
@@ -254,7 +266,7 @@ export class HandshakeProtocol {
               const ourCheck = checkCompat(resp.version);
               if (!ourCheck.compatible) {
                 this.incompatiblePeers.add(peerId);
-                this.log.warn('Peer version is incompatible', { peer: peerId.slice(0, 16), version: resp.version, message: ourCheck.message });
+                this.log.warn('Peer version is incompatible', { reason: 'version_incompatible', peer: peerId.slice(0, 16), version: resp.version, message: ourCheck.message });
                 this.disconnectPeer(peerId);
               } else if (ourCheck.deprecated) {
                 this.log.info('Peer version is deprecated', { peer: peerId.slice(0, 16), version: resp.version });
@@ -295,13 +307,23 @@ export class HandshakeProtocol {
 
               if (!result.compatible) {
                 self.incompatiblePeers.add(remotePeerId);
-                self.log.warn('Incompatible peer', { peer: remotePeerId.slice(0, 16), version: req.version, message: result.message });
+                self.log.warn('Incompatible peer', { reason: 'version_incompatible', peer: remotePeerId.slice(0, 16), version: req.version, message: result.message });
                 self.disconnectPeer(remotePeerId);
               } else if (result.deprecated) {
                 self.log.info('Deprecated peer', { peer: remotePeerId.slice(0, 16), version: req.version });
               }
 
               self.events.onPeerVersion?.(remotePeerId, req.version, result);
+
+              // Derive machine-readable rejection code for the response
+              let rejectionCode: HandshakeRejectionCode | undefined;
+              if (!result.compatible) {
+                if (!req.version || req.version === '0.0.0' || req.version === 'unknown') {
+                  rejectionCode = 'version_unknown';
+                } else {
+                  rejectionCode = 'version_below_min';
+                }
+              }
 
               // Check our version against THEIR minVersion
               const theyThinkWeAre = checkCompat(LEYLINE_VERSION);
@@ -313,6 +335,7 @@ export class HandshakeProtocol {
                 compatible: result.compatible,
                 deprecated: result.deprecated,
                 message: result.message,
+                ...(rejectionCode !== undefined ? { rejectionCode } : {}),
               };
 
               yield encode(response);
