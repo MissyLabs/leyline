@@ -90,6 +90,7 @@ function decode(data: Uint8Array): InboxWireMessage {
 export class InboxServer {
   private readonly libp2p: Libp2p;
   private readonly buffer: MessageBuffer;
+  private readonly log = new Logger('InboxServer');
 
   constructor(libp2p: Libp2p, buffer: MessageBuffer) {
     this.libp2p = libp2p;
@@ -166,6 +167,15 @@ export class InboxServer {
               const authorizedTopics = req.topics.filter((t: string) =>
                 peerTopics.has(t),
               );
+
+              if (req.topics.length > authorizedTopics.length) {
+                const deniedTopics = req.topics.filter((t: string) => !peerTopics.has(t));
+                this.log.warn('Inbox request denied topics', {
+                  deniedCount: deniedTopics.length,
+                  deniedTopics,
+                  peer: remotePeerId.slice(0, 16),
+                });
+              }
 
               const cap = Math.min(req.limit, 500);
               const messages = this.buffer.getForTopics(authorizedTopics, req.since, cap);
