@@ -5,6 +5,8 @@ import { publicKeyToHex } from './identity/keypair.js';
 import { MessageType } from './messages/message.js';
 import { Logger } from './utils/logger.js';
 import { promises as fs } from 'node:fs';
+import { createConnection } from 'node:net';
+import { execSync } from 'node:child_process';
 
 const log = new Logger('CLI');
 
@@ -12,8 +14,49 @@ const args = process.argv.slice(2);
 const isSeed = args.includes('--seed');
 const noSeeds = args.includes('--no-seeds');
 const enableMdns = args.includes('--mdns');
+const autoPort = args.includes('--auto-port');
 const portFlag = args.indexOf('--port');
-const port = portFlag !== -1 ? parseInt(args[portFlag + 1], 10) : 9876;
+let port = portFlag !== -1 ? parseInt(args[portFlag + 1], 10) : 9876;
+
+/**
+ * Check if a TCP port is already in use. Returns the PID of the owner if
+ * detectable, or true if in use but PID unknown, or false if free.
+ */
+async function checkPortInUse(p: number): Promise<string | boolean> {
+  return new Promise((resolve) => {
+    const sock = createConnection({ port: p, host: '127.0.0.1' });
+    sock.once('connect', () => {
+      sock.destroy();
+      // Try to find owning PID
+      try {
+        const out = execSync(`ss -tlnp sport = :${p} 2>/dev/null || lsof -ti :${p} 2>/dev/null`, { encoding: 'utf8', timeout: 2000 });
+        const pidMatch = out.match(/pid=(\d+)/);
+        resolve(pidMatch ? `PID ${pidMatch[1]}` : (out.trim() || true));
+      } catch {
+        resolve(true);
+      }
+    });
+    sock.once('error', () => {
+      sock.destroy();
+      resolve(false);
+    });
+    sock.setTimeout(1000, () => {
+      sock.destroy();
+      resolve(false);
+    });
+  });
+}
+
+/**
+ * Find a free port starting from the given port, incrementing up to 100.
+ */
+async function findFreePort(startPort: number): Promise<number> {
+  for (let p = startPort; p < startPort + 100; p++) {
+    const inUse = await checkPortInUse(p);
+    if (!inUse) return p;
+  }
+  throw new Error(`No free port found in range ${startPort}-${startPort + 99}`);
+}
 
 // --seeds overrides default seeds; --no-seeds disables bootstrap entirely
 const seedNodesFlag = args.indexOf('--seeds');
@@ -52,6 +95,24 @@ const config: Partial<MagicConfig> = {
 };
 
 async function main() {
+  // --- #1: EADDRINUSE guard ---
+  const portOwner = await checkPortInUse(port);
+  if (portOwner) {
+    const ownerStr = typeof portOwner === 'string' ? ` (owner: ${portOwner})` : '';
+    if (autoPort) {
+      log.warn(`Port ${port} is already in use${ownerStr} — finding a free port (--auto-port)`);
+      port = await findFreePort(port + 1);
+      config.listenPort = port;
+      config.listenAddresses = [`/ip4/0.0.0.0/tcp/${port}`];
+      config.dataDir = `./data/node-${port}`;
+      log.info(`Auto-selected port ${port}`);
+    } else {
+      log.error(`Port ${port} is already in use${ownerStr}`);
+      log.error('Remediation: stop the existing node, choose another port with --port <N>, or use --auto-port for automatic fallback');
+      process.exit(1);
+    }
+  }
+
   const node = isSeed ? new SeedNode(config) : new MagicNode(config);
 
   const activeTimers: ReturnType<typeof setInterval>[] = [];
@@ -96,7 +157,17 @@ async function main() {
 
     const health = log.child('health');
     activeTimers.push(setInterval(() => {
-      health.info('Status', { peers: node.getPeerCount(), openTags: node.getOpenTags(), paused: node.isPaused() });
+      const snap = node.getMetrics().snapshot();
+      health.info('Status', {
+        peers: node.getPeerCount(),
+        openTags: node.getOpenTags(),
+        paused: node.isPaused(),
+        msgRecv: snap.messagesReceived,
+        msgBlocked: snap.messagesBlocked,
+        rateLimitHits: snap.rateLimitHits,
+        trustDenials: snap.trustDenials,
+        sigFails: snap.signatureFailures,
+      });
     }, 30_000));
 
     if (sendTriggerFile) {
