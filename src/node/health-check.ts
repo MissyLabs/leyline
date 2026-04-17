@@ -20,6 +20,8 @@ export interface HealthCheckDeps {
   getBufferedMessageCount: () => number;
   getKnownPeerCount: () => number;
   getLedgerEntryCount: () => Promise<number>;
+  /** Optional: return all metric counters for the /metrics endpoint. */
+  getMetrics?: () => Record<string, number>;
 }
 
 export class HealthCheckServer {
@@ -67,6 +69,14 @@ export class HealthCheckServer {
         res.writeHead(503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'error' }));
       });
+    } else if (req.url === '/metrics') {
+      if (this.deps.getMetrics) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(this.deps.getMetrics()));
+      } else {
+        res.writeHead(501, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'metrics not available' }));
+      }
     } else {
       res.writeHead(404);
       res.end();
