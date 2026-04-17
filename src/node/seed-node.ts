@@ -124,6 +124,7 @@ export class SeedNode extends MagicNode {
         getBufferedMessageCount: () => this.messageBuffer.getCount(),
         getKnownPeerCount: () => this.knownPeers.size,
         getLedgerEntryCount: () => this.sharedLedger.getEntryCount(),
+        getMetrics: () => this.metrics.allCounters(),
       });
       await this.healthCheck.start();
     }

@@ -100,6 +100,13 @@ export class NodeMetrics extends EventEmitter {
     };
   }
 
+  /** Get all counter values as a plain object for operator diagnostics. */
+  allCounters(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [k, v] of this.counters) out[k] = v;
+    return out;
+  }
+
   snapshot(): MetricsSnapshot {
     const gaugeEntries: Record<string, number> = {};
     for (const [k, v] of this.gauges) gaugeEntries[k] = v;

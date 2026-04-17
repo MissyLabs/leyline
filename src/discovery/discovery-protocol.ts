@@ -448,6 +448,7 @@ export class DiscoveryProtocol {
             const msg = decodeMsg(chunk.subarray());
 
             if (!self.checkRateLimit(remotePeerId)) {
+              self.log.warn('Discovery request rate-limited', { reason: 'discovery_rate_limited', peer: remotePeerId });
               break;
             }
 

@@ -86,8 +86,17 @@ export class PeerExchange {
   /** Max age before a peer record is considered stale (30 min) */
   private maxPeerAge: number;
 
-  /** How often to exchange peers (30 seconds) */
-  private exchangeIntervalMs: number;
+  /** Base interval for exchange (30 seconds). Actual interval grows with backoff. */
+  private baseExchangeIntervalMs: number;
+
+  /** Current exchange interval (adapts with backoff). */
+  private currentExchangeIntervalMs: number;
+
+  /** Consecutive empty exchange rounds (for adaptive backoff). */
+  private consecutiveEmptyRounds = 0;
+
+  /** Max backoff multiplier cap. */
+  private static readonly MAX_BACKOFF_MULTIPLIER = 4;
 
   /** Optional peer reputation tracker for weighted selection. */
   private reputation?: PeerReputation;
@@ -112,7 +121,8 @@ export class PeerExchange {
     this.localPeerId = libp2p.peerId.toString();
     this.maxPeers = opts.maxPeers ?? 500;
     this.maxPeerAge = opts.maxPeerAge ?? 30 * 60 * 1000;
-    this.exchangeIntervalMs = opts.exchangeIntervalMs ?? 30_000;
+    this.baseExchangeIntervalMs = opts.exchangeIntervalMs ?? 30_000;
+    this.currentExchangeIntervalMs = this.baseExchangeIntervalMs;
     this.localPrivateKey = opts.localPrivateKey;
     this.localPubkeyHex = opts.localPubkeyHex;
     this.reputation = opts.reputation;
@@ -148,12 +158,8 @@ export class PeerExchange {
       await this.handleIncoming(stream);
     });
 
-    // Start periodic exchange with connected peers
-    this.exchangeInterval = setInterval(() => {
-      this.exchangeWithPeers().catch((err) => {
-        this.log.warn('Exchange round failed', { error: String((err as Error)?.message ?? err) });
-      });
-    }, this.exchangeIntervalMs);
+    // Start periodic exchange with adaptive backoff
+    this.scheduleNextExchange();
   }
 
   /** Stop the protocol handler and periodic exchange. */
@@ -163,6 +169,21 @@ export class PeerExchange {
       this.exchangeInterval = null;
     }
     await this.libp2p.unhandle(PEER_EXCHANGE_PROTOCOL);
+  }
+
+  /** Schedule the next exchange round with adaptive backoff + jitter. */
+  private scheduleNextExchange(): void {
+    const jitter = Math.floor(Math.random() * this.baseExchangeIntervalMs * 0.2);
+    const delay = this.currentExchangeIntervalMs + jitter;
+    this.exchangeInterval = setTimeout(() => {
+      this.exchangeWithPeers().catch((err) => {
+        this.log.warn('Exchange round failed', { error: String((err as Error)?.message ?? err) });
+      }).finally(() => {
+        if (this.exchangeInterval !== null) {
+          this.scheduleNextExchange();
+        }
+      });
+    }, delay) as unknown as ReturnType<typeof setInterval>;
   }
 
   /** Maximum number of tags per peer record. */
@@ -360,10 +381,21 @@ export class PeerExchange {
     this.pruneStale();
 
     const connectedPeers = this.libp2p.getPeers();
-    if (connectedPeers.length === 0) return;
+    if (connectedPeers.length === 0) {
+      this.log.warn('No peers connected — cannot exchange', { reason: 'no_peers_connected' });
+      this.applyBackoff();
+      return;
+    }
 
     let selected = connectedPeers.map((p) => p.toString())
       .filter((p) => !this.circuitBreaker?.isOpen(p));
+
+    if (selected.length === 0) {
+      this.log.warn('All peers circuit-broken — cannot exchange', { reason: 'all_peers_circuit_broken', connected: connectedPeers.length });
+      this.applyBackoff();
+      return;
+    }
+
     if (selected.length > PeerExchange.MAX_CONCURRENT_EXCHANGES) {
       if (this.reputation) {
         selected.sort((a, b) => this.reputation!.getScore(b) - this.reputation!.getScore(a));
@@ -382,7 +414,33 @@ export class PeerExchange {
       (r) => r.status === 'fulfilled' && r.value.length > 0,
     ).length;
     if (succeeded === 0 && selected.length > 0) {
-      this.log.warn('All peer exchanges returned no results', { attempted: selected.length });
+      this.log.warn('Peers connected but all exchanges returned empty', {
+        reason: 'peers_connected_but_no_exchange_results',
+        attempted: selected.length,
+        connected: connectedPeers.length,
+        knownPeers: this.peerTable.size,
+      });
+      this.applyBackoff();
+    } else if (succeeded > 0) {
+      this.resetBackoff();
+    }
+  }
+
+  /** Increase backoff interval after empty round. */
+  private applyBackoff(): void {
+    this.consecutiveEmptyRounds++;
+    const multiplier = Math.min(
+      Math.pow(1.5, this.consecutiveEmptyRounds),
+      PeerExchange.MAX_BACKOFF_MULTIPLIER,
+    );
+    this.currentExchangeIntervalMs = Math.floor(this.baseExchangeIntervalMs * multiplier);
+  }
+
+  /** Reset backoff interval after successful exchange. */
+  private resetBackoff(): void {
+    if (this.consecutiveEmptyRounds > 0) {
+      this.consecutiveEmptyRounds = 0;
+      this.currentExchangeIntervalMs = this.baseExchangeIntervalMs;
     }
   }
 
