@@ -85,6 +85,22 @@ function deserializeEntry(json: string): SharedLedgerEntry {
 }
 
 /**
+ * Filter criteria for {@link SharedLedger.query}.
+ *
+ * All specified fields are combined with AND semantics.
+ */
+export interface LedgerQueryFilter {
+  /** Filter by submitter public key hex */
+  submitterPubkeyHex?: string;
+  /** Filter by timestamp range [minMs, maxMs] (both inclusive) */
+  timestampRange?: [number, number];
+  /** Minimum confirmation count (inclusive) */
+  minConfirmations?: number;
+  /** Maximum number of results to return (default: unlimited) */
+  limit?: number;
+}
+
+/**
  * Shared distributed ledger for provable records.
  * Entries are submitted with a signature and can be confirmed by peers.
  * Uses a hash chain for integrity, stored in LevelDB.
@@ -270,6 +286,45 @@ export class SharedLedger {
       if (entry) entries.push(entry);
     }
     return entries;
+  }
+
+  /**
+   * Query ledger entries with optional filter criteria.
+   *
+   * Walks all entries in ascending index order and returns those that satisfy
+   * every specified filter field (AND semantics). Results are capped by
+   * `filter.limit` when provided.
+   *
+   * @param filter - One or more filter criteria; omitted fields are ignored.
+   * @returns Matching {@link SharedLedgerEntry} objects in ascending index order.
+   */
+  async query(filter: LedgerQueryFilter): Promise<SharedLedgerEntry[]> {
+    const results: SharedLedgerEntry[] = [];
+    const limit = filter.limit ?? Infinity;
+
+    for (let i = 1; i <= this.currentIndex; i++) {
+      if (results.length >= limit) break;
+
+      const entry = await this.getEntry(i);
+      if (!entry) continue;
+
+      if (filter.submitterPubkeyHex !== undefined) {
+        if (toHex(entry.submitterPubkey) !== filter.submitterPubkeyHex) continue;
+      }
+
+      if (filter.timestampRange !== undefined) {
+        const [minMs, maxMs] = filter.timestampRange;
+        if (entry.timestamp < minMs || entry.timestamp > maxMs) continue;
+      }
+
+      if (filter.minConfirmations !== undefined) {
+        if (entry.confirmations < filter.minConfirmations) continue;
+      }
+
+      results.push(entry);
+    }
+
+    return results;
   }
 
   /**

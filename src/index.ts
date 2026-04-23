@@ -36,10 +36,11 @@ export { TagPubSub } from './pubsub/tag-pubsub.js';
 export { TrustPolicy, SpamFilter } from './trust/policy.js';
 export { PersistentTrustPolicy, PersistentSpamFilter } from './trust/persistent-policy.js';
 export { PeerReputation, type PeerReputationRecord, type PeerReputationConfig } from './trust/peer-reputation.js';
+export { ReputationGate, type ReputationGateConfig } from './trust/reputation-gate.js';
 
 // Ledgers
 export { LocalLedger } from './ledger/local-log.js';
-export { SharedLedger } from './ledger/shared-ledger.js';
+export { SharedLedger, type LedgerQueryFilter } from './ledger/shared-ledger.js';
 export { LedgerSync } from './ledger/ledger-sync.js';
 export {
   LedgerConsensus,
