@@ -2,7 +2,7 @@ import type { Libp2p } from 'libp2p';
 import type { Stream } from '@libp2p/interface';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { encryptPayload, decryptPayload } from '../crypto/envelope.js';
 import { hexToPublicKey, sign as edSign, verify as edVerify } from '../identity/keypair.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
@@ -52,6 +52,10 @@ export interface DirectEnvelope {
    * Prevents spoofing of sender identity in DMs and relay hops.
    */
   envelopeSignature?: string;
+  /** Unique receipt token — if present, receiver should send back a receipt */
+  receiptToken?: string;
+  /** Indicates this envelope IS a receipt (not a message) */
+  isReceipt?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -70,6 +74,8 @@ interface WireEnvelope {
   senderPubkeyHex?: string;
   visitedPeers?: string[];
   envelopeSignature?: string;
+  receiptToken?: string;
+  isReceipt?: boolean;
 }
 
 /**
@@ -104,6 +110,8 @@ function encodeEnvelope(envelope: DirectEnvelope): Uint8Array {
     senderPubkeyHex: envelope.senderPubkeyHex,
     visitedPeers: envelope.visitedPeers,
     envelopeSignature: envelope.envelopeSignature,
+    receiptToken: envelope.receiptToken,
+    isReceipt: envelope.isReceipt,
   };
   return new TextEncoder().encode(JSON.stringify(wire));
 }
@@ -142,6 +150,11 @@ function decodeEnvelope(data: Uint8Array): DirectEnvelope {
     ? wire.visitedPeers.filter((p): p is string => typeof p === 'string').slice(0, 50)
     : [];
 
+  const receiptToken =
+    typeof wire.receiptToken === 'string' && wire.receiptToken.length <= 64
+      ? wire.receiptToken
+      : undefined;
+
   return {
     payload: new Uint8Array(Buffer.from(wire.payload, 'base64')),
     targetPeerId: wire.targetPeerId,
@@ -154,6 +167,8 @@ function decodeEnvelope(data: Uint8Array): DirectEnvelope {
     senderPubkeyHex: typeof wire.senderPubkeyHex === 'string' ? wire.senderPubkeyHex : undefined,
     visitedPeers,
     envelopeSignature: typeof wire.envelopeSignature === 'string' ? wire.envelopeSignature : undefined,
+    receiptToken,
+    isReceipt: wire.isReceipt === true ? true : undefined,
   };
 }
 
@@ -207,6 +222,8 @@ export class DirectMessageProtocol {
   private readonly libp2p: Libp2p;
   private readonly opts: DirectMessageOptions;
   private readonly shutdownSignal?: AbortSignal;
+  /** Pending receipt callbacks keyed by receiptToken. */
+  private readonly pendingReceipts = new Map<string, (timestamp: number) => void>();
 
   constructor(libp2p: Libp2p, opts: DirectMessageOptions = {}, shutdownSignal?: AbortSignal) {
     this.libp2p = libp2p;
@@ -231,6 +248,8 @@ export class DirectMessageProtocol {
   /** Unregister the protocol handler. */
   async stop(): Promise<void> {
     await this.libp2p.unhandle(DIRECT_MESSAGE_PROTOCOL);
+    // Reject all pending receipt callbacks so callers don't hang indefinitely.
+    this.pendingReceipts.clear();
   }
 
   // --------------------------------------------------------------------------
@@ -315,6 +334,110 @@ export class DirectMessageProtocol {
       hopsRemaining: 3,
     };
     return this.forwardToRelays(relayEnvelope);
+  }
+
+  /**
+   * Send `payload` directly to `targetPeerId` and wait for a delivery receipt.
+   *
+   * Generates a random receipt token, attaches it to the envelope, and waits
+   * up to `timeoutMs` for the recipient to echo the token back as a receipt
+   * envelope. Returns `{ delivered: true, receiptTimestamp }` on success or
+   * `{ delivered: false }` if the timeout expires first.
+   *
+   * @param targetPeerId       - libp2p peer ID string of the destination node.
+   * @param payload            - Serialized {@link MagicMessage} bytes to deliver.
+   * @param recipientPubkeyHex - Recipient's Ed25519 public key hex for encryption.
+   * @param timeoutMs          - How long to wait for a receipt (default 10 s).
+   */
+  async sendWithReceipt(
+    targetPeerId: string,
+    payload: Uint8Array,
+    recipientPubkeyHex?: string,
+    timeoutMs: number = 10_000,
+  ): Promise<{ delivered: boolean; receiptTimestamp?: number }> {
+    const receiptToken = randomBytes(8).toString('hex'); // 16 hex chars
+
+    // Register the callback before sending to avoid a race where the receipt
+    // arrives before we set up the listener.
+    const receiptPromise = new Promise<number>((resolve) => {
+      this.pendingReceipts.set(receiptToken, resolve);
+    });
+
+    // Build the envelope with the receipt token.  We replicate the relevant
+    // parts of send() so that we can inject the token before signing.
+    let finalPayload = payload;
+    let encrypted = false;
+    let nonce: Uint8Array | undefined;
+
+    if (recipientPubkeyHex && this.opts.localPrivateKey) {
+      const recipientPub = hexToPublicKey(recipientPubkeyHex);
+      const result = encryptPayload(payload, this.opts.localPrivateKey, recipientPub);
+      finalPayload = result.ciphertext;
+      nonce = result.nonce;
+      encrypted = true;
+    }
+
+    const localPeerId = this.libp2p.peerId.toString();
+    const envelope: DirectEnvelope = {
+      payload: finalPayload,
+      targetPeerId,
+      senderPeerId: localPeerId,
+      timestamp: Date.now(),
+      isRelay: false,
+      hopsRemaining: 0,
+      encrypted,
+      nonce,
+      senderPubkeyHex: this.opts.localPubkeyHex,
+      visitedPeers: [localPeerId],
+      receiptToken,
+    };
+
+    if (this.opts.localPrivateKey && this.opts.localPubkeyHex) {
+      const wireForSig: WireEnvelope = {
+        payload: Buffer.from(finalPayload).toString('base64'),
+        targetPeerId,
+        senderPeerId: localPeerId,
+        timestamp: envelope.timestamp,
+        isRelay: false,
+        hopsRemaining: 0,
+        encrypted,
+        senderPubkeyHex: this.opts.localPubkeyHex,
+      };
+      const signable = computeEnvelopeSignableBytes(wireForSig);
+      const sig = await edSign(this.opts.localPrivateKey, signable);
+      envelope.envelopeSignature = Buffer.from(sig).toString('hex');
+    }
+
+    let sent = await this.deliverDirect(targetPeerId, envelope);
+    if (!sent) {
+      const relayEnvelope: DirectEnvelope = { ...envelope, isRelay: true, hopsRemaining: 3 };
+      sent = await this.forwardToRelays(relayEnvelope);
+    }
+
+    if (!sent) {
+      this.pendingReceipts.delete(receiptToken);
+      return { delivered: false };
+    }
+
+    // Race the receipt promise against the timeout.
+    const timeoutHandle = setTimeout(() => {
+      this.pendingReceipts.delete(receiptToken);
+    }, timeoutMs);
+
+    try {
+      const receiptTimestamp = await Promise.race<number | undefined>([
+        receiptPromise,
+        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), timeoutMs)),
+      ]);
+
+      if (receiptTimestamp === undefined) {
+        return { delivered: false };
+      }
+      return { delivered: true, receiptTimestamp };
+    } finally {
+      clearTimeout(timeoutHandle);
+      this.pendingReceipts.delete(receiptToken);
+    }
   }
 
   /**
@@ -494,6 +617,19 @@ export class DirectMessageProtocol {
                 if (!checker.isAllowed(envelope.senderPubkeyHex)) continue;
               }
 
+              // If this is a receipt envelope, resolve the matching pending callback.
+              if (envelope.isReceipt === true) {
+                if (envelope.receiptToken) {
+                  const cb = this.pendingReceipts.get(envelope.receiptToken);
+                  if (cb) {
+                    this.pendingReceipts.delete(envelope.receiptToken);
+                    cb(envelope.timestamp);
+                  }
+                }
+                // Do not invoke onMessage for receipts.
+                continue;
+              }
+
               // This message is for us — decrypt if encrypted.
               if (envelope.encrypted && envelope.nonce && envelope.senderPubkeyHex && this.opts.localPrivateKey) {
                 try {
@@ -511,6 +647,26 @@ export class DirectMessageProtocol {
                 }
               }
               this.opts.onMessage?.(envelope);
+
+              // If the sender requested a delivery receipt, send one back best-effort.
+              if (envelope.receiptToken && envelope.senderPeerId) {
+                const receiptEnvelope: DirectEnvelope = {
+                  payload: new Uint8Array(0),
+                  targetPeerId: envelope.senderPeerId,
+                  senderPeerId: localPeerId,
+                  timestamp: Date.now(),
+                  isRelay: false,
+                  hopsRemaining: 0,
+                  encrypted: false,
+                  receiptToken: envelope.receiptToken,
+                  isReceipt: true,
+                  senderPubkeyHex: this.opts.localPubkeyHex,
+                  visitedPeers: [localPeerId],
+                };
+                this.deliverDirect(envelope.senderPeerId, receiptEnvelope).catch(() => {
+                  // Best-effort — receipt delivery failure is not critical
+                });
+              }
             } else if (envelope.isRelay && envelope.hopsRemaining > 0) {
               // Verify envelope signature before relaying to prevent amplification of forged envelopes
               if (envelope.senderPubkeyHex && envelope.envelopeSignature) {
