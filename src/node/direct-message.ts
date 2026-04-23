@@ -81,8 +81,8 @@ interface WireEnvelope {
 /**
  * Compute the canonical signable bytes for an envelope.
  * Covers all fields that identify the sender and intent — payload hash,
- * target, sender, timestamp. Relay fields (hopsRemaining, visitedPeers)
- * are excluded since they change during relay.
+ * target, sender, timestamp, receipt semantics. Relay fields (hopsRemaining,
+ * visitedPeers) are excluded since they change during relay.
  */
 function computeEnvelopeSignableBytes(wire: WireEnvelope): Uint8Array {
   const payloadHash = createHash('sha256').update(wire.payload).digest('hex');
@@ -93,6 +93,8 @@ function computeEnvelopeSignableBytes(wire: WireEnvelope): Uint8Array {
     String(wire.timestamp),
     wire.senderPubkeyHex ?? '',
     String(wire.encrypted),
+    wire.receiptToken ?? '',
+    String(wire.isReceipt ?? false),
   ].join('|');
   return new TextEncoder().encode(canonical);
 }
@@ -319,6 +321,7 @@ export class DirectMessageProtocol {
         hopsRemaining: 0,
         encrypted,
         senderPubkeyHex: this.opts.localPubkeyHex,
+        receiptToken,
       };
       const signable = computeEnvelopeSignableBytes(wireForSig);
       const sig = await edSign(this.opts.localPrivateKey, signable);
@@ -536,6 +539,8 @@ export class DirectMessageProtocol {
                     hopsRemaining: envelope.hopsRemaining,
                     encrypted: envelope.encrypted,
                     senderPubkeyHex: envelope.senderPubkeyHex,
+                    receiptToken: envelope.receiptToken,
+                    isReceipt: envelope.isReceipt,
                   };
                   const signable = computeEnvelopeSignableBytes(wireForVerify);
                   const sigBytes = new Uint8Array(Buffer.from(envelope.envelopeSignature, 'hex'));
@@ -630,6 +635,8 @@ export class DirectMessageProtocol {
                     hopsRemaining: 0,
                     encrypted: false,
                     senderPubkeyHex: this.opts.localPubkeyHex,
+                    receiptToken: receiptEnvelope.receiptToken,
+                    isReceipt: true,
                   };
                   const signable = computeEnvelopeSignableBytes(wireForSig);
                   const sig = await edSign(this.opts.localPrivateKey, signable);
@@ -653,6 +660,8 @@ export class DirectMessageProtocol {
                     hopsRemaining: envelope.hopsRemaining,
                     encrypted: envelope.encrypted,
                     senderPubkeyHex: envelope.senderPubkeyHex,
+                    receiptToken: envelope.receiptToken,
+                    isReceipt: envelope.isReceipt,
                   };
                   const signable = computeEnvelopeSignableBytes(wireForVerify);
                   const sigBytes = new Uint8Array(Buffer.from(envelope.envelopeSignature, 'hex'));
