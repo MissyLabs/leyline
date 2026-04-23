@@ -133,6 +133,14 @@ export class MagicNode {
   /** When true, all inbound message delivery is paused (messages are silently dropped). */
   private paused = false;
 
+  // --- Per-tag rate limiting ---
+  /**
+   * Sliding-window timestamps keyed by tag then by sender pubkeyHex.
+   * Only populated when `config.tagRateLimits` is non-empty.
+   * Layout: tag → (senderHex → timestamps[])
+   */
+  private tagRateWindows = new Map<string, Map<string, number[]>>();
+
   constructor(config: Partial<MagicConfig>, events: MagicNodeEvents = {}) {
     this.config = mergeConfig(config);
     this.trustPolicy = new PersistentTrustPolicy(`${this.config.dataDir}/trust`);
@@ -1114,6 +1122,17 @@ export class MagicNode {
       return; // Already seen — recorded as blocked for audit
     }
 
+    // Per-tag rate limiting (checked before the global per-sender limit).
+    // Only runs when tagRateLimits config is non-empty.
+    if (Object.keys(this.config.tagRateLimits).length > 0 &&
+        this.isTagRateLimited(senderHex, msg.tags)) {
+      this.metrics.increment('ratelimit.hit');
+      this.metrics.increment('messages.blocked', 1, { reason: 'tag_ratelimit' });
+      this.log.debug('Per-tag rate limit exceeded', { sender: senderHex.slice(0, 16), tags: msg.tags });
+      await this.localLedger.append(data, 'blocked');
+      return;
+    }
+
     // Check rate limiting (per-sender)
     if (this.spamFilter.isRateLimited(senderHex, this.config.rateLimitPerMinute)) {
       await this.spamFilter.reportSpam(senderHex);
@@ -1217,5 +1236,65 @@ export class MagicNode {
 
     // Fire global event
     this.events.onMessage?.(msg, topic);
+  }
+
+  /**
+   * Check whether a sender has exceeded the per-tag rate limit for any of
+   * the given tags.
+   *
+   * Uses per-tag sliding one-minute windows (independent of the global
+   * per-sender window managed by {@link SpamFilter}). A message is blocked
+   * if the sender exceeds the configured limit for **any** tag it carries.
+   *
+   * Returns `false` immediately when `config.tagRateLimits` is empty so
+   * there is zero overhead on nodes that have not configured per-tag limits.
+   *
+   * @param senderHex - Hex-encoded public key of the message sender.
+   * @param tags      - Tags carried by the incoming message.
+   * @returns `true` if the message should be blocked due to a tag rate limit.
+   */
+  private isTagRateLimited(senderHex: string, tags: string[]): boolean {
+    const limits = this.config.tagRateLimits;
+    const now = Date.now();
+    const windowMs = 60_000;
+    const cutoff = now - windowMs;
+
+    for (const tag of tags) {
+      const limit = limits[tag];
+      if (limit === undefined) continue; // No per-tag limit configured for this tag
+
+      // Get or create the per-tag sender map
+      let senderMap = this.tagRateWindows.get(tag);
+      if (senderMap === undefined) {
+        senderMap = new Map<string, number[]>();
+        this.tagRateWindows.set(tag, senderMap);
+      }
+
+      // Get or create the sender's timestamp array for this tag
+      let timestamps = senderMap.get(senderHex);
+      if (timestamps === undefined) {
+        timestamps = [];
+        senderMap.set(senderHex, timestamps);
+      }
+
+      // Prune expired entries using binary search
+      let lo = 0;
+      let hi = timestamps.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if ((timestamps[mid] as number) < cutoff) lo = mid + 1;
+        else hi = mid;
+      }
+      if (lo > 0) timestamps.splice(0, lo);
+
+      // Record this message arrival
+      timestamps.push(now);
+
+      if (timestamps.length > limit) {
+        return true; // Exceeded limit for this tag
+      }
+    }
+
+    return false;
   }
 }
