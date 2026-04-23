@@ -11,6 +11,12 @@ export class TagPubSub {
   private subscribedTags = new Set<string>();
   private handlers = new Map<string, Set<(data: Uint8Array, tag: string) => void>>();
   private globalHandlers = new Set<(data: Uint8Array, tag: string) => void>();
+  /** Active wildcard patterns (e.g. "game:*"). */
+  private wildcardPatterns = new Set<string>();
+  /** Per-pattern handlers fired when a message tag matches the pattern. */
+  private patternHandlers = new Map<string, Set<(data: Uint8Array, tag: string) => void>>();
+  /** Compiled regex cache keyed by pattern string. */
+  private patternRegexCache = new Map<string, RegExp>();
 
   static readonly TOPIC_PREFIX = 'magic/tag/';
   /** Special topic for peer discovery */
@@ -115,6 +121,15 @@ export class TagPubSub {
     for (const handler of this.globalHandlers) {
       handler(data, tag);
     }
+
+    // Fire wildcard pattern handlers whose pattern matches this tag
+    for (const [pattern, handlerSet] of this.patternHandlers) {
+      if (this.matchesPattern(tag, pattern)) {
+        for (const handler of handlerSet) {
+          handler(data, tag);
+        }
+      }
+    }
   }
 
   /** Get all currently subscribed tags. */
@@ -134,9 +149,92 @@ export class TagPubSub {
     return peers.length;
   }
 
+  /**
+   * Subscribe to all tags that match a wildcard pattern.
+   *
+   * The pattern may include `*` as a multi-character wildcard.
+   * For example `"game:*"` matches `"game:chess"` and `"game:drift"`.
+   *
+   * Already-subscribed tags matching the pattern are subscribed immediately.
+   * Future tags are auto-subscribed when seen via {@link checkAndSubscribeNewTopic}.
+   *
+   * @param pattern - Wildcard pattern string.
+   */
+  subscribePattern(pattern: string): void {
+    this.wildcardPatterns.add(pattern);
+    // Subscribe to any already-known tags that match.
+    for (const tag of this.subscribedTags) {
+      if (this.matchesPattern(tag, pattern)) {
+        this.subscribe(tag); // idempotent
+      }
+    }
+  }
+
+  /**
+   * Register a handler that fires for any incoming message whose tag matches
+   * the given wildcard pattern.
+   *
+   * @param pattern - Wildcard pattern string (same syntax as {@link subscribePattern}).
+   * @param handler - Callback receiving the raw data and the matched tag.
+   */
+  onTagPattern(pattern: string, handler: (data: Uint8Array, tag: string) => void): void {
+    if (!this.patternHandlers.has(pattern)) {
+      this.patternHandlers.set(pattern, new Set());
+    }
+    this.patternHandlers.get(pattern)!.add(handler);
+  }
+
+  /**
+   * Remove a pattern handler registered via {@link onTagPattern}.
+   *
+   * @param pattern - The pattern the handler was registered under.
+   * @param handler - The handler to remove.
+   */
+  offTagPattern(pattern: string, handler: (data: Uint8Array, tag: string) => void): void {
+    this.patternHandlers.get(pattern)?.delete(handler);
+  }
+
+  /**
+   * Check whether `tag` matches `pattern` using `*` as a wildcard.
+   * Results are cached to avoid repeated regex compilation.
+   */
+  private matchesPattern(tag: string, pattern: string): boolean {
+    let regex = this.patternRegexCache.get(pattern);
+    if (regex === undefined) {
+      // Escape all regex-special characters except `*`, then replace `*` with `.*`.
+      const escaped = pattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+      regex = new RegExp(`^${escaped}$`);
+      this.patternRegexCache.set(pattern, regex);
+    }
+    return regex.test(tag);
+  }
+
+  /**
+   * Check a newly-seen topic against all registered wildcard patterns and
+   * auto-subscribe via GossipSub if any pattern matches.
+   *
+   * Call this whenever a new topic is discovered from a remote peer.
+   *
+   * @param topic - GossipSub topic string (including the "magic/tag/" prefix).
+   */
+  checkAndSubscribeNewTopic(topic: string): void {
+    const tag = this.topicToTag(topic);
+    if (tag === null) return;
+
+    for (const pattern of this.wildcardPatterns) {
+      if (this.matchesPattern(tag, pattern)) {
+        this.subscribe(tag);
+        break;
+      }
+    }
+  }
+
   /** Remove all handlers and clear subscriptions. Call during node shutdown. */
   clear(): void {
     this.handlers.clear();
     this.globalHandlers.clear();
+    this.wildcardPatterns.clear();
+    this.patternHandlers.clear();
+    this.patternRegexCache.clear();
   }
 }
