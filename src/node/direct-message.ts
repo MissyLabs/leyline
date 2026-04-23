@@ -223,7 +223,7 @@ export class DirectMessageProtocol {
   private readonly opts: DirectMessageOptions;
   private readonly shutdownSignal?: AbortSignal;
   /** Pending receipt callbacks keyed by receiptToken. */
-  private readonly pendingReceipts = new Map<string, (timestamp: number) => void>();
+  private readonly pendingReceipts = new Map<string, { expectedSender: string; resolve: (timestamp: number) => void }>();
 
   constructor(libp2p: Libp2p, opts: DirectMessageOptions = {}, shutdownSignal?: AbortSignal) {
     this.libp2p = libp2p;
@@ -361,7 +361,7 @@ export class DirectMessageProtocol {
     const receiptToken = randomBytes(8).toString('hex'); // 16 hex chars
 
     const receiptPromise = new Promise<number>((resolve) => {
-      this.pendingReceipts.set(receiptToken, resolve);
+      this.pendingReceipts.set(receiptToken, { expectedSender: targetPeerId, resolve });
     });
 
     // Delegate to send() with the receipt token — avoids duplicating
@@ -574,10 +574,12 @@ export class DirectMessageProtocol {
               // If this is a receipt envelope, resolve the matching pending callback.
               if (envelope.isReceipt === true) {
                 if (envelope.receiptToken) {
-                  const cb = this.pendingReceipts.get(envelope.receiptToken);
-                  if (cb) {
+                  const pending = this.pendingReceipts.get(envelope.receiptToken);
+                  // Verify the receipt came from the peer we actually sent to —
+                  // prevents relay hops or other peers from forging confirmations.
+                  if (pending && envelope.senderPeerId === pending.expectedSender) {
                     this.pendingReceipts.delete(envelope.receiptToken);
-                    cb(envelope.timestamp);
+                    pending.resolve(envelope.timestamp);
                   }
                 }
                 // Do not invoke onMessage for receipts.
