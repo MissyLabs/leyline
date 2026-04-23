@@ -142,4 +142,65 @@ export class NodeMetrics extends EventEmitter {
     this.gauges.clear();
     this.histograms.clear();
   }
+
+  /**
+   * Export all metrics in the
+   * [Prometheus text exposition format](https://prometheus.io/docs/instrumenting/exposition_formats/).
+   *
+   * Each well-known counter from {@link snapshot} is exported as a Prometheus
+   * `counter`, all gauge values as `gauge`, and all histogram samples as a
+   * `summary` (with count, mean, p50, p95, and p99 quantiles).
+   *
+   * Metric names follow the `leyline_<name>` convention and `.` separators in
+   * internal names are replaced with `_` to comply with Prometheus naming rules.
+   *
+   * @returns A UTF-8 string in Prometheus text format, terminated with a
+   *   trailing newline as required by the specification.
+   */
+  toPrometheus(): string {
+    const lines: string[] = [];
+    const snap = this.snapshot();
+
+    // Export the named snapshot counter fields
+    const counterFields: [string, number][] = [
+      ['messages_received', snap.messagesReceived],
+      ['messages_blocked', snap.messagesBlocked],
+      ['messages_sent', snap.messagesSent],
+      ['peer_connections', snap.peerConnections],
+      ['peer_disconnections', snap.peerDisconnections],
+      ['trust_denials', snap.trustDenials],
+      ['ratelimit_hits', snap.rateLimitHits],
+      ['signature_failures', snap.signatureFailures],
+      ['ledger_submissions', snap.ledgerSubmissions],
+      ['ledger_confirmations', snap.ledgerConfirmations],
+      ['discovery_queries', snap.discoveryQueries],
+      ['dm_sent', snap.dmSent],
+      ['dm_received', snap.dmReceived],
+      ['uptime_ms', snap.uptime],
+    ];
+    for (const [name, value] of counterFields) {
+      lines.push(`# TYPE leyline_${name} counter`);
+      lines.push(`leyline_${name} ${value}`);
+    }
+
+    // Gauges
+    for (const [name, value] of Object.entries(snap.gauges)) {
+      const promName = name.replace(/\./g, '_');
+      lines.push(`# TYPE leyline_${promName} gauge`);
+      lines.push(`leyline_${promName} ${value}`);
+    }
+
+    // Histograms — exported as Prometheus summary metrics
+    for (const [name, stats] of Object.entries(snap.histograms)) {
+      const promName = name.replace(/\./g, '_');
+      lines.push(`# TYPE leyline_${promName} summary`);
+      lines.push(`leyline_${promName}_count ${stats.count}`);
+      lines.push(`leyline_${promName}_mean ${stats.mean.toFixed(3)}`);
+      lines.push(`leyline_${promName}_p50 ${stats.p50.toFixed(3)}`);
+      lines.push(`leyline_${promName}_p95 ${stats.p95.toFixed(3)}`);
+      lines.push(`leyline_${promName}_p99 ${stats.p99.toFixed(3)}`);
+    }
+
+    return lines.join('\n') + '\n';
+  }
 }
