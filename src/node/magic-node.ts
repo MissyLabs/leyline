@@ -102,6 +102,7 @@ export class MagicNode {
   protected privateKey: Uint8Array = new Uint8Array(0);
   protected events: MagicNodeEvents;
   private gossipHandler: ((evt: CustomEvent) => void) | null = null;
+  private subscriptionChangeHandler: ((evt: CustomEvent) => void) | null = null;
   private peerConnectHandler: ((evt: CustomEvent) => void) | null = null;
   private peerDisconnectHandler: ((evt: CustomEvent) => void) | null = null;
   /** Serialization lock for submitToSharedLedger to prevent concurrent submit races. */
@@ -281,6 +282,19 @@ export class MagicNode {
       });
     };
     gs.addEventListener('gossipsub:message', this.gossipHandler);
+
+    // Auto-subscribe new topics matching wildcard patterns
+    this.subscriptionChangeHandler = (evt: CustomEvent) => {
+      const { subscriptions } = evt.detail;
+      if (Array.isArray(subscriptions) && this.tagPubSub) {
+        for (const sub of subscriptions) {
+          if (sub.subscribe && typeof sub.topic === 'string') {
+            this.tagPubSub.checkAndSubscribeNewTopic(sub.topic);
+          }
+        }
+      }
+    };
+    gs.addEventListener('subscription-change', this.subscriptionChangeHandler);
 
     // Initialize inbox client for store-and-forward message retrieval
     this.inboxClient = new InboxClient(this.libp2p, this.shutdownController.signal);
@@ -533,6 +547,10 @@ export class MagicNode {
       const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
       gs.removeEventListener('gossipsub:message', this.gossipHandler);
       this.gossipHandler = null;
+      if (this.subscriptionChangeHandler) {
+        gs.removeEventListener('subscription-change', this.subscriptionChangeHandler);
+        this.subscriptionChangeHandler = null;
+      }
     }
     if (this.libp2p && this.peerConnectHandler) {
       this.libp2p.removeEventListener('peer:connect', this.peerConnectHandler);
@@ -1259,25 +1277,27 @@ export class MagicNode {
     const windowMs = 60_000;
     const cutoff = now - windowMs;
 
+    // Two-pass: verify all tags pass first, then record timestamps.
+    // Prevents phantom counts when tag A passes but tag B rejects.
+    const pendingRecords: Array<{ timestamps: number[] }> = [];
+
     for (const tag of tags) {
       const limit = limits[tag];
-      if (limit === undefined) continue; // No per-tag limit configured for this tag
+      if (limit === undefined) continue;
 
-      // Get or create the per-tag sender map
       let senderMap = this.tagRateWindows.get(tag);
-      if (senderMap === undefined) {
+      if (!senderMap) {
         senderMap = new Map<string, number[]>();
         this.tagRateWindows.set(tag, senderMap);
       }
 
-      // Get or create the sender's timestamp array for this tag
       let timestamps = senderMap.get(senderHex);
-      if (timestamps === undefined) {
+      if (!timestamps) {
         timestamps = [];
         senderMap.set(senderHex, timestamps);
       }
 
-      // Prune expired entries using binary search
+      // Prune expired entries
       let lo = 0;
       let hi = timestamps.length;
       while (lo < hi) {
@@ -1287,12 +1307,23 @@ export class MagicNode {
       }
       if (lo > 0) timestamps.splice(0, lo);
 
-      // Record this message arrival
-      timestamps.push(now);
-
-      if (timestamps.length > limit) {
-        return true; // Exceeded limit for this tag
+      // Clean up empty entries to prevent unbounded growth
+      if (timestamps.length === 0) {
+        senderMap.delete(senderHex);
+        if (senderMap.size === 0) this.tagRateWindows.delete(tag);
+        continue;
       }
+
+      if (timestamps.length >= limit) {
+        return true; // Would exceed — reject without recording
+      }
+
+      pendingRecords.push({ timestamps });
+    }
+
+    // All tags passed — now record
+    for (const { timestamps } of pendingRecords) {
+      timestamps.push(now);
     }
 
     return false;

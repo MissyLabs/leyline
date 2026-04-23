@@ -176,12 +176,15 @@ export class NodeMetrics extends EventEmitter {
       ['discovery_queries', snap.discoveryQueries],
       ['dm_sent', snap.dmSent],
       ['dm_received', snap.dmReceived],
-      ['uptime_ms', snap.uptime],
     ];
     for (const [name, value] of counterFields) {
       lines.push(`# TYPE leyline_${name} counter`);
       lines.push(`leyline_${name} ${value}`);
     }
+
+    // Uptime is a gauge (resets on restart), not a counter
+    lines.push('# TYPE leyline_uptime_ms gauge');
+    lines.push(`leyline_uptime_ms ${snap.uptime}`);
 
     // Gauges
     for (const [name, value] of Object.entries(snap.gauges)) {
@@ -195,10 +198,9 @@ export class NodeMetrics extends EventEmitter {
       const promName = name.replace(/\./g, '_');
       lines.push(`# TYPE leyline_${promName} summary`);
       lines.push(`leyline_${promName}_count ${stats.count}`);
-      lines.push(`leyline_${promName}_mean ${stats.mean.toFixed(3)}`);
-      lines.push(`leyline_${promName}_p50 ${stats.p50.toFixed(3)}`);
-      lines.push(`leyline_${promName}_p95 ${stats.p95.toFixed(3)}`);
-      lines.push(`leyline_${promName}_p99 ${stats.p99.toFixed(3)}`);
+      lines.push(`leyline_${promName}{quantile="0.5"} ${stats.p50.toFixed(3)}`);
+      lines.push(`leyline_${promName}{quantile="0.95"} ${stats.p95.toFixed(3)}`);
+      lines.push(`leyline_${promName}{quantile="0.99"} ${stats.p99.toFixed(3)}`);
     }
 
     return lines.join('\n') + '\n';

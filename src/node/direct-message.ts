@@ -276,6 +276,8 @@ export class DirectMessageProtocol {
     targetPeerId: string,
     payload: Uint8Array,
     recipientPubkeyHex?: string,
+    /** @internal Injected by sendWithReceipt — not part of public API. */
+    receiptToken?: string,
   ): Promise<boolean> {
     let finalPayload = payload;
     let encrypted = false;
@@ -303,6 +305,7 @@ export class DirectMessageProtocol {
       // Always include sender pubkey so trust checks work for both encrypted and cleartext DMs
       senderPubkeyHex: this.opts.localPubkeyHex,
       visitedPeers: [localPeerId],
+      receiptToken,
     };
 
     // Sign the envelope to prove sender identity (prevents spoofing)
@@ -357,62 +360,13 @@ export class DirectMessageProtocol {
   ): Promise<{ delivered: boolean; receiptTimestamp?: number }> {
     const receiptToken = randomBytes(8).toString('hex'); // 16 hex chars
 
-    // Register the callback before sending to avoid a race where the receipt
-    // arrives before we set up the listener.
     const receiptPromise = new Promise<number>((resolve) => {
       this.pendingReceipts.set(receiptToken, resolve);
     });
 
-    // Build the envelope with the receipt token.  We replicate the relevant
-    // parts of send() so that we can inject the token before signing.
-    let finalPayload = payload;
-    let encrypted = false;
-    let nonce: Uint8Array | undefined;
-
-    if (recipientPubkeyHex && this.opts.localPrivateKey) {
-      const recipientPub = hexToPublicKey(recipientPubkeyHex);
-      const result = encryptPayload(payload, this.opts.localPrivateKey, recipientPub);
-      finalPayload = result.ciphertext;
-      nonce = result.nonce;
-      encrypted = true;
-    }
-
-    const localPeerId = this.libp2p.peerId.toString();
-    const envelope: DirectEnvelope = {
-      payload: finalPayload,
-      targetPeerId,
-      senderPeerId: localPeerId,
-      timestamp: Date.now(),
-      isRelay: false,
-      hopsRemaining: 0,
-      encrypted,
-      nonce,
-      senderPubkeyHex: this.opts.localPubkeyHex,
-      visitedPeers: [localPeerId],
-      receiptToken,
-    };
-
-    if (this.opts.localPrivateKey && this.opts.localPubkeyHex) {
-      const wireForSig: WireEnvelope = {
-        payload: Buffer.from(finalPayload).toString('base64'),
-        targetPeerId,
-        senderPeerId: localPeerId,
-        timestamp: envelope.timestamp,
-        isRelay: false,
-        hopsRemaining: 0,
-        encrypted,
-        senderPubkeyHex: this.opts.localPubkeyHex,
-      };
-      const signable = computeEnvelopeSignableBytes(wireForSig);
-      const sig = await edSign(this.opts.localPrivateKey, signable);
-      envelope.envelopeSignature = Buffer.from(sig).toString('hex');
-    }
-
-    let sent = await this.deliverDirect(targetPeerId, envelope);
-    if (!sent) {
-      const relayEnvelope: DirectEnvelope = { ...envelope, isRelay: true, hopsRemaining: 3 };
-      sent = await this.forwardToRelays(relayEnvelope);
-    }
+    // Delegate to send() with the receipt token — avoids duplicating
+    // envelope construction, signing, encryption, and relay logic.
+    const sent = await this.send(targetPeerId, payload, recipientPubkeyHex, receiptToken);
 
     if (!sent) {
       this.pendingReceipts.delete(receiptToken);
@@ -649,6 +603,7 @@ export class DirectMessageProtocol {
               this.opts.onMessage?.(envelope);
 
               // If the sender requested a delivery receipt, send one back best-effort.
+              // Sign the receipt so the sender can verify it came from us.
               if (envelope.receiptToken && envelope.senderPeerId) {
                 const receiptEnvelope: DirectEnvelope = {
                   payload: new Uint8Array(0),
@@ -663,6 +618,21 @@ export class DirectMessageProtocol {
                   senderPubkeyHex: this.opts.localPubkeyHex,
                   visitedPeers: [localPeerId],
                 };
+                if (this.opts.localPrivateKey && this.opts.localPubkeyHex) {
+                  const wireForSig: WireEnvelope = {
+                    payload: Buffer.from(receiptEnvelope.payload).toString('base64'),
+                    targetPeerId: receiptEnvelope.targetPeerId,
+                    senderPeerId: receiptEnvelope.senderPeerId,
+                    timestamp: receiptEnvelope.timestamp,
+                    isRelay: false,
+                    hopsRemaining: 0,
+                    encrypted: false,
+                    senderPubkeyHex: this.opts.localPubkeyHex,
+                  };
+                  const signable = computeEnvelopeSignableBytes(wireForSig);
+                  const sig = await edSign(this.opts.localPrivateKey, signable);
+                  receiptEnvelope.envelopeSignature = Buffer.from(sig).toString('hex');
+                }
                 this.deliverDirect(envelope.senderPeerId, receiptEnvelope).catch(() => {
                   // Best-effort — receipt delivery failure is not critical
                 });
