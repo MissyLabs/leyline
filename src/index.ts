@@ -33,7 +33,7 @@ export { initProto } from './messages/proto.js';
 export { TagPubSub } from './pubsub/tag-pubsub.js';
 
 // Trust
-export { TrustPolicy, SpamFilter } from './trust/policy.js';
+export { TrustPolicy, SpamFilter, TrustLevel, type TrustLevelValue } from './trust/policy.js';
 export { PersistentTrustPolicy, PersistentSpamFilter } from './trust/persistent-policy.js';
 export { PeerReputation, type PeerReputationRecord, type PeerReputationConfig } from './trust/peer-reputation.js';
 export { ReputationGate, type ReputationGateConfig } from './trust/reputation-gate.js';
