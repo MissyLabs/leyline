@@ -125,6 +125,7 @@ export class SeedNode extends MagicNode {
         getKnownPeerCount: () => this.knownPeers.size,
         getLedgerEntryCount: () => this.sharedLedger.getEntryCount(),
         getMetrics: () => this.metrics.allCounters(),
+        getPrometheusMetrics: () => this.metrics.toPrometheus(),
       });
       await this.healthCheck.start();
     }

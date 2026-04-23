@@ -20,8 +20,17 @@ export interface HealthCheckDeps {
   getBufferedMessageCount: () => number;
   getKnownPeerCount: () => number;
   getLedgerEntryCount: () => Promise<number>;
-  /** Optional: return all metric counters for the /metrics endpoint. */
+  /** Optional: return all metric counters for the /metrics endpoint (JSON format). */
   getMetrics?: () => Record<string, number>;
+  /**
+   * Optional: return metrics in Prometheus text exposition format.
+   *
+   * When provided, requests to `/metrics` that include `Accept: text/plain`
+   * (or any request to `/metrics/prometheus`) will receive the Prometheus
+   * text format with `Content-Type: text/plain; version=0.0.4` instead of
+   * the default JSON response.
+   */
+  getPrometheusMetrics?: () => string;
 }
 
 export class HealthCheckServer {
@@ -69,8 +78,35 @@ export class HealthCheckServer {
         res.writeHead(503, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ status: 'error' }));
       });
+    } else if (req.url === '/metrics/prometheus') {
+      // Explicit Prometheus endpoint — always returns text format.
+      if (this.deps.getPrometheusMetrics) {
+        res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+        res.end(this.deps.getPrometheusMetrics());
+      } else if (this.deps.getMetrics) {
+        // Fallback: convert JSON counters to a simple Prometheus text response.
+        const counters = this.deps.getMetrics();
+        const lines: string[] = [];
+        for (const [name, value] of Object.entries(counters)) {
+          const promName = `leyline_${name.replace(/\./g, '_')}`;
+          lines.push(`# TYPE ${promName} counter`);
+          lines.push(`${promName} ${value}`);
+        }
+        res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+        res.end(lines.join('\n') + '\n');
+      } else {
+        res.writeHead(501, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'metrics not available' }));
+      }
     } else if (req.url === '/metrics') {
-      if (this.deps.getMetrics) {
+      // Check whether the client prefers Prometheus text format via Accept header.
+      const acceptHeader = req.headers['accept'] ?? '';
+      const wantsText = acceptHeader.includes('text/plain');
+
+      if (wantsText && this.deps.getPrometheusMetrics) {
+        res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' });
+        res.end(this.deps.getPrometheusMetrics());
+      } else if (this.deps.getMetrics) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(this.deps.getMetrics()));
       } else {

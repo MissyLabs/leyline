@@ -328,6 +328,8 @@ describe('DirectMessage — relay loop and hop limits', () => {
         String(envelope.timestamp),
         envelope.senderPubkeyHex ?? '',
         String(envelope.encrypted),
+        envelope.receiptToken ?? '',
+        String(envelope.isReceipt ?? false),
       ].join('|');
       const signable = new TextEncoder().encode(canonical);
       const sig = await edSign(kpA.privateKey, signable);

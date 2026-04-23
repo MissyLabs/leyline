@@ -102,6 +102,7 @@ export class MagicNode {
   protected privateKey: Uint8Array = new Uint8Array(0);
   protected events: MagicNodeEvents;
   private gossipHandler: ((evt: CustomEvent) => void) | null = null;
+  private subscriptionChangeHandler: ((evt: CustomEvent) => void) | null = null;
   private peerConnectHandler: ((evt: CustomEvent) => void) | null = null;
   private peerDisconnectHandler: ((evt: CustomEvent) => void) | null = null;
   /** Serialization lock for submitToSharedLedger to prevent concurrent submit races. */
@@ -132,6 +133,14 @@ export class MagicNode {
   private payloadBudgets = new Map<string, { bytes: number; windowStart: number }>();
   /** When true, all inbound message delivery is paused (messages are silently dropped). */
   private paused = false;
+
+  // --- Per-tag rate limiting ---
+  /**
+   * Sliding-window timestamps keyed by tag then by sender pubkeyHex.
+   * Only populated when `config.tagRateLimits` is non-empty.
+   * Layout: tag → (senderHex → timestamps[])
+   */
+  private tagRateWindows = new Map<string, Map<string, number[]>>();
 
   constructor(config: Partial<MagicConfig>, events: MagicNodeEvents = {}) {
     this.config = mergeConfig(config);
@@ -273,6 +282,19 @@ export class MagicNode {
       });
     };
     gs.addEventListener('gossipsub:message', this.gossipHandler);
+
+    // Auto-subscribe new topics matching wildcard patterns
+    this.subscriptionChangeHandler = (evt: CustomEvent) => {
+      const { subscriptions } = evt.detail;
+      if (Array.isArray(subscriptions) && this.tagPubSub) {
+        for (const sub of subscriptions) {
+          if (sub.subscribe && typeof sub.topic === 'string') {
+            this.tagPubSub.checkAndSubscribeNewTopic(sub.topic);
+          }
+        }
+      }
+    };
+    gs.addEventListener('subscription-change', this.subscriptionChangeHandler);
 
     // Initialize inbox client for store-and-forward message retrieval
     this.inboxClient = new InboxClient(this.libp2p, this.shutdownController.signal);
@@ -525,6 +547,10 @@ export class MagicNode {
       const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
       gs.removeEventListener('gossipsub:message', this.gossipHandler);
       this.gossipHandler = null;
+      if (this.subscriptionChangeHandler) {
+        gs.removeEventListener('subscription-change', this.subscriptionChangeHandler);
+        this.subscriptionChangeHandler = null;
+      }
     }
     if (this.libp2p && this.peerConnectHandler) {
       this.libp2p.removeEventListener('peer:connect', this.peerConnectHandler);
@@ -1114,6 +1140,17 @@ export class MagicNode {
       return; // Already seen — recorded as blocked for audit
     }
 
+    // Per-tag rate limiting (checked before the global per-sender limit).
+    // Only runs when tagRateLimits config is non-empty.
+    if (Object.keys(this.config.tagRateLimits).length > 0 &&
+        this.isTagRateLimited(senderHex, msg.tags)) {
+      this.metrics.increment('ratelimit.hit');
+      this.metrics.increment('messages.blocked', 1, { reason: 'tag_ratelimit' });
+      this.log.debug('Per-tag rate limit exceeded', { sender: senderHex.slice(0, 16), tags: msg.tags });
+      await this.localLedger.append(data, 'blocked');
+      return;
+    }
+
     // Check rate limiting (per-sender)
     if (this.spamFilter.isRateLimited(senderHex, this.config.rateLimitPerMinute)) {
       await this.spamFilter.reportSpam(senderHex);
@@ -1217,5 +1254,78 @@ export class MagicNode {
 
     // Fire global event
     this.events.onMessage?.(msg, topic);
+  }
+
+  /**
+   * Check whether a sender has exceeded the per-tag rate limit for any of
+   * the given tags.
+   *
+   * Uses per-tag sliding one-minute windows (independent of the global
+   * per-sender window managed by {@link SpamFilter}). A message is blocked
+   * if the sender exceeds the configured limit for **any** tag it carries.
+   *
+   * Returns `false` immediately when `config.tagRateLimits` is empty so
+   * there is zero overhead on nodes that have not configured per-tag limits.
+   *
+   * @param senderHex - Hex-encoded public key of the message sender.
+   * @param tags      - Tags carried by the incoming message.
+   * @returns `true` if the message should be blocked due to a tag rate limit.
+   */
+  private isTagRateLimited(senderHex: string, tags: string[]): boolean {
+    const limits = this.config.tagRateLimits;
+    const now = Date.now();
+    const windowMs = 60_000;
+    const cutoff = now - windowMs;
+
+    // Two-pass: verify all tags pass first, then record timestamps.
+    // Prevents phantom counts when tag A passes but tag B rejects.
+    const pendingRecords: Array<{ timestamps: number[] }> = [];
+
+    for (const tag of tags) {
+      const limit = limits[tag];
+      if (limit === undefined) continue;
+
+      let senderMap = this.tagRateWindows.get(tag);
+      if (!senderMap) {
+        senderMap = new Map<string, number[]>();
+        this.tagRateWindows.set(tag, senderMap);
+      }
+
+      let timestamps = senderMap.get(senderHex);
+      if (!timestamps) {
+        timestamps = [];
+        senderMap.set(senderHex, timestamps);
+      }
+
+      // Prune expired entries
+      let lo = 0;
+      let hi = timestamps.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if ((timestamps[mid] as number) < cutoff) lo = mid + 1;
+        else hi = mid;
+      }
+      if (lo > 0) timestamps.splice(0, lo);
+
+      // Clean up empty entries to prevent unbounded growth
+      if (timestamps.length === 0) {
+        senderMap.delete(senderHex);
+        if (senderMap.size === 0) this.tagRateWindows.delete(tag);
+        continue;
+      }
+
+      if (timestamps.length >= limit) {
+        return true; // Would exceed — reject without recording
+      }
+
+      pendingRecords.push({ timestamps });
+    }
+
+    // All tags passed — now record
+    for (const { timestamps } of pendingRecords) {
+      timestamps.push(now);
+    }
+
+    return false;
   }
 }

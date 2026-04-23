@@ -77,6 +77,34 @@ export interface DiscoveryQuery {
 
   /** Maximum number of results to return. Unlimited when omitted. */
   limit?: number;
+
+  /**
+   * Tags to exclude from results.
+   *
+   * A descriptor is excluded when it carries **any** of these tags. This
+   * allows callers to hide deprecated, internal, or unwanted service
+   * categories without post-filtering the results.
+   *
+   * @example
+   * // Exclude any services tagged as 'internal' or 'deprecated'
+   * { excludeTags: ['internal', 'deprecated'] }
+   */
+  excludeTags?: string[];
+
+  /**
+   * Metadata keys that must be present on a descriptor for it to be
+   * included in results.
+   *
+   * A descriptor is only returned when **all** of the listed keys exist in
+   * its {@link ServiceDescriptor.metadata} map (values are not checked, only
+   * key presence). This is useful for filtering to services that expose
+   * specific capability signals via metadata.
+   *
+   * @example
+   * // Only return services that declare an 'endpoint' and 'version'
+   * { requiredMetadataKeys: ['endpoint', 'version'] }
+   */
+  requiredMetadataKeys?: string[];
 }
 
 /**
@@ -300,11 +328,15 @@ export class ServiceRegistry {
    * @returns Matching {@link ServiceDescriptor} records, up to `limit` entries.
    */
   query(query: DiscoveryQuery): ServiceDescriptor[] {
-    const { tags, name, limit } = query;
+    const { tags, name, limit, excludeTags, requiredMetadataKeys } = query;
 
     // Normalise tag set for O(1) membership tests.
     const tagSet = tags && tags.length > 0 ? new Set(tags) : null;
     const nameLower = name !== undefined ? name.toLowerCase() : null;
+    const excludeSet = excludeTags && excludeTags.length > 0 ? new Set(excludeTags) : null;
+    const requiredKeys = requiredMetadataKeys && requiredMetadataKeys.length > 0
+      ? requiredMetadataKeys
+      : null;
 
     // Short-circuit on zero or negative limit
     if (limit !== undefined && limit <= 0) return [];
@@ -322,6 +354,12 @@ export class ServiceRegistry {
       if (nameLower !== null) {
         if (!descriptor.name.toLowerCase().includes(nameLower)) continue;
       }
+
+      // Exclude filter: skip descriptors that carry any of the excluded tags.
+      if (excludeSet !== null && descriptor.tags.some((t) => excludeSet.has(t))) continue;
+
+      // Required metadata keys: skip descriptors missing any required key.
+      if (requiredKeys !== null && !requiredKeys.every((k) => k in descriptor.metadata)) continue;
 
       results.push(descriptor);
 

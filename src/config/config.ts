@@ -125,6 +125,19 @@ export interface MagicConfig {
    * @defaultValue 100
    */
   maxConnections: number;
+
+  /**
+   * Per-tag message rate limits (messages per minute per sender).
+   *
+   * Tags not listed here use the global {@link rateLimitPerMinute} value.
+   * When a sender exceeds the per-tag limit for any tag carried by an
+   * inbound message, the message is dropped before the global check runs.
+   *
+   * Example: `{ 'system:alert': 500, 'chat:general': 30 }`
+   *
+   * @defaultValue {} (empty — all tags use the global limit)
+   */
+  tagRateLimits: Record<string, number>;
 }
 
 export const DEFAULT_CONFIG: MagicConfig = {
@@ -148,6 +161,7 @@ export const DEFAULT_CONFIG: MagicConfig = {
   healthCheckPort: 0,
   enableMdns: false,
   maxConnections: 100,
+  tagRateLimits: {},
 };
 
 export function mergeConfig(partial: Partial<MagicConfig>): MagicConfig {

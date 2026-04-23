@@ -5,6 +5,27 @@
  * All unknown senders are blocked unless explicitly allowed.
  */
 
+/**
+ * Graduated trust levels for peer agents.
+ *
+ * Levels are ordered from most-restrictive to most-permissive:
+ * - `BLOCKED`     — messages from this agent are always rejected.
+ * - `UNTRUSTED`   — agent is not on any allow-list; messages rejected by default.
+ * - `CAUTIOUS`    — agent is allowed but subject to tag restrictions.
+ * - `ALLOWED`     — agent is fully allowed (agent-level whitelist).
+ * - `WHITELISTED` — highest trust; agent is allowed with explicit recognition.
+ */
+export const TrustLevel = {
+  BLOCKED: 0,
+  UNTRUSTED: 1,
+  CAUTIOUS: 2,
+  ALLOWED: 3,
+  WHITELISTED: 4,
+} as const;
+
+/** Numeric type for {@link TrustLevel} values. */
+export type TrustLevelValue = (typeof TrustLevel)[keyof typeof TrustLevel];
+
 /** Sliding window entry tracking message timestamps for rate limiting. */
 interface SenderWindow {
   timestamps: number[];
@@ -15,6 +36,7 @@ interface SenderWindow {
  *
  * `allowed` reflects agent-level whitelist state. `blocked` overrides it.
  * Tag maps are consulted only when an agent passes the agent-level check.
+ * `trustLevel` provides a graduated view of the same state for external consumers.
  */
 interface AgentPolicy {
   allowed: boolean;
@@ -22,6 +44,8 @@ interface AgentPolicy {
   blockExpiry?: number;
   allowedTags: Set<string>;
   blockedTags: Set<string>;
+  /** Optional graduated trust level; undefined means legacy/unset. */
+  trustLevel?: TrustLevelValue;
 }
 
 /**
@@ -58,20 +82,25 @@ export class TrustPolicy {
   /**
    * Whitelist an agent.
    * Has no effect if the agent is also blocked — `blockAgent` always wins.
+   * Sets the trust level to {@link TrustLevel.ALLOWED}.
    */
   allowAgent(pubkeyHex: string): void {
-    this.#getOrCreate(pubkeyHex).allowed = true;
+    const policy = this.#getOrCreate(pubkeyHex);
+    policy.allowed = true;
+    policy.trustLevel = TrustLevel.ALLOWED;
   }
 
   /**
    * Blacklist an agent permanently.
    * Overrides any prior or future `allowAgent` call for the same key.
+   * Sets the trust level to {@link TrustLevel.BLOCKED}.
    */
   blockAgent(pubkeyHex: string): void {
     const policy = this.#getOrCreate(pubkeyHex);
     policy.blocked = true;
     policy.allowed = false;
     policy.blockExpiry = undefined;
+    policy.trustLevel = TrustLevel.BLOCKED;
   }
 
   /**
@@ -79,22 +108,101 @@ export class TrustPolicy {
    * After expiry, `isAllowed` treats the agent as unblocked.
    * Unlike permanent `blockAgent`, this preserves the prior `allowed` state
    * so that the agent's access is fully restored when the ban expires.
+   * Sets the trust level to {@link TrustLevel.BLOCKED}.
    */
   blockAgentUntil(pubkeyHex: string, expiresAt: number): void {
     const policy = this.#getOrCreate(pubkeyHex);
     policy.blocked = true;
     policy.blockExpiry = expiresAt;
+    policy.trustLevel = TrustLevel.BLOCKED;
   }
 
   /**
    * Remove a block from an agent, restoring them to deny-first default.
    * Does NOT automatically allow the agent — they must be re-allowed separately.
+   * Sets the trust level to {@link TrustLevel.UNTRUSTED}.
    */
   unblockAgent(pubkeyHex: string): void {
     const policy = this.#agents.get(pubkeyHex);
     if (policy) {
       policy.blocked = false;
       policy.blockExpiry = undefined;
+      policy.trustLevel = TrustLevel.UNTRUSTED;
+    }
+  }
+
+  /**
+   * Set the graduated trust level for an agent.
+   *
+   * Automatically updates the underlying `allowed` and `blocked` flags for
+   * backwards compatibility with callers that rely on the legacy boolean API:
+   * - `BLOCKED`     → blocked=true, allowed=false
+   * - `UNTRUSTED`   → blocked=false, allowed=false
+   * - `CAUTIOUS`    → blocked=false, allowed=true (agent may still have tag restrictions)
+   * - `ALLOWED`     → blocked=false, allowed=true
+   * - `WHITELISTED` → blocked=false, allowed=true
+   *
+   * @param pubkeyHex - Hex-encoded Ed25519 public key of the agent.
+   * @param level     - Desired trust level.
+   */
+  setTrustLevel(pubkeyHex: string, level: TrustLevelValue): void {
+    const policy = this.#getOrCreate(pubkeyHex);
+    policy.trustLevel = level;
+    switch (level) {
+      case TrustLevel.BLOCKED:
+        policy.blocked = true;
+        policy.allowed = false;
+        policy.blockExpiry = undefined;
+        break;
+      case TrustLevel.UNTRUSTED:
+        policy.blocked = false;
+        policy.allowed = false;
+        break;
+      case TrustLevel.CAUTIOUS:
+      case TrustLevel.ALLOWED:
+      case TrustLevel.WHITELISTED:
+        policy.blocked = false;
+        policy.allowed = true;
+        break;
+    }
+  }
+
+  /**
+   * Return the graduated trust level for an agent.
+   *
+   * If a trust level was explicitly set via {@link setTrustLevel} or one of
+   * the update methods, that value is returned. Otherwise the level is inferred
+   * from the legacy `blocked`/`allowed` flags:
+   * - blocked=true  → `BLOCKED`
+   * - allowed=true  → `ALLOWED`
+   * - otherwise     → `UNTRUSTED`
+   *
+   * @param pubkeyHex - Hex-encoded Ed25519 public key.
+   * @returns The current {@link TrustLevelValue}.
+   */
+  getTrustLevel(pubkeyHex: string): TrustLevelValue {
+    const policy = this.#agents.get(pubkeyHex);
+    if (policy === undefined) return TrustLevel.UNTRUSTED;
+    if (policy.trustLevel !== undefined) return policy.trustLevel;
+    // Legacy inference
+    if (policy.blocked) return TrustLevel.BLOCKED;
+    if (policy.allowed) return TrustLevel.ALLOWED;
+    return TrustLevel.UNTRUSTED;
+  }
+
+  /**
+   * Return a human-readable name for a {@link TrustLevelValue}.
+   *
+   * @param level - A numeric trust level value.
+   * @returns One of `'blocked'`, `'untrusted'`, `'cautious'`, `'allowed'`, or `'whitelisted'`.
+   */
+  getTrustLevelName(level: TrustLevelValue): 'blocked' | 'untrusted' | 'cautious' | 'allowed' | 'whitelisted' {
+    switch (level) {
+      case TrustLevel.BLOCKED:     return 'blocked';
+      case TrustLevel.UNTRUSTED:   return 'untrusted';
+      case TrustLevel.CAUTIOUS:    return 'cautious';
+      case TrustLevel.ALLOWED:     return 'allowed';
+      case TrustLevel.WHITELISTED: return 'whitelisted';
     }
   }
 
