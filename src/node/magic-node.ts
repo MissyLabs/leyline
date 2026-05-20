@@ -493,7 +493,7 @@ export class MagicNode {
     if (this.config.seedNodes.length > 0 && !this.config.isSeedNode) {
       this.seedMonitorTimer = setInterval(() => {
         this.checkSeedConnectivity();
-      }, 15_000);
+      }, 60_000);
     }
 
     const fingerprint = getFingerprint(this.publicKey);
@@ -1083,30 +1083,45 @@ export class MagicNode {
       const reason = 'No peers connected — operating in degraded mode (messages will be queued locally)';
       this.log.warn(reason);
       this.events.onDegraded?.(reason);
-
-      // Attempt manual re-dial to seeds
-      this.redialSeeds();
     } else if (totalPeers > 0 && this.degraded) {
       this.degraded = false;
       this.log.info('Seed connectivity restored — recovered from degraded mode');
       this.events.onRecovered?.();
     }
+
+    // Always re-dial disconnected seeds — not just when fully isolated.
+    // libp2p's bootstrap only runs at startup; without this, seed connections
+    // lost to network blips, idle timeouts, or seed restarts are never restored.
+    this.redialDisconnectedSeeds(connectedPeerIds);
   }
 
-  private redialSeeds(): void {
+  private redialDisconnectedSeeds(connectedPeerIds: Set<string>): void {
     if (!this.libp2p || this.stopping) return;
 
     import('@multiformats/multiaddr').then(({ multiaddr }) => {
       for (const seedAddr of this.config.seedNodes) {
         if (!this.libp2p || this.stopping) return;
+
+        // Extract peer ID from the multiaddr /p2p/ suffix
+        const peerIdMatch = seedAddr.match(/\/p2p\/(12D3KooW\w+)$/);
+        if (!peerIdMatch) continue;
+        const seedPeerId = peerIdMatch[1];
+
+        // Skip if already connected
+        if (connectedPeerIds.has(seedPeerId)) continue;
+
+        // Skip if circuit breaker is open (avoid hammering unreachable seeds)
+        if (this.circuitBreaker?.isOpen(seedPeerId)) continue;
+
         this.libp2p.dial(multiaddr(seedAddr)).then(() => {
-          this.log.info('Re-dial succeeded', { seedAddr });
+          this.log.info('Reconnected to seed', { seed: seedPeerId.slice(0, 16) });
+          this.circuitBreaker?.recordSuccess(seedPeerId);
         }).catch(() => {
-          // Expected — seed may still be unreachable
+          this.circuitBreaker?.recordFailure(seedPeerId);
         });
       }
     }).catch((err) => {
-      this.log.warn('multiaddr import failed in redialSeeds', { error: String(err) });
+      this.log.warn('multiaddr import failed in redialDisconnectedSeeds', { error: String(err) });
     });
   }
 
