@@ -728,6 +728,13 @@ export class MagicNode {
    * Like `onTagQueued`, but messages are processed in priority order.
    * The `assignPriority` callback classifies each message. Lower number = higher precedence.
    * When the queue is full, lowest-priority messages are dropped first.
+   *
+   * Scheduling contract: this is a *greedy online* priority queue. A message
+   * begins processing immediately when the queue is idle; only messages already
+   * waiting in the queue at pop time are ordered by priority. Processing is
+   * never delayed to coalesce with future arrivals, and an in-flight handler is
+   * never preempted — so a lower-priority message that arrives while the queue
+   * is idle can start before a higher-priority message that arrives later.
    */
   onTagPriority(
     tag: string,
