@@ -37,14 +37,27 @@ export interface PeerChainQuerier {
  * over `confirm:{hash}`, every entry's submitter signature is checked, and every
  * entry's hash is recomputed locally rather than trusted.
  */
+/** Upper bound on confirmer entries examined per entry (DoS guard, SEC-1). */
+const MAX_CONFIRMERS_PER_ENTRY = 64;
+
 export class ForkResolver {
   private readonly ledger: SharedLedger;
   private readonly maxReorgDepth: number;
   private readonly log = new Logger('ForkResolver');
+  /**
+   * SEC-3: submitter authorization gate. When set, a peer suffix is refused if
+   * ANY entry's submitter is not authorized — a reorg must not smuggle in
+   * entries that ordinary ingest would reject.
+   */
+  private readonly isSubmitterAuthorized?: (submitterPubkeyHex: string) => boolean;
 
-  constructor(ledger: SharedLedger, opts?: { maxReorgDepth?: number }) {
+  constructor(
+    ledger: SharedLedger,
+    opts?: { maxReorgDepth?: number; isSubmitterAuthorized?: (submitterPubkeyHex: string) => boolean },
+  ) {
     this.ledger = ledger;
     this.maxReorgDepth = opts?.maxReorgDepth ?? 50;
+    this.isSubmitterAuthorized = opts?.isSubmitterAuthorized;
   }
 
   async detectFork(peer: PeerChainQuerier): Promise<ForkInfo | null> {
@@ -165,18 +178,65 @@ export class ForkResolver {
         return fork;
       }
 
+      // SEC-3: the reorg path bypasses LedgerSync's ordinary ingest gate, so
+      // enforce the submitter allow-list over the ENTIRE suffix here, before
+      // any rollback. If any entry's submitter is not authorized, refuse — a
+      // chain with unauthorized submitters must not enter via reorg.
+      if (this.isSubmitterAuthorized) {
+        for (const entry of peerSuffix) {
+          if (!this.isSubmitterAuthorized(toHex(entry.submitterPubkey))) {
+            this.log.warn('Peer chain contains unauthorized submitter — refusing reorg', {
+              divergenceIndex: fork.divergenceIndex,
+              submitter: toHex(entry.submitterPubkey).slice(0, 16),
+            });
+            fork.winner = 'local';
+            fork.resolved = true;
+            return fork;
+          }
+        }
+      }
+
       await this.ledger.rollbackTo(fork.divergenceIndex - 1);
 
+      // SEC-1/adoption: import each peer entry VERBATIM (index, timestamp,
+      // prevHash, hash, signature preserved) so the adopted local head hash
+      // equals the peer head hash. Re-timestamping/re-hashing here (as submit()
+      // does) would produce a different hash and leave the peer perpetually
+      // "forked" against us.
       for (const entry of peerSuffix) {
-        await this.ledger.submit(entry.data, entry.submitterPubkey, entry.signature);
         const sigs = entry.confirmerSignatures ?? [];
-        for (let i = 0; i < entry.confirmerPubkeys.length; i++) {
+        const keptPubkeys: Uint8Array[] = [];
+        const keptSigs: Uint8Array[] = [];
+        const seen = new Set<string>();
+        const n = Math.min(entry.confirmerPubkeys.length, MAX_CONFIRMERS_PER_ENTRY);
+        for (let i = 0; i < n; i++) {
           const sig = sigs[i];
-          // Only replay confirmations we can verify — drop unproven ones.
           if (!sig || sig.length === 0) continue;
+          const pkHex = toHex(entry.confirmerPubkeys[i]);
+          if (seen.has(pkHex)) continue;
+          // Only preserve confirmations we can verify against the true hash.
           if (!await verifyConfirmation(entry.hash, entry.confirmerPubkeys[i], sig)) continue;
-          await this.ledger.addConfirmation(entry.index, entry.confirmerPubkeys[i], sig);
+          seen.add(pkHex);
+          keptPubkeys.push(entry.confirmerPubkeys[i]);
+          keptSigs.push(sig);
         }
+        await this.ledger.appendValidated({
+          ...entry,
+          confirmerPubkeys: keptPubkeys,
+          confirmerSignatures: keptSigs,
+          confirmations: keptPubkeys.length,
+        });
+      }
+
+      // Adoption invariant: our head hash must now equal the peer head hash.
+      const peerHead = peerSuffix[peerSuffix.length - 1];
+      const localHead = await this.ledger.getLatest();
+      if (!localHead || toHex(localHead.hash) !== toHex(peerHead.hash)) {
+        this.log.error('Fork adoption did not converge to peer head hash', {
+          divergenceIndex: fork.divergenceIndex,
+          localHead: localHead ? toHex(localHead.hash).slice(0, 16) : 'none',
+          peerHead: toHex(peerHead.hash).slice(0, 16),
+        });
       }
 
       fork.resolved = true;
@@ -254,10 +314,22 @@ async function verifiedConfirmations(entries: SharedLedgerEntry[]): Promise<numb
     // attacker-signed confirmations.
     const trueHash = computeEntryHash(e);
     const sigs = e.confirmerSignatures ?? [];
-    for (let i = 0; i < e.confirmerPubkeys.length; i++) {
+    // SEC-1: deduplicate confirmers by pubkey so a repeated (key,sig) pair
+    // contributes weight 1, not N — otherwise a peer replays one valid key
+    // thousands of times to inflate confirmation weight and force a reorg.
+    // Cap the number of positions examined BEFORE doing signature work so a
+    // huge confirmer array can't burn CPU.
+    const seen = new Set<string>();
+    const n = Math.min(e.confirmerPubkeys.length, MAX_CONFIRMERS_PER_ENTRY);
+    for (let i = 0; i < n; i++) {
       const sig = sigs[i];
       if (!sig || sig.length === 0) continue;
-      if (await verifyConfirmation(trueHash, e.confirmerPubkeys[i], sig)) total++;
+      const pkHex = toHex(e.confirmerPubkeys[i]);
+      if (seen.has(pkHex)) continue;
+      if (await verifyConfirmation(trueHash, e.confirmerPubkeys[i], sig)) {
+        seen.add(pkHex);
+        total++;
+      }
     }
   }
   return total;

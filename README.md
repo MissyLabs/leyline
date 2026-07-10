@@ -410,7 +410,10 @@ node.isPaused()                              // Check if paused
 await node.submitToSharedLedger(data)        // Submit provable record
 const page = await node.getSharedLedger().queryPage({ submitterPubkeyHex, limit, after })  // Paginated, indexed query
 const proof = await node.getSharedLedger().getProof(index)     // Merkle-style inclusion proof
-SharedLedger.verifyProof(proof)              // Verify an inclusion proof (static)
+// Verify against an INDEPENDENTLY-TRUSTED head hash (and optional height).
+// Self-consistency alone proves nothing — an attacker can forge a proof whose
+// own latestHash matches its fabricated chain, so a trusted head is required.
+SharedLedger.verifyProof(proof, expectedLatestHash, expectedLatestIndex?)
 
 // --- Network state ---
 node.getPeerCount()                          // Connected peer count

@@ -310,6 +310,73 @@ export class SharedLedger {
     return entry;
   }
 
+  /**
+   * Append a fully-formed, externally-validated entry to the chain WITHOUT
+   * re-timestamping or re-hashing it (fork adoption path).
+   *
+   * Unlike {@link submit}, which mints a fresh timestamp + hash for a brand-new
+   * local entry, this preserves the peer entry's `index`, `timestamp`,
+   * `prevHash`, `hash`, `signature`, and (already-verified) confirmations
+   * verbatim, so the adopted local head hash equals the peer head hash. The
+   * caller is responsible for having validated the entry cryptographically
+   * (submitter signature, confirmer signatures, authorization) BEFORE calling.
+   *
+   * Enforces structural continuity: the entry must extend the current head
+   * (`index === currentIndex + 1`, `prevHash === latestHash`) and its `hash`
+   * must equal the locally-recomputed hash. Any mismatch throws so a bad
+   * adoption cannot silently corrupt the chain.
+   */
+  async appendValidated(entry: SharedLedgerEntry): Promise<SharedLedgerEntry> {
+    const prev = this.submitLock;
+    let resolve!: () => void;
+    this.submitLock = new Promise<void>((r) => { resolve = r; });
+
+    try {
+      await prev;
+      return await this.appendValidatedInner(entry);
+    } finally {
+      resolve();
+    }
+  }
+
+  private async appendValidatedInner(entry: SharedLedgerEntry): Promise<SharedLedgerEntry> {
+    const expectedIndex = this.currentIndex + 1;
+    if (entry.index !== expectedIndex) {
+      throw new Error(`appendValidated: index ${entry.index} does not extend head (expected ${expectedIndex})`);
+    }
+    if (toHex(entry.prevHash) !== toHex(this.latestHash)) {
+      throw new Error('appendValidated: prevHash does not match current head');
+    }
+    const recomputed = computeEntryHash(entry);
+    if (toHex(recomputed) !== toHex(entry.hash)) {
+      throw new Error('appendValidated: entry hash does not match recomputed hash');
+    }
+
+    const stored: SharedLedgerEntry = {
+      index: entry.index,
+      prevHash: entry.prevHash,
+      hash: entry.hash,
+      data: entry.data,
+      submitterPubkey: entry.submitterPubkey,
+      signature: entry.signature,
+      timestamp: entry.timestamp,
+      confirmations: entry.confirmerPubkeys.length,
+      confirmerPubkeys: entry.confirmerPubkeys,
+      confirmerSignatures: entry.confirmerSignatures ?? [],
+    };
+
+    await this.db.batch([
+      { type: 'put', key: `entry:${entry.index}`, value: serializeEntry(stored) },
+      { type: 'put', key: `idx:sub:${toHex(entry.submitterPubkey)}:${padIndex(entry.index)}`, value: '' },
+      { type: 'put', key: `idx:ts:${timeBucket(entry.timestamp)}:${padIndex(entry.index)}`, value: '' },
+      { type: 'put', key: 'meta:latest', value: JSON.stringify({ index: entry.index, hash: toHex(entry.hash) }) },
+    ]);
+    this.currentIndex = entry.index;
+    this.latestHash = entry.hash;
+
+    return stored;
+  }
+
   async getEntry(index: number): Promise<SharedLedgerEntry | null> {
     try {
       const raw = await this.db.get(`entry:${index}`);
@@ -469,15 +536,33 @@ export class SharedLedger {
   }
 
   /**
-   * Verify a {@link LedgerProof} produced by {@link getProof}. Recomputes each
-   * step's hash from its preimage fields, checks hash-chain linkage, and
-   * confirms the final hash matches `latestHash`. Returns false for any
-   * tampering or structural inconsistency.
+   * Verify a {@link LedgerProof} produced by {@link getProof} against an
+   * INDEPENDENTLY-TRUSTED chain head.
+   *
+   * Self-consistency alone is insufficient: an attacker can trivially fabricate
+   * a short chain and set `proof.latestHash` to its own computed head, so a
+   * proof that only checks internal linkage proves nothing about inclusion in
+   * the real ledger. The verifier MUST supply `expectedLatestHash` (and,
+   * recommended, `expectedLatestIndex`) obtained from a trusted source
+   * (a checkpoint, a quorum of peers, the verifier's own head). The proof is
+   * accepted only when:
+   *   1. every step's hash recomputes from its preimage and the chain links,
+   *   2. the proof's declared head matches `expectedLatestHash`
+   *      (and `expectedLatestIndex` when provided).
+   *
+   * @param proof The inclusion proof to verify.
+   * @param expectedLatestHash Trusted head hash (hex) the proof must terminate at.
+   * @param expectedLatestIndex Optional trusted head index the proof must match.
    */
-  static verifyProof(proof: LedgerProof): boolean {
+  static verifyProof(proof: LedgerProof, expectedLatestHash: string, expectedLatestIndex?: number): boolean {
     if (!proof || !Array.isArray(proof.steps) || proof.steps.length === 0) return false;
+    if (typeof expectedLatestHash !== 'string' || expectedLatestHash.length === 0) return false;
     if (proof.steps[0].index !== proof.index) return false;
     if (proof.steps[proof.steps.length - 1].index !== proof.latestIndex) return false;
+
+    // Bind the proof to the trusted head BEFORE trusting its internal claims.
+    if (proof.latestHash !== expectedLatestHash) return false;
+    if (expectedLatestIndex !== undefined && proof.latestIndex !== expectedLatestIndex) return false;
 
     let expectedPrevHash: string | null = null;
     for (let i = 0; i < proof.steps.length; i++) {
@@ -496,7 +581,9 @@ export class SharedLedger {
       expectedPrevHash = step.hash;
     }
 
-    return proof.steps[proof.steps.length - 1].hash === proof.latestHash;
+    // Recomputed head must equal both the proof's declared head and the
+    // independently-trusted head (already checked equal above).
+    return proof.steps[proof.steps.length - 1].hash === expectedLatestHash;
   }
 
   /**

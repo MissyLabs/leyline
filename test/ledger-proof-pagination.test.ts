@@ -32,7 +32,8 @@ describe('SharedLedger — proof, pagination, submitter index (FEAT-1)', () => {
 
     const proof = await ledger.getProof(2);
     expect(proof).not.toBeNull();
-    expect(SharedLedger.verifyProof(proof!)).toBe(true);
+    const head = await ledger.getLatest();
+    expect(SharedLedger.verifyProof(proof!, Buffer.from(head!.hash).toString('hex'), 5)).toBe(true);
     expect(proof!.index).toBe(2);
     expect(proof!.latestIndex).toBe(5);
   });
@@ -43,17 +44,21 @@ describe('SharedLedger — proof, pagination, submitter index (FEAT-1)', () => {
 
     const proof = await ledger.getProof(1);
     expect(proof).not.toBeNull();
+    const head = await ledger.getLatest();
+    const trustedHead = Buffer.from(head!.hash).toString('hex');
     // Tamper with the target entry's data — the recomputed hash chain must break.
     proof!.steps[0].data = Buffer.from(enc.encode('forged')).toString('hex');
-    expect(SharedLedger.verifyProof(proof!)).toBe(false);
+    expect(SharedLedger.verifyProof(proof!, trustedHead)).toBe(false);
   });
 
   it('rejects a proof whose latestHash was swapped', async () => {
     const pk = new Uint8Array(32).fill(7);
     for (let i = 0; i < 3; i++) await submit(`e${i}`, pk);
     const proof = await ledger.getProof(1);
+    const head = await ledger.getLatest();
+    const trustedHead = Buffer.from(head!.hash).toString('hex');
     proof!.latestHash = 'deadbeef'.repeat(8);
-    expect(SharedLedger.verifyProof(proof!)).toBe(false);
+    expect(SharedLedger.verifyProof(proof!, trustedHead)).toBe(false);
   });
 
   it('returns null for an out-of-range proof index', async () => {
@@ -112,6 +117,45 @@ describe('SharedLedger — proof, pagination, submitter index (FEAT-1)', () => {
     const sig = await sign(kp.privateKey, data);
     await ledger.submit(data, kp.publicKey, sig);
     const proof = await ledger.getProof(1);
-    expect(SharedLedger.verifyProof(proof!)).toBe(true);
+    const head = await ledger.getLatest();
+    expect(SharedLedger.verifyProof(proof!, Buffer.from(head!.hash).toString('hex'), 1)).toBe(true);
+  });
+
+  // FINDING 4: verifyProof must NOT trust the proof's own head. A fabricated
+  // self-consistent proof (whose latestHash matches its own forged chain) must
+  // fail when checked against the real trusted head; a genuine proof passes.
+  it('rejects a self-consistent forged proof against the real trusted head', async () => {
+    const pk = new Uint8Array(32).fill(7);
+    for (let i = 0; i < 3; i++) await submit(`real-${i}`, pk); // real chain, 3 entries
+    const trustedHead = Buffer.from((await ledger.getLatest())!.hash).toString('hex');
+
+    // Attacker fabricates an entirely different one-step chain and sets its
+    // latestHash to its OWN computed hash — internally consistent but bogus.
+    const forgedLedgerDir = await mkdtemp(join(tmpdir(), 'ledger-forge-'));
+    const forged = new SharedLedger(forgedLedgerDir);
+    await forged.open();
+    await forged.submit(enc.encode('attacker-controlled'), new Uint8Array(32).fill(42), new Uint8Array(64).fill(1));
+    const forgedProof = await forged.getProof(1);
+    await forged.close();
+    await rm(forgedLedgerDir, { recursive: true, force: true });
+
+    // The forged proof is internally self-consistent...
+    expect(forgedProof!.latestHash).toBe(forgedProof!.steps[forgedProof!.steps.length - 1].hash);
+    // ...but MUST fail against the real trusted head.
+    expect(SharedLedger.verifyProof(forgedProof!, trustedHead)).toBe(false);
+
+    // A genuine proof from the real ledger still verifies against that head.
+    const genuine = await ledger.getProof(1);
+    expect(SharedLedger.verifyProof(genuine!, trustedHead)).toBe(true);
+  });
+
+  it('rejects a genuine proof when checked against a mismatched trusted height', async () => {
+    const pk = new Uint8Array(32).fill(7);
+    for (let i = 0; i < 4; i++) await submit(`e${i}`, pk);
+    const proof = await ledger.getProof(2);
+    const trustedHead = Buffer.from((await ledger.getLatest())!.hash).toString('hex');
+    // Correct head hash but wrong expected height → reject.
+    expect(SharedLedger.verifyProof(proof!, trustedHead, 99)).toBe(false);
+    expect(SharedLedger.verifyProof(proof!, trustedHead, 4)).toBe(true);
   });
 });

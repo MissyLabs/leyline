@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { Libp2p } from 'libp2p';
 import type { Stream } from '@libp2p/interface';
 import { pipe } from 'it-pipe';
@@ -185,6 +186,15 @@ export class LedgerSync {
   private readonly ingestTimestamps = new Map<string, number[]>();
   private readonly maxIngestPerMinute: number;
 
+  /**
+   * Recently-charged distinct entry identities → last-seen ms (SEC-3 replay
+   * guard). An entry we've already charged a budget slot for must NOT be
+   * charged again when replayed, otherwise a peer replays one observed
+   * `(data,submitter,signature)` tuple to exhaust the submitter's whole
+   * per-minute budget without the submitter's key.
+   */
+  private readonly ingestSeen = new Map<string, number>();
+
   /** Cached peer chain lengths to avoid the O(log n) probe storm (RL-3). */
   private readonly peerChainLength = new Map<string, { count: number; at: number }>();
   private static readonly PEER_LENGTH_TTL_MS = 30_000;
@@ -220,7 +230,11 @@ export class LedgerSync {
     this.shutdownSignal = opts.shutdownSignal;
     this.isSubmitterAuthorized = opts.isSubmitterAuthorized;
     this.maxIngestPerMinute = opts.maxIngestPerMinute ?? 30;
-    this.forkResolver = new ForkResolver(ledger);
+    // SEC-3: the fork-resolution path must enforce the same submitter allow-list
+    // as ordinary ingest, or a reorg could smuggle in unauthorized entries.
+    this.forkResolver = new ForkResolver(ledger, {
+      isSubmitterAuthorized: this.isSubmitterAuthorized,
+    });
   }
 
   /**
@@ -228,7 +242,7 @@ export class LedgerSync {
    * enforces the optional submitter authorization allow-list and a per-submitter
    * ingest rate limit. Returns true if the entry may proceed.
    */
-  private admitSubmitter(submitterPubkeyHex: string): boolean {
+  private admitSubmitter(submitterPubkeyHex: string, entryIdentity: string): boolean {
     if (this.isSubmitterAuthorized && !this.isSubmitterAuthorized(submitterPubkeyHex)) {
       this.log.warn('Rejected ledger entry from unauthorized submitter', { submitter: submitterPubkeyHex.slice(0, 16) });
       return false;
@@ -236,6 +250,17 @@ export class LedgerSync {
     if (this.maxIngestPerMinute > 0) {
       const now = Date.now();
       const cutoff = now - 60_000;
+
+      // Replay dedup (SEC-3): if we've already charged a budget slot for this
+      // exact entry within the window, admit it WITHOUT charging again. Only a
+      // genuinely new entry consumes budget, so replaying an observed entry
+      // cannot starve the submitter's next legitimate entry.
+      const lastSeen = this.ingestSeen.get(entryIdentity);
+      if (lastSeen !== undefined && lastSeen >= cutoff) {
+        this.ingestSeen.set(entryIdentity, now);
+        return true;
+      }
+
       let ts = this.ingestTimestamps.get(submitterPubkeyHex);
       if (!ts) { ts = []; this.ingestTimestamps.set(submitterPubkeyHex, ts); }
       while (ts.length > 0 && ts[0] < cutoff) ts.shift();
@@ -243,15 +268,35 @@ export class LedgerSync {
         this.log.warn('Rate-limited ledger ingest for submitter', { submitter: submitterPubkeyHex.slice(0, 16) });
         return false;
       }
+      // Charge the budget only now that we know this is a genuinely new entry.
       ts.push(now);
-      // Bound memory: drop empty/cold submitter windows occasionally.
+      this.ingestSeen.set(entryIdentity, now);
+      // Bound memory: drop empty/cold submitter windows and stale dedup keys.
       if (this.ingestTimestamps.size > 5_000) {
         for (const [k, v] of this.ingestTimestamps) {
           if (v.length === 0 || v[v.length - 1] <= cutoff) this.ingestTimestamps.delete(k);
         }
       }
+      if (this.ingestSeen.size > 10_000) {
+        for (const [k, seenAt] of this.ingestSeen) {
+          if (seenAt < cutoff) this.ingestSeen.delete(k);
+        }
+      }
     }
     return true;
+  }
+
+  /**
+   * Stable identity for a received entry, independent of its ledger position:
+   * a hash over the submitter, signature, and data. Used to deduplicate ingest
+   * replays (SEC-3) so a replayed entry consumes at most one budget slot.
+   */
+  private static entryIdentity(entry: SharedLedgerEntry): string {
+    return createHash('sha256')
+      .update(entry.submitterPubkey)
+      .update(entry.signature)
+      .update(entry.data)
+      .digest('hex');
   }
 
   async start(): Promise<void> {
@@ -295,6 +340,7 @@ export class LedgerSync {
     this.consensus.pruneExpired();
     this.peerChainLength.clear();
     this.ingestTimestamps.clear();
+    this.ingestSeen.clear();
     this.streamGate.clear();
     await this.libp2p.unhandle(LEDGER_SYNC_PROTOCOL);
   }
@@ -436,6 +482,19 @@ export class LedgerSync {
                   !confirm.confirmationSignature || confirm.confirmationSignature.length !== 128) {
                 continue;
               }
+              // Bind the confirmation to the entry WE pushed. A peer may sign any
+              // valid `confirm:{hash}` and claim any index; without this check a
+              // signature-valid confirmation would be stored against the wrong
+              // local entry (where it will never verify). Require an exact match
+              // to the pushed entry's index AND hash.
+              // Bind the confirmation to the entry WE pushed. A peer may sign any
+              // valid `confirm:{hash}` and claim any index; without this check a
+              // signature-valid confirmation would be stored against the wrong
+              // local entry (where it will never verify). Require an exact match
+              // to the pushed entry's index AND hash.
+              if (confirm.entryIndex !== entry.index || confirm.entryHash !== toHex(entry.hash)) {
+                continue;
+              }
               const confirmData = new TextEncoder().encode(`confirm:${confirm.entryHash}`);
               let sigValid = false;
               try {
@@ -507,7 +566,7 @@ export class LedgerSync {
     let ingested = 0;
     for (const entry of entries) {
       const valid = await this.validateReceivedEntry(entry);
-      if (valid && this.admitSubmitter(toHex(entry.submitterPubkey))) {
+      if (valid && this.admitSubmitter(toHex(entry.submitterPubkey), LedgerSync.entryIdentity(entry))) {
         const committed = await this.proposeAndMaybeCommit(
           entry.data,
           entry.submitterPubkey,
@@ -740,7 +799,7 @@ export class LedgerSync {
                 const push = syncMsg as PushEntry;
                 const entry = deserializeEntry(push.entry);
                 const valid = await self.validateReceivedEntry(entry);
-                const authorized = valid && self.admitSubmitter(toHex(entry.submitterPubkey));
+                const authorized = valid && self.admitSubmitter(toHex(entry.submitterPubkey), LedgerSync.entryIdentity(entry));
                 self.log.info('Received push-entry', { index: entry.index, valid, authorized, peer: push.senderPeerId.slice(0, 16) });
 
                 if (valid && authorized) {
