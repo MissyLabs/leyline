@@ -64,35 +64,51 @@ describe('MagicNode — onTagPriority', () => {
   it('processes messages in priority order', async () => {
     const order: number[] = [];
 
+    // `onTagPriority` is a greedy online priority queue: the first message is
+    // dequeued immediately when the queue is idle, and the drain loop pops
+    // whatever is *already waiting* in priority order — it does not delay
+    // processing to coalesce future arrivals. A previous version of this test
+    // relied on all four messages happening to enqueue within the first
+    // handler's 10ms sleep, which is a race (issue #12): on slower machines the
+    // drain loop could pop a partially-filled queue and process the tail out of
+    // priority order. We instead hold the FIRST handler invocation open with an
+    // explicit gate so the remaining messages are provably enqueued before the
+    // drain loop continues — making the ordering guarantee deterministic.
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((r) => { releaseFirst = r; });
+    let firstCall = true;
+
     node.onTagPriority(
       'prio-test',
       async (msg) => {
         order.push(msg.payload[0]);
-        await new Promise(r => setTimeout(r, 10));
+        if (firstCall) {
+          firstCall = false;
+          await firstGate; // keep the drain loop parked until the rest enqueue
+        }
       },
       (msg) => msg.payload[0] as MessagePriority,
       20,
     );
 
-    // Send messages with different priorities encoded in payload[0]
-    // 3=LOW, 2=NORMAL, 0=CRITICAL, 1=HIGH
+    // Send messages with different priorities encoded in payload[0].
+    // 3=LOW, 2=NORMAL, 0=CRITICAL, 1=HIGH. The first (3) is popped immediately
+    // (queue idle); 2/0/1 queue up behind the parked first handler because
+    // drain() is fire-and-forget, so each processMessage() resolves after enqueue.
     const priorities = [3, 2, 0, 1];
     for (const p of priorities) {
       const data = await makeMsg(new Uint8Array([p]));
       await node.processMessage('magic/tag/prio-test', data);
     }
 
-    await new Promise(r => setTimeout(r, 300));
+    // All of 2/0/1 are now waiting in the queue; let the drain loop proceed.
+    releaseFirst();
+    await new Promise(r => setTimeout(r, 100));
 
-    // First message (3) was dequeued immediately since queue was idle.
-    // Remaining should be processed in priority order: 0, 1, 2.
+    // First message (3) was dequeued immediately since the queue was idle.
+    // The remaining waiting messages drain in strict priority order: 0, 1, 2.
     expect(order[0]).toBe(3);
-    expect(order.slice(1).sort()).toEqual([0, 1, 2]);
-    // The priority-ordered portion
-    const prioritized = order.slice(1);
-    for (let i = 1; i < prioritized.length; i++) {
-      expect(prioritized[i]).toBeGreaterThanOrEqual(prioritized[i - 1]);
-    }
+    expect(order.slice(1)).toEqual([0, 1, 2]);
   });
 
   it('drops lowest priority when queue is full', async () => {
