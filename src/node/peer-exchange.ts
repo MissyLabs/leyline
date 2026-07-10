@@ -4,6 +4,7 @@ import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { sign as edSign, verify as edVerify, hexToPublicKey } from '../identity/keypair.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { StreamGate } from '../utils/stream-gate.js';
 import type { PeerReputation } from '../trust/peer-reputation.js';
 import { Logger } from '../utils/logger.js';
 
@@ -101,6 +102,8 @@ export class PeerExchange {
   /** Optional peer reputation tracker for weighted selection. */
   private reputation?: PeerReputation;
   private readonly log = new Logger('PeerExchange');
+  /** Per-peer inbound stream concurrency cap (RL-4). */
+  private readonly streamGate = new StreamGate(32);
   private readonly shutdownSignal?: AbortSignal;
   private circuitBreaker?: import('../utils/circuit-breaker.js').CircuitBreaker;
 
@@ -153,9 +156,18 @@ export class PeerExchange {
 
   /** Start the peer exchange protocol — register handler and begin periodic exchange. */
   async start(): Promise<void> {
-    // Register as a protocol handler
-    await this.libp2p.handle(PEER_EXCHANGE_PROTOCOL, async ({ stream }) => {
-      await this.handleIncoming(stream);
+    // Register as a protocol handler (per-peer stream cap, RL-4).
+    await this.libp2p.handle(PEER_EXCHANGE_PROTOCOL, async ({ stream, connection }) => {
+      const peerId = connection.remotePeer.toString();
+      if (!this.streamGate.tryAcquire(peerId)) {
+        try { stream.close(); } catch { /* already closed */ }
+        return;
+      }
+      try {
+        await this.handleIncoming(stream);
+      } finally {
+        this.streamGate.release(peerId);
+      }
     });
 
     // Start periodic exchange with adaptive backoff
@@ -168,6 +180,7 @@ export class PeerExchange {
       clearInterval(this.exchangeInterval);
       this.exchangeInterval = null;
     }
+    this.streamGate.clear();
     await this.libp2p.unhandle(PEER_EXCHANGE_PROTOCOL);
   }
 

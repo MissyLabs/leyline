@@ -310,6 +310,17 @@ export class LedgerConsensus {
    * Compute a deterministic content hash from data and submitter.
    * This hash is the same regardless of when or where the proposal was created,
    * enabling cross-node deduplication.
+   *
+   * DC-3 — DELIBERATE DESIGN CONSTRAINT: because the hash intentionally excludes
+   * the timestamp/nonce, two submissions with identical `data` from the same
+   * submitter collapse into a single proposal (and therefore a single committed
+   * ledger entry). This is required for cross-node dedup: it lets every node
+   * recognize the *same* logical entry proposed independently by different peers
+   * and converge on one committed record. The trade-off is that a submitter
+   * **cannot record the exact same payload twice** — submissions must be unique
+   * per submitter (e.g. embed a sequence number, timestamp, or nonce in `data`
+   * for repeated facts such as heartbeats). Adding the timestamp here would break
+   * convergence by turning each peer's copy into a distinct entry.
    */
   private computeContentHash(data: Uint8Array, submitterPubkey: Uint8Array): string {
     const hasher = createHash('sha256');

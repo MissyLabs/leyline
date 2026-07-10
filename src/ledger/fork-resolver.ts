@@ -1,4 +1,5 @@
-import type { SharedLedger, SharedLedgerEntry } from './shared-ledger.js';
+import { SharedLedger, computeEntryHash, type SharedLedgerEntry } from './shared-ledger.js';
+import { verify } from '../identity/keypair.js';
 import { Logger } from '../utils/logger.js';
 
 function toHex(arr: Uint8Array): string {
@@ -26,9 +27,15 @@ export interface PeerChainQuerier {
  *
  * Resolution strategy (non-Byzantine, honest-majority assumption):
  * 1. Find the divergence point via binary search
- * 2. Compare total confirmations in the divergent suffix
- * 3. The chain with more confirmations wins; ties broken by length, then kept local
- * 4. If the peer wins, roll back local entries and replay the peer's chain
+ * 2. Compare total *cryptographically verified* confirmations in the divergent suffix
+ * 3. The chain with more verified confirmations wins; ties broken by length, then kept local
+ * 4. If the peer wins, the peer suffix is fully validated (submitter signatures +
+ *    recomputed hashes + continuity) before the local chain is rolled back and replaced.
+ *
+ * SEC-1: a peer can no longer force a reorg by inflating the bare `confirmations`
+ * count or serving fabricated entries — confirmations must be backed by signatures
+ * over `confirm:{hash}`, every entry's submitter signature is checked, and every
+ * entry's hash is recomputed locally rather than trusted.
  */
 export class ForkResolver {
   private readonly ledger: SharedLedger;
@@ -115,8 +122,9 @@ export class ForkResolver {
       return { ...fork, resolved: false, winner: 'none' };
     }
 
-    const localConfs = totalConfirmations(localSuffix);
-    const peerConfs = totalConfirmations(peerSuffix);
+    // Only count confirmations that are cryptographically proven (SEC-1).
+    const localConfs = await verifiedConfirmations(localSuffix);
+    const peerConfs = await verifiedConfirmations(peerSuffix);
 
     fork.localConfirmations = localConfs;
     fork.peerConfirmations = peerConfs;
@@ -145,12 +153,29 @@ export class ForkResolver {
         return fork;
       }
 
+      // SEC-1: verify every peer entry (recomputed hash + submitter signature)
+      // BEFORE mutating the local chain. A single bad entry aborts the reorg.
+      if (!await validatePeerSuffix(peerSuffix)) {
+        this.log.warn('Peer chain failed cryptographic validation — refusing reorg', {
+          divergenceIndex: fork.divergenceIndex,
+          peerEntries: peerSuffix.length,
+        });
+        fork.winner = 'local';
+        fork.resolved = true;
+        return fork;
+      }
+
       await this.ledger.rollbackTo(fork.divergenceIndex - 1);
 
       for (const entry of peerSuffix) {
         await this.ledger.submit(entry.data, entry.submitterPubkey, entry.signature);
-        for (const confirmer of entry.confirmerPubkeys) {
-          await this.ledger.addConfirmation(entry.index, confirmer);
+        const sigs = entry.confirmerSignatures ?? [];
+        for (let i = 0; i < entry.confirmerPubkeys.length; i++) {
+          const sig = sigs[i];
+          // Only replay confirmations we can verify — drop unproven ones.
+          if (!sig || sig.length === 0) continue;
+          if (!await verifyConfirmation(entry.hash, entry.confirmerPubkeys[i], sig)) continue;
+          await this.ledger.addConfirmation(entry.index, entry.confirmerPubkeys[i], sig);
         }
       }
 
@@ -206,12 +231,54 @@ export class ForkResolver {
   }
 }
 
-function totalConfirmations(entries: SharedLedgerEntry[]): number {
+/** Verify a confirmer signature over `confirm:{entryHash}`. */
+async function verifyConfirmation(entryHash: Uint8Array, confirmerPubkey: Uint8Array, signature: Uint8Array): Promise<boolean> {
+  const confirmData = new TextEncoder().encode(`confirm:${toHex(entryHash)}`);
+  try {
+    return await verify(confirmerPubkey, signature, confirmData);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Count only cryptographically-verified confirmations across a suffix.
+ * A confirmation counts only when its stored signature verifies against
+ * `confirm:{entryHash}` for the corresponding confirmer pubkey.
+ */
+async function verifiedConfirmations(entries: SharedLedgerEntry[]): Promise<number> {
   let total = 0;
   for (const e of entries) {
-    total += e.confirmations;
+    // Guard against a peer inflating the hash used for confirmation binding:
+    // recompute it locally so a fabricated `hash` can't be used to "validate"
+    // attacker-signed confirmations.
+    const trueHash = computeEntryHash(e);
+    const sigs = e.confirmerSignatures ?? [];
+    for (let i = 0; i < e.confirmerPubkeys.length; i++) {
+      const sig = sigs[i];
+      if (!sig || sig.length === 0) continue;
+      if (await verifyConfirmation(trueHash, e.confirmerPubkeys[i], sig)) total++;
+    }
   }
   return total;
+}
+
+/**
+ * Validate a peer suffix cryptographically: each entry's hash must match the
+ * locally-recomputed hash and the submitter signature must verify over `data`.
+ */
+async function validatePeerSuffix(entries: SharedLedgerEntry[]): Promise<boolean> {
+  for (const e of entries) {
+    if (toHex(computeEntryHash(e)) !== toHex(e.hash)) return false;
+    let sigOk = false;
+    try {
+      sigOk = await verify(e.submitterPubkey, e.signature, e.data);
+    } catch {
+      sigOk = false;
+    }
+    if (!sigOk) return false;
+  }
+  return true;
 }
 
 function validatePeerChainContinuity(entries: SharedLedgerEntry[], startIndex: number): boolean {

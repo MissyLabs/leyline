@@ -115,6 +115,36 @@ export interface MagicConfig {
   /** Port for the seed node HTTP health check endpoint. 0 to disable. */
   healthCheckPort: number;
 
+  /**
+   * Bind address for the health-check / metrics HTTP server (SEC-4).
+   * Defaults to `127.0.0.1` so operational metrics are not exposed publicly.
+   * Set to `0.0.0.0` only when a bearer token is configured or the port is
+   * firewalled.
+   * @defaultValue '127.0.0.1'
+   */
+  healthCheckBind: string;
+
+  /**
+   * Optional bearer token required for the `/metrics` and `/metrics/prometheus`
+   * endpoints (SEC-4). When set, requests must send
+   * `Authorization: Bearer <token>`. `/health` stays unauthenticated but minimal.
+   */
+  healthCheckAuthToken?: string;
+
+  /**
+   * Optional allow-list of submitter public key hexes permitted to write to the
+   * shared ledger (SEC-3). When set, entries from other submitters are rejected
+   * on the sync/ingest path. When omitted, the ledger is open (default).
+   */
+  ledgerSubmitterAllowlist?: string[];
+
+  /**
+   * Max distinct ledger entries accepted per submitter per minute on the
+   * sync/ingest path (SEC-3). Set to 0 to disable.
+   * @defaultValue 30
+   */
+  ledgerMaxIngestPerMinute: number;
+
   /** Enable mDNS for automatic local network peer discovery. */
   enableMdns: boolean;
 
@@ -159,6 +189,8 @@ export const DEFAULT_CONFIG: MagicConfig = {
   enableRelay: true,
   webSocketPort: 9877,
   healthCheckPort: 0,
+  healthCheckBind: '127.0.0.1',
+  ledgerMaxIngestPerMinute: 30,
   enableMdns: false,
   maxConnections: 100,
   tagRateLimits: {},

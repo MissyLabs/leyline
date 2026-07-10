@@ -2,11 +2,13 @@ import type { Libp2p } from 'libp2p';
 import type { Stream } from '@libp2p/interface';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
-import { SharedLedger, type SharedLedgerEntry } from './shared-ledger.js';
+import { SharedLedger, type SharedLedgerEntry, type LedgerProof } from './shared-ledger.js';
 import { LedgerConsensus } from './consensus.js';
 import { ForkResolver, type PeerChainQuerier } from './fork-resolver.js';
 import { sign, verify, publicKeyToHex } from '../identity/keypair.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { StreamGate } from '../utils/stream-gate.js';
+import { jitteredPeriod } from '../utils/jitter.js';
 import { Logger } from '../utils/logger.js';
 
 /**
@@ -23,7 +25,7 @@ import { Logger } from '../utils/logger.js';
 
 export const LEDGER_SYNC_PROTOCOL = '/leyline/ledger-sync/1.0.0';
 
-type SyncMessageType = 'range-request' | 'range-response' | 'push-entry' | 'confirm-entry';
+type SyncMessageType = 'range-request' | 'range-response' | 'push-entry' | 'confirm-entry' | 'proof-request' | 'proof-response';
 
 interface SyncMessage {
   type: SyncMessageType;
@@ -56,6 +58,16 @@ interface ConfirmEntry extends SyncMessage {
   confirmationSignature: string; // hex — Ed25519 sig over "confirm:{entryHash}"
 }
 
+interface ProofRequest extends SyncMessage {
+  type: 'proof-request';
+  entryIndex: number;
+}
+
+interface ProofResponse extends SyncMessage {
+  type: 'proof-response';
+  proof: LedgerProof | null;
+}
+
 /** JSON-safe entry for wire transfer */
 interface SerializedEntry {
   index: number;
@@ -67,9 +79,10 @@ interface SerializedEntry {
   timestamp: number;
   confirmations: number;
   confirmerPubkeys: string[];
+  confirmerSignatures?: string[];
 }
 
-type AnySyncMessage = RangeRequest | RangeResponse | PushEntry | ConfirmEntry;
+type AnySyncMessage = RangeRequest | RangeResponse | PushEntry | ConfirmEntry | ProofRequest | ProofResponse;
 
 function toHex(arr: Uint8Array): string {
   return Buffer.from(arr).toString('hex');
@@ -90,6 +103,7 @@ function serializeEntry(entry: SharedLedgerEntry): SerializedEntry {
     timestamp: entry.timestamp,
     confirmations: entry.confirmations,
     confirmerPubkeys: entry.confirmerPubkeys.map(toHex),
+    confirmerSignatures: entry.confirmerSignatures.map(toHex),
   };
 }
 
@@ -104,6 +118,9 @@ function deserializeEntry(se: SerializedEntry): SharedLedgerEntry {
     timestamp: se.timestamp,
     confirmations: se.confirmations,
     confirmerPubkeys: se.confirmerPubkeys.map(fromHex),
+    confirmerSignatures: Array.isArray(se.confirmerSignatures)
+      ? se.confirmerSignatures.map(fromHex)
+      : [],
   };
 }
 
@@ -123,6 +140,9 @@ function decode(data: Uint8Array): AnySyncMessage {
     const ei = Number(parsed.endIndex);
     parsed.startIndex = Number.isFinite(si) ? Math.max(0, Math.floor(si)) : 0;
     parsed.endIndex = Number.isFinite(ei) ? Math.max(0, Math.floor(ei)) : 0;
+  } else if (parsed.type === 'proof-request') {
+    const ix = Number(parsed.entryIndex);
+    parsed.entryIndex = Number.isFinite(ix) ? Math.max(0, Math.floor(ix)) : 0;
   }
   return parsed;
 }
@@ -154,6 +174,24 @@ export class LedgerSync {
   /** How often to attempt sync with peers (60 seconds) */
   private syncIntervalMs: number;
 
+  /**
+   * Optional submitter authorization gate (SEC-3). When set, entries whose
+   * submitter is not authorized are rejected before proposal/commit. When
+   * absent, the ledger stays open (default network behavior).
+   */
+  private readonly isSubmitterAuthorized?: (submitterPubkeyHex: string) => boolean;
+
+  /** Per-submitter ingest rate limiting (SEC-3): submitterHex → timestamps. */
+  private readonly ingestTimestamps = new Map<string, number[]>();
+  private readonly maxIngestPerMinute: number;
+
+  /** Cached peer chain lengths to avoid the O(log n) probe storm (RL-3). */
+  private readonly peerChainLength = new Map<string, { count: number; at: number }>();
+  private static readonly PEER_LENGTH_TTL_MS = 30_000;
+
+  /** Per-peer inbound stream concurrency cap (RL-4). */
+  private readonly streamGate = new StreamGate(32);
+
   constructor(
     libp2p: Libp2p,
     ledger: SharedLedger,
@@ -164,6 +202,10 @@ export class LedgerSync {
       syncIntervalMs?: number;
       events?: LedgerSyncEvents;
       shutdownSignal?: AbortSignal;
+      /** Authorize which submitter pubkeys may write to the shared ledger. */
+      isSubmitterAuthorized?: (submitterPubkeyHex: string) => boolean;
+      /** Max distinct entries accepted per submitter per minute on ingest. Default 30. */
+      maxIngestPerMinute?: number;
     } = {},
   ) {
     this.libp2p = libp2p;
@@ -176,21 +218,63 @@ export class LedgerSync {
     this.syncIntervalMs = opts.syncIntervalMs ?? 60_000;
     this.events = opts.events ?? {};
     this.shutdownSignal = opts.shutdownSignal;
+    this.isSubmitterAuthorized = opts.isSubmitterAuthorized;
+    this.maxIngestPerMinute = opts.maxIngestPerMinute ?? 30;
     this.forkResolver = new ForkResolver(ledger);
+  }
+
+  /**
+   * Gate an entry before it is proposed/committed on ingest (SEC-3):
+   * enforces the optional submitter authorization allow-list and a per-submitter
+   * ingest rate limit. Returns true if the entry may proceed.
+   */
+  private admitSubmitter(submitterPubkeyHex: string): boolean {
+    if (this.isSubmitterAuthorized && !this.isSubmitterAuthorized(submitterPubkeyHex)) {
+      this.log.warn('Rejected ledger entry from unauthorized submitter', { submitter: submitterPubkeyHex.slice(0, 16) });
+      return false;
+    }
+    if (this.maxIngestPerMinute > 0) {
+      const now = Date.now();
+      const cutoff = now - 60_000;
+      let ts = this.ingestTimestamps.get(submitterPubkeyHex);
+      if (!ts) { ts = []; this.ingestTimestamps.set(submitterPubkeyHex, ts); }
+      while (ts.length > 0 && ts[0] < cutoff) ts.shift();
+      if (ts.length >= this.maxIngestPerMinute) {
+        this.log.warn('Rate-limited ledger ingest for submitter', { submitter: submitterPubkeyHex.slice(0, 16) });
+        return false;
+      }
+      ts.push(now);
+      // Bound memory: drop empty/cold submitter windows occasionally.
+      if (this.ingestTimestamps.size > 5_000) {
+        for (const [k, v] of this.ingestTimestamps) {
+          if (v.length === 0 || v[v.length - 1] <= cutoff) this.ingestTimestamps.delete(k);
+        }
+      }
+    }
+    return true;
   }
 
   async start(): Promise<void> {
     // Register protocol handler
-    await this.libp2p.handle(LEDGER_SYNC_PROTOCOL, async ({ stream }) => {
-      await this.handleIncoming(stream);
+    await this.libp2p.handle(LEDGER_SYNC_PROTOCOL, async ({ stream, connection }) => {
+      const peerId = connection.remotePeer.toString();
+      if (!this.streamGate.tryAcquire(peerId)) {
+        try { stream.close(); } catch { /* already closed */ }
+        return;
+      }
+      try {
+        await this.handleIncoming(stream);
+      } finally {
+        this.streamGate.release(peerId);
+      }
     });
 
-    // Start periodic sync
+    // Start periodic sync (jittered to avoid fleet-wide lockstep, SCH-3)
     this.syncInterval = setInterval(() => {
       this.syncWithAllPeers().catch((err) => {
         this.log.warn('Periodic sync failed', { error: String((err as Error)?.message ?? err) });
       });
-    }, this.syncIntervalMs);
+    }, jitteredPeriod(this.syncIntervalMs));
 
     // Periodically prune expired consensus proposals
     this.pruneInterval = setInterval(() => {
@@ -209,6 +293,9 @@ export class LedgerSync {
     }
     // Flush any orphaned pending proposals
     this.consensus.pruneExpired();
+    this.peerChainLength.clear();
+    this.ingestTimestamps.clear();
+    this.streamGate.clear();
     await this.libp2p.unhandle(LEDGER_SYNC_PROTOCOL);
   }
 
@@ -265,6 +352,52 @@ export class LedgerSync {
   }
 
   /**
+   * Request a hash-chain inclusion proof for `entryIndex` from a peer.
+   * Returns the {@link LedgerProof} (verifiable via `SharedLedger.verifyProof`)
+   * or null if the peer has no such entry / is unreachable (FEAT-1).
+   */
+  async requestProof(peerId: string, entryIndex: number): Promise<LedgerProof | null> {
+    const peerIdObj = this.libp2p.getPeers().find((p) => p.toString() === peerId);
+    if (!peerIdObj) return null;
+
+    let stream: Stream;
+    try {
+      stream = await this.libp2p.dialProtocol(peerIdObj, LEDGER_SYNC_PROTOCOL, { signal: this.shutdownSignal });
+    } catch {
+      return null;
+    }
+
+    const request: ProofRequest = {
+      type: 'proof-request',
+      senderPeerId: this.localPeerId,
+      timestamp: Date.now(),
+      entryIndex,
+    };
+
+    let proof: LedgerProof | null = null;
+    try {
+      await pipe(
+        [encode(request)],
+        (source) => lp.encode(source),
+        stream,
+        (source) => lp.decode(source),
+        async (source) => {
+          for await (const msg of withTimeout(source)) {
+            const response = decode(msg.subarray()) as ProofResponse;
+            if (response.type === 'proof-response') proof = response.proof ?? null;
+          }
+        },
+      );
+    } catch {
+      // Stream error or timeout
+    } finally {
+      try { stream.close(); } catch { /* already closed */ }
+    }
+
+    return proof;
+  }
+
+  /**
    * Push a new entry to a specific peer for their confirmation.
    */
   async pushEntry(peerId: string, entry: SharedLedgerEntry): Promise<void> {
@@ -310,7 +443,7 @@ export class LedgerSync {
               } catch { /* malformed */ }
               if (sigValid) {
                 await this.handleConfirmationForEntry(confirmerHex, confirm.entryIndex);
-                await this.ledger.addConfirmation(confirm.entryIndex, fromHex(confirmerHex));
+                await this.ledger.addConfirmation(confirm.entryIndex, fromHex(confirmerHex), fromHex(confirm.confirmationSignature));
                 this.events.onEntryConfirmed?.(confirm.entryIndex, confirmerHex);
               }
             }
@@ -374,7 +507,7 @@ export class LedgerSync {
     let ingested = 0;
     for (const entry of entries) {
       const valid = await this.validateReceivedEntry(entry);
-      if (valid) {
+      if (valid && this.admitSubmitter(toHex(entry.submitterPubkey))) {
         const committed = await this.proposeAndMaybeCommit(
           entry.data,
           entry.submitterPubkey,
@@ -390,6 +523,62 @@ export class LedgerSync {
     }
   }
 
+  /**
+   * Ask a peer for its chain length using the `totalEntries` field already
+   * present in every `range-response` (RL-3). Cached briefly to avoid a
+   * request storm when syncing against many peers each cycle.
+   */
+  private async requestPeerEntryCount(peerId: string): Promise<number> {
+    const cached = this.peerChainLength.get(peerId);
+    if (cached && Date.now() - cached.at < LedgerSync.PEER_LENGTH_TTL_MS) {
+      return cached.count;
+    }
+
+    const peerIdObj = this.libp2p.getPeers().find((p) => p.toString() === peerId);
+    if (!peerIdObj) return 0;
+
+    let stream: Stream;
+    try {
+      stream = await this.libp2p.dialProtocol(peerIdObj, LEDGER_SYNC_PROTOCOL, { signal: this.shutdownSignal });
+    } catch {
+      return cached?.count ?? 0;
+    }
+
+    const request: RangeRequest = {
+      type: 'range-request',
+      senderPeerId: this.localPeerId,
+      timestamp: Date.now(),
+      startIndex: 1,
+      endIndex: 1,
+    };
+
+    let total = 0;
+    try {
+      await pipe(
+        [encode(request)],
+        (source) => lp.encode(source),
+        stream,
+        (source) => lp.decode(source),
+        async (source) => {
+          for await (const msg of withTimeout(source)) {
+            const response = decode(msg.subarray()) as RangeResponse;
+            if (response.type === 'range-response') {
+              const t = Number(response.totalEntries);
+              total = Number.isFinite(t) && t >= 0 ? Math.floor(t) : 0;
+            }
+          }
+        },
+      );
+    } catch {
+      return cached?.count ?? 0;
+    } finally {
+      try { stream.close(); } catch { /* already closed */ }
+    }
+
+    this.peerChainLength.set(peerId, { count: total, at: Date.now() });
+    return total;
+  }
+
   private makePeerQuerier(peerId: string): PeerChainQuerier {
     const self = this;
     return {
@@ -402,20 +591,7 @@ export class LedgerSync {
         return self.requestRange(peerId, startIndex, endIndex);
       },
       async getEntryCount(): Promise<number> {
-        const probe = await self.requestRange(peerId, 1, 1);
-        if (probe.length === 0) return 0;
-        // Use a binary probe to estimate peer chain length
-        let low = 1, high = 100_000;
-        while (low < high) {
-          const mid = Math.floor((low + high + 1) / 2);
-          const check = await self.requestRange(peerId, mid, mid);
-          if (check.length > 0) {
-            low = mid;
-          } else {
-            high = mid - 1;
-          }
-        }
-        return low;
+        return self.requestPeerEntryCount(peerId);
       },
     };
   }
@@ -547,13 +723,27 @@ export class LedgerSync {
                 break;
               }
 
+              case 'proof-request': {
+                const preq = syncMsg as ProofRequest;
+                const proof = await self.ledger.getProof(preq.entryIndex);
+                const response: ProofResponse = {
+                  type: 'proof-response',
+                  senderPeerId: self.localPeerId,
+                  timestamp: Date.now(),
+                  proof,
+                };
+                yield encode(response);
+                break;
+              }
+
               case 'push-entry': {
                 const push = syncMsg as PushEntry;
                 const entry = deserializeEntry(push.entry);
                 const valid = await self.validateReceivedEntry(entry);
-                self.log.info('Received push-entry', { index: entry.index, valid, peer: push.senderPeerId.slice(0, 16) });
+                const authorized = valid && self.admitSubmitter(toHex(entry.submitterPubkey));
+                self.log.info('Received push-entry', { index: entry.index, valid, authorized, peer: push.senderPeerId.slice(0, 16) });
 
-                if (valid) {
+                if (valid && authorized) {
                   // Propose through consensus. The submitter signed the entry,
                   // which counts as their confirmation. Add both the submitter's
                   // AND our own confirmation to reach quorum.
@@ -621,6 +811,7 @@ export class LedgerSync {
                 await self.ledger.addConfirmation(
                   confirm.entryIndex,
                   fromHex(confirmerHex),
+                  fromHex(confirm.confirmationSignature),
                 );
                 self.events.onEntryConfirmed?.(confirm.entryIndex, confirmerHex);
                 break;

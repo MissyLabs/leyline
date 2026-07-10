@@ -7,6 +7,7 @@ import { MessageBuffer } from './message-buffer.js';
 import { InboxServer } from './inbox-protocol.js';
 import { publicKeyToHex, verify } from '../identity/keypair.js';
 import { HealthCheckServer } from './health-check.js';
+import { jitteredPeriod } from '../utils/jitter.js';
 import { Logger } from '../utils/logger.js';
 
 interface StoredPeer {
@@ -27,6 +28,10 @@ export class SeedNode extends MagicNode {
   private peerExchangeTimer: ReturnType<typeof setInterval> | null = null;
   private ledgerConfirmTimer: ReturnType<typeof setInterval> | null = null;
   private mirroredTopics = new Set<string>();
+  /** Per-peer count of topics this seed mirrored on that peer's behalf (SEC-6). */
+  private mirroredTopicsByPeer = new Map<string, number>();
+  /** Max topics a single peer may cause the seed to mirror (anti-starvation). */
+  private static readonly MAX_MIRRORED_TOPICS_PER_PEER = 50;
   private peerDb: Level<string, string> | null = null;
   /** Message buffer for store-and-forward delivery to offline peers. */
   private messageBuffer: MessageBuffer = new MessageBuffer();
@@ -126,6 +131,26 @@ export class SeedNode extends MagicNode {
         getLedgerEntryCount: () => this.sharedLedger.getEntryCount(),
         getMetrics: () => this.metrics.allCounters(),
         getPrometheusMetrics: () => this.metrics.toPrometheus(),
+        getDashboard: async () => {
+          const status = await this.getNodeStatusAsync();
+          return {
+            version: status.version,
+            uptimeSeconds: Math.floor(status.uptime / 1000),
+            peers: status.peerCount,
+            connectedSeeds: status.connectedSeeds,
+            totalSeeds: status.totalSeeds,
+            degraded: status.degraded,
+            mirroredTopics: this.mirroredTopics.size,
+            bufferedMessages: this.messageBuffer.getCount(),
+            knownPeers: this.knownPeers.size,
+            ledgerEntries: status.ledgerEntries,
+            versionDistribution: Object.fromEntries(this.getVersionStats()),
+            recentEvents: this.getRecentEvents(),
+          };
+        },
+      }, {
+        bind: this.config.healthCheckBind,
+        authToken: this.config.healthCheckAuthToken,
       });
       await this.healthCheck.start();
     }
@@ -172,6 +197,7 @@ export class SeedNode extends MagicNode {
       }
     }
     this.mirroredTopics.clear();
+    this.mirroredTopicsByPeer.clear();
     this.ledgerSubmitTimestamps.clear();
     await super.stop();
   }
@@ -218,6 +244,7 @@ export class SeedNode extends MagicNode {
       this.persistPeer(peerId, { peerId, multiaddrs: peer.multiaddrs, lastSeen: peer.lastSeen });
     }
     this.peerSubscriptions.delete(peerId);
+    this.mirroredTopicsByPeer.delete(peerId);
     this.seedLog.info('Peer disconnected', { peerId });
   }
 
@@ -313,7 +340,7 @@ export class SeedNode extends MagicNode {
           // Swallow publish errors on seed node
         });
       }
-    }, 30_000);
+    }, jitteredPeriod(30_000));
   }
 
   /**
@@ -331,20 +358,29 @@ export class SeedNode extends MagicNode {
     const gs = (this.libp2p.services as Record<string, unknown>).pubsub as GossipSub;
 
     this.topicMirrorHandler = (evt: CustomEvent) => {
-      const { subscriptions } = evt.detail;
+      const { peerId, subscriptions } = evt.detail;
       if (!Array.isArray(subscriptions)) return;
+      const peerIdStr = peerId?.toString() ?? 'unknown';
 
       for (const sub of subscriptions) {
         const topic = (sub as { topic: string; subscribe: boolean }).topic;
         const subscribing = (sub as { topic: string; subscribe: boolean }).subscribe;
 
         if (subscribing && !this.mirroredTopics.has(topic)) {
+          // SEC-6: per-peer cap so a single peer can't announce hundreds of junk
+          // topics and exhaust the global mirror cap, starving legitimate topics.
+          const perPeer = this.mirroredTopicsByPeer.get(peerIdStr) ?? 0;
+          if (perPeer >= SeedNode.MAX_MIRRORED_TOPICS_PER_PEER) {
+            this.seedLog.warn('Per-peer topic mirror cap reached', { peer: peerIdStr.slice(0, 16), topic });
+            continue;
+          }
           if (this.mirroredTopics.size >= 500) {
             this.seedLog.warn('Topic mirror cap reached (500)', { topic });
             continue;
           }
           gs.subscribe(topic);
           this.mirroredTopics.add(topic);
+          this.mirroredTopicsByPeer.set(peerIdStr, perPeer + 1);
           this.seedLog.info('Mirroring topic', { topic, total: this.mirroredTopics.size });
         }
       }

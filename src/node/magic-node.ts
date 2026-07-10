@@ -47,6 +47,9 @@ import { Logger } from '../utils/logger.js';
 import { PartitionDetector, type PartitionEvent } from '../utils/partition-detector.js';
 import { PriorityQueue, MessagePriority } from '../utils/priority-queue.js';
 import { CircuitBreaker } from '../utils/circuit-breaker.js';
+import { InboundBudget } from '../utils/inbound-budget.js';
+import { jitteredPeriod } from '../utils/jitter.js';
+import { isPrivateMultiaddr, extractSeedPeerId } from '../utils/addr-filter.js';
 
 export interface MagicNodeEvents {
   onMessage?: (msg: MagicMessage, tag: string) => void;
@@ -123,14 +126,24 @@ export class MagicNode {
   private degraded = false;
   /** Parsed seed PeerIds for connectivity tracking. */
   private seedPeerIds = new Set<string>();
+  /**
+   * PeerIds extracted from the configured seed multiaddrs (DC-1). Matching a
+   * connection's `remotePeer` against these is DNS/IP-agnostic, unlike the old
+   * host-substring match which never fired for resolved `/dns4/...` seeds.
+   */
+  private configuredSeedPeerIds = new Set<string>();
   /** Circuit breaker for outbound peer dials — prevents hammering unreachable peers. */
   protected circuitBreaker = new CircuitBreaker();
+  /** Epoch ms when start() completed, for uptime reporting (DC-2). */
+  private startedAt = 0;
+  /** Recent degraded/recovered/partition events for the health dashboard (FEAT-3), newest first. */
+  private recentEvents: string[] = [];
 
-  // --- Global inbound rate limiting (token burn protection) ---
-  /** Timestamps of messages delivered to handlers in the current window. */
-  private inboundTimestamps: number[] = [];
-  /** Per-sender payload byte counters: pubkeyHex -> { bytes, windowStart } */
-  private payloadBudgets = new Map<string, { bytes: number; windowStart: number }>();
+  // --- Unified inbound cost governor (token burn protection, FEAT-2) ---
+  /** Shared budget applied across GossipSub, direct-message, and inbox paths. */
+  protected inboundBudget!: InboundBudget;
+  /** Optional queued (sequential) direct-message handler push fn. */
+  private dmQueuedPush: ((envelope: DirectEnvelope) => void) | null = null;
   /** When true, all inbound message delivery is paused (messages are silently dropped). */
   private paused = false;
 
@@ -156,11 +169,27 @@ export class MagicNode {
     this.log = new Logger('MagicNode');
     this.events = events;
 
-    if (events.onPartition) {
-      this.partitionDetector.on('partition', (event: PartitionEvent) => {
-        this.events.onPartition?.(event);
-      });
+    // Unified inbound cost governor shared across all delivery paths (FEAT-2).
+    this.inboundBudget = new InboundBudget(
+      {
+        maxInboundPerMinute: this.config.maxInboundPerMinute,
+        maxPayloadBytesPerMinute: this.config.maxPayloadBytesPerMinute,
+      },
+      (reason) => {
+        this.metrics.increment('budget.shed', 1, { reason });
+      },
+    );
+
+    // Pre-parse configured seed PeerIds for DNS-agnostic connectivity tracking (DC-1).
+    for (const seed of this.config.seedNodes) {
+      const pid = extractSeedPeerId(seed);
+      if (pid) this.configuredSeedPeerIds.add(pid);
     }
+
+    this.partitionDetector.on('partition', (event: PartitionEvent) => {
+      this.recordEvent(`${event.type}: ${event.reason}`);
+      this.events.onPartition?.(event);
+    });
   }
 
   async start(): Promise<void> {
@@ -208,14 +237,7 @@ export class MagicNode {
     // which other peers can't reach. This wastes dial attempts and breaks
     // GossipSub mesh formation.
     const announceFilter = (addrs: Array<{ toString(): string }>) =>
-      addrs.filter((ma) => {
-        const str = ma.toString();
-        // Keep loopback for local testing, filter private ranges for production
-        if (str.includes('/ip4/10.') || str.includes('/ip4/172.') || str.includes('/ip4/192.168.')) {
-          return false;
-        }
-        return true;
-      });
+      addrs.filter((ma) => !isPrivateMultiaddr(ma.toString()));
 
     // Build libp2p config
     const libp2pOptions: Record<string, unknown> = {
@@ -248,6 +270,10 @@ export class MagicNode {
     };
 
     this.libp2p = await createLibp2p(libp2pOptions as Parameters<typeof createLibp2p>[0]);
+
+    // A seed's own multiaddr is in the default seed list; drop our own PeerId from
+    // the configured-seed set so self is never counted as a reachable seed (SCH-1/DC-1).
+    this.configuredSeedPeerIds.delete(this.libp2p.peerId.toString());
 
     // Start version handshake protocol
     this.handshake = new HandshakeProtocol(this.libp2p, {
@@ -303,15 +329,11 @@ export class MagicNode {
     this.peerConnectHandler = (evt: CustomEvent) => {
       const peerId = evt.detail.toString();
 
-      // Track seed PeerIds: if this connection came from bootstrap, remember the PeerId
-      if (this.config.seedNodes.length > 0 && this.libp2p) {
-        const conns = this.libp2p.getConnections(evt.detail);
-        for (const conn of conns) {
-          const remoteAddr = conn.remoteAddr.toString();
-          if (this.config.seedNodes.some((seed) => remoteAddr.includes(seed.split('/p2p/')[0]))) {
-            this.seedPeerIds.add(peerId);
-          }
-        }
+      // Track seed PeerIds by matching the connected peer against the configured
+      // seed PeerIds (DC-1). This is DNS/IP-agnostic — the old host-substring
+      // match never fired for resolved /dns4 seeds, so connectedSeeds read 0/N.
+      if (this.configuredSeedPeerIds.has(peerId)) {
+        this.seedPeerIds.add(peerId);
       }
 
       this.metrics.increment('peers.connected');
@@ -374,14 +396,23 @@ export class MagicNode {
     });
     await this.peerExchange.start();
 
-    // Start ledger sync protocol
+    // Start ledger sync protocol. SEC-3: apply the optional submitter allow-list
+    // and per-submitter ingest rate limit on the sync path.
+    const submitterAllowlist = this.config.ledgerSubmitterAllowlist;
+    const allowlistSet = submitterAllowlist && submitterAllowlist.length > 0
+      ? new Set(submitterAllowlist)
+      : undefined;
     this.ledgerSync = new LedgerSync(
       this.libp2p,
       this.sharedLedger,
       this.ledgerConsensus,
       this.publicKey,
       this.privateKey,
-      { shutdownSignal: this.shutdownController.signal },
+      {
+        shutdownSignal: this.shutdownController.signal,
+        isSubmitterAuthorized: allowlistSet ? (hex) => allowlistSet.has(hex) : undefined,
+        maxIngestPerMinute: this.config.ledgerMaxIngestPerMinute,
+      },
     );
     await this.ledgerSync.start();
 
@@ -393,9 +424,12 @@ export class MagicNode {
       reportSpam: (pubkeyHex: string) => { this.spamFilter.reportSpam(pubkeyHex); },
     };
 
-    // Start direct message protocol with encryption keys and trust checking
+    // Start direct message protocol with encryption keys and trust checking.
+    // DM delivery is routed through the shared InboundBudget so the global
+    // inbound cap and per-sender payload budget apply to direct messages too
+    // (SEC-2 / RL-1) — the primary token-burn path for a targeted attacker.
     this.directMessage = new DirectMessageProtocol(this.libp2p, {
-      onMessage: (envelope) => this.events.onDirectMessage?.(envelope),
+      onMessage: (envelope) => this.deliverDirectMessage(envelope),
       localPrivateKey: this.privateKey,
       localPubkeyHex: publicKeyToHex(this.publicKey),
       trustChecker: dmTrustChecker,
@@ -458,7 +492,7 @@ export class MagicNode {
             this.log.warn('Descriptor signing failed', { error: (err as Error)?.message ?? String(err) });
           });
         }
-      }, 4 * 60_000);
+      }, jitteredPeriod(4 * 60_000));
     }
 
     // Periodic inbox polling — fallback receive path for NATted nodes.
@@ -468,33 +502,52 @@ export class MagicNode {
     if (this.inboxClient && this.tagPubSub && !this.config.isSeedNode) {
       this.inboxPollTimer = setInterval(() => {
         if (this.paused || !this.inboxClient || !this.tagPubSub) return;
+        // RL-2: stop early if the global inbound window is already full — no
+        // point fetching messages we'll only drop.
+        if (!this.inboundBudget.hasGlobalCapacity()) return;
+
         const topics = this.tagPubSub.getSubscribedTags().map(
           (tag) => `magic/tag/${tag}`,
         );
         if (topics.length === 0) return;
 
-        this.inboxClient.fetchFromAllPeers(topics).then((messages) => {
-          if (messages.length > 0) {
-            this.log.info('Inbox poll: new messages', { count: messages.length });
-            for (const msg of messages) {
-              this.handleIncomingMessage(msg.topic, msg.data).catch((err) => {
-                this.log.warn('Error handling polled inbox message', { error: (err as Error)?.message ?? String(err) });
-              });
-            }
+        // SCH-2: only poll connected seed nodes (the inbox servers), not every
+        // connected peer. Fall back to all peers only when no seeds are known.
+        const connected = new Set((this.libp2p?.getPeers() ?? []).map((p) => p.toString()));
+        const seedTargets = [...this.configuredSeedPeerIds].filter((id) => connected.has(id));
+        const targets = seedTargets.length > 0 ? seedTargets : undefined;
+
+        this.inboxClient.fetchFromPeers(topics, targets).then((messages) => {
+          if (messages.length === 0) return;
+          this.log.info('Inbox poll: new messages', { count: messages.length });
+          // RL-2: cap total messages processed per cycle to the inbound budget.
+          const cap = this.config.maxInboundPerMinute > 0 ? this.config.maxInboundPerMinute : messages.length;
+          let processed = 0;
+          for (const msg of messages) {
+            if (processed >= cap || !this.inboundBudget.hasGlobalCapacity()) break;
+            processed++;
+            this.handleIncomingMessage(msg.topic, msg.data).catch((err) => {
+              this.log.warn('Error handling polled inbox message', { error: (err as Error)?.message ?? String(err) });
+            });
           }
         }).catch((err) => {
           this.log.warn('Inbox poll failed', { error: (err as Error)?.message ?? String(err) });
         });
-      }, 30_000);
+      }, jitteredPeriod(30_000));
     }
 
     // Seed connectivity monitoring: track which seeds are reachable, emit
     // degraded/recovered events, and attempt manual re-dial when disconnected.
-    if (this.config.seedNodes.length > 0 && !this.config.isSeedNode) {
+    // SCH-1: this now runs on seed nodes too — libp2p bootstrap only dials at
+    // startup, so without this the seed mesh never re-heals after a disconnect.
+    if (this.config.seedNodes.length > 0) {
       this.seedMonitorTimer = setInterval(() => {
         this.checkSeedConnectivity();
-      }, 60_000);
+      }, jitteredPeriod(60_000));
     }
+
+    // Record start time last so uptime reflects a fully-started node (DC-2).
+    this.startedAt = Date.now();
 
     const fingerprint = getFingerprint(this.publicKey);
     const addrs = this.libp2p.getMultiaddrs().map((a) => a.toString());
@@ -537,8 +590,7 @@ export class MagicNode {
     await this.trustPolicy.close();
     await this.spamFilter.close();
     this.peerReputation.clear();
-    this.payloadBudgets.clear();
-    this.inboundTimestamps = [];
+    this.inboundBudget.clear();
     this.partitionDetector.reset();
     this.circuitBreaker.clear();
 
@@ -706,6 +758,71 @@ export class MagicNode {
       queue.push({ msg, tag: t }, priority);
       drain();
     });
+  }
+
+  /**
+   * Central delivery point for inbound direct messages. Applies the shared
+   * inbound budget (global cap + per-sender payload bytes) BEFORE invoking any
+   * handler, then fans out to the global `onDirectMessage` event and, if
+   * registered, the sequential queued handler (SEC-2 / FEAT-2).
+   */
+  private deliverDirectMessage(envelope: DirectEnvelope): void {
+    if (this.paused) return;
+
+    // Budget by sender identity when known; fall back to the sender peer id.
+    const senderKey = envelope.senderPubkeyHex ?? `peer:${envelope.senderPeerId}`;
+    const result = this.inboundBudget.admit(senderKey, envelope.payload.length);
+    if (!result.admitted) {
+      this.metrics.increment('messages.blocked', 1, { reason: `dm_${result.reason}` });
+      if (result.reason === 'payload_bytes' && envelope.senderPubkeyHex) {
+        this.spamFilter.reportSpam(envelope.senderPubkeyHex);
+      }
+      return;
+    }
+
+    this.metrics.increment('dm.received');
+    this.events.onDirectMessage?.(envelope);
+    this.dmQueuedPush?.(envelope);
+  }
+
+  /**
+   * Register a queued handler for incoming direct messages.
+   *
+   * Mirrors {@link onTagQueued}: messages are processed sequentially — only one
+   * handler invocation runs at a time. Excess messages queue up to
+   * `maxQueueSize`, after which the oldest are dropped. Combined with the shared
+   * inbound budget, this is the recommended DM handler for AI bots that call LLM
+   * APIs per message, preventing concurrent API calls from burning tokens.
+   *
+   * @param handler      - Async handler; the next DM waits until it resolves.
+   * @param maxQueueSize - Max pending DMs (default 50). Oldest dropped when full.
+   */
+  onDirectMessageQueued(
+    handler: (envelope: DirectEnvelope) => Promise<void>,
+    maxQueueSize: number = 50,
+  ): void {
+    const queue: DirectEnvelope[] = [];
+    let processing = false;
+
+    const drain = async () => {
+      if (processing) return;
+      processing = true;
+      while (queue.length > 0) {
+        const env = queue.shift()!;
+        try {
+          await handler(env);
+        } catch (err) {
+          this.log.error('onDirectMessageQueued handler error', { error: (err as Error)?.message ?? String(err) });
+        }
+      }
+      processing = false;
+    };
+
+    this.dmQueuedPush = (envelope: DirectEnvelope) => {
+      if (queue.length >= maxQueueSize) queue.shift(); // Drop oldest
+      queue.push(envelope);
+      drain();
+    };
   }
 
   /** Allow a specific agent (by public key hex). */
@@ -1016,6 +1133,18 @@ export class MagicNode {
     return this.degraded;
   }
 
+  /** Record a health event (degraded/recovered/partition) for the dashboard. */
+  private recordEvent(message: string): void {
+    const stamped = `${new Date().toISOString()} — ${message}`;
+    this.recentEvents.unshift(stamped);
+    if (this.recentEvents.length > 20) this.recentEvents.length = 20;
+  }
+
+  /** Recent degraded/recovered/partition events, newest first (FEAT-3). */
+  getRecentEvents(): string[] {
+    return [...this.recentEvents];
+  }
+
   /** Comprehensive node status for operational monitoring. */
   getNodeStatus(): NodeStatus {
     const peers = this.libp2p?.getPeers() ?? [];
@@ -1034,7 +1163,7 @@ export class MagicNode {
       remoteServices: this.serviceRegistry.getAll().length - this.serviceRegistry.getLocal().length,
       ledgerEntries: 0, // filled async
       paused: this.paused,
-      uptime: 0,
+      uptime: this.startedAt ? Date.now() - this.startedAt : 0,
       version: LEYLINE_VERSION,
       circuitBreakerOpen: this.circuitBreaker.getOpenPeers().length,
     };
@@ -1051,8 +1180,11 @@ export class MagicNode {
   getConnectedSeedCount(): number {
     if (!this.libp2p) return 0;
     const connectedPeerIds = new Set(this.libp2p.getPeers().map((p) => p.toString()));
+    // Prefer the configured seed PeerIds (DC-1) so reporting works for /dns4
+    // seeds; fall back to learned seedPeerIds when no configured ids exist.
+    const seedIds = this.configuredSeedPeerIds.size > 0 ? this.configuredSeedPeerIds : this.seedPeerIds;
     let count = 0;
-    for (const seedPeerId of this.seedPeerIds) {
+    for (const seedPeerId of seedIds) {
       if (connectedPeerIds.has(seedPeerId)) count++;
     }
     return count;
@@ -1063,29 +1195,35 @@ export class MagicNode {
 
     const connectedPeerIds = new Set(this.libp2p.getPeers().map((p) => p.toString()));
 
-    // Build seedPeerIds from connected peers that match configured seed multiaddrs.
-    // libp2p bootstrap dials seed addrs and we discover their PeerIds from connections.
-    // Once we know a PeerId belongs to a seed, we track it persistently.
-    // On initial start before any connection, seedPeerIds is empty and we track via
-    // total connected peers as a fallback.
+    // DC-1: count seeds by matching connected peers against the configured seed
+    // PeerIds (DNS/IP-agnostic). Falls back to learned seedPeerIds if none.
     const totalPeers = connectedPeerIds.size;
-    const connectedSeeds = this.seedPeerIds.size > 0
-      ? [...this.seedPeerIds].filter((id) => connectedPeerIds.has(id)).length
-      : 0;
+    const connectedSeeds = this.getConnectedSeedCount();
+    const seedsConfigured = this.configuredSeedPeerIds.size > 0 || this.seedPeerIds.size > 0;
 
-    const totalSeeds = Math.max(this.seedPeerIds.size, this.config.seedNodes.length);
+    const totalSeeds = Math.max(this.configuredSeedPeerIds.size, this.seedPeerIds.size, this.config.seedNodes.length);
 
     this.partitionDetector.updateSeedConnectivity(connectedSeeds, totalSeeds);
     this.events.onSeedConnectivityChange?.(connectedSeeds, totalSeeds);
 
-    if (totalPeers === 0 && !this.degraded) {
+    // DC-4: base degraded on seed reachability when seeds are configured. A node
+    // connected only to non-seed peers has no relay/inbox/ledger path and should
+    // still be flagged degraded. When no seeds are configured, fall back to the
+    // total-peer signal.
+    const isDegradedNow = seedsConfigured ? connectedSeeds === 0 : totalPeers === 0;
+
+    if (isDegradedNow && !this.degraded) {
       this.degraded = true;
-      const reason = 'No peers connected — operating in degraded mode (messages will be queued locally)';
+      const reason = seedsConfigured
+        ? 'No seed nodes reachable — operating in degraded mode (no relay/inbox/ledger path)'
+        : 'No peers connected — operating in degraded mode (messages will be queued locally)';
       this.log.warn(reason);
+      this.recordEvent(`degraded: ${reason}`);
       this.events.onDegraded?.(reason);
-    } else if (totalPeers > 0 && this.degraded) {
+    } else if (!isDegradedNow && this.degraded) {
       this.degraded = false;
       this.log.info('Seed connectivity restored — recovered from degraded mode');
+      this.recordEvent('recovered: seed connectivity restored');
       this.events.onRecovered?.();
     }
 
@@ -1103,9 +1241,11 @@ export class MagicNode {
         if (!this.libp2p || this.stopping) return;
 
         // Extract peer ID from the multiaddr /p2p/ suffix
-        const peerIdMatch = seedAddr.match(/\/p2p\/(12D3KooW\w+)$/);
-        if (!peerIdMatch) continue;
-        const seedPeerId = peerIdMatch[1];
+        const seedPeerId = extractSeedPeerId(seedAddr);
+        if (!seedPeerId) continue;
+
+        // Never dial ourselves — a seed's own multiaddr is in its seed list (SCH-1).
+        if (seedPeerId === this.libp2p.peerId.toString()) continue;
 
         // Skip if already connected
         if (connectedPeerIds.has(seedPeerId)) continue;
@@ -1182,47 +1322,19 @@ export class MagicNode {
       return;
     }
 
-    // Global inbound rate limit (token burn protection)
-    if (this.config.maxInboundPerMinute > 0) {
-      const now = Date.now();
-      const cutoff = now - 60_000;
-      // Prune old timestamps using binary search + slice (O(log n) vs O(n) shift loop)
-      let lo = 0;
-      let hi = this.inboundTimestamps.length;
-      while (lo < hi) {
-        const mid = (lo + hi) >>> 1;
-        if (this.inboundTimestamps[mid] < cutoff) lo = mid + 1;
-        else hi = mid;
-      }
-      if (lo > 0) this.inboundTimestamps = this.inboundTimestamps.slice(lo);
-      if (this.inboundTimestamps.length >= this.config.maxInboundPerMinute) {
-        // Global cap reached — drop silently (not the sender's fault, just backpressure)
+    // Unified inbound cost governor: global per-minute cap + per-sender payload
+    // byte budget, shared with the direct-message and inbox paths (FEAT-2).
+    const admit = this.inboundBudget.admit(senderHex, msg.payload.length);
+    if (!admit.admitted) {
+      if (admit.reason === 'global_rate') {
+        // Global cap reached — drop silently (not the sender's fault, backpressure).
         return;
       }
-      this.inboundTimestamps.push(now);
-    }
-
-    // Per-sender payload byte budget (prevents large-payload token burn)
-    if (this.config.maxPayloadBytesPerMinute > 0) {
-      const now = Date.now();
-      let budget = this.payloadBudgets.get(senderHex);
-      if (!budget || now - budget.windowStart > 60_000) {
-        budget = { bytes: 0, windowStart: now };
-        this.payloadBudgets.set(senderHex, budget);
-      }
-      budget.bytes += msg.payload.length;
-      if (budget.bytes > this.config.maxPayloadBytesPerMinute) {
-        await this.spamFilter.reportSpam(senderHex);
-        await this.localLedger.append(data, 'blocked');
-        return;
-      }
-
-      // Periodically evict stale payload budget entries to prevent memory leak
-      if (this.payloadBudgets.size > 1000) {
-        for (const [key, b] of this.payloadBudgets) {
-          if (now - b.windowStart > 120_000) this.payloadBudgets.delete(key);
-        }
-      }
+      // Per-sender payload budget exceeded — treat as spam.
+      await this.spamFilter.reportSpam(senderHex);
+      this.metrics.increment('messages.blocked', 1, { reason: 'payload_budget' });
+      await this.localLedger.append(data, 'blocked');
+      return;
     }
 
     // Check trust policy BEFORE signature verification (deny-first).

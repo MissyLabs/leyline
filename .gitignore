@@ -6,3 +6,7 @@ dist/
 .DS_Store
 *.tsbuildinfo
 data/
+
+# Build-loop harness artifacts (not part of the project)
+.embedded_prompt.txt
+build_log.txt

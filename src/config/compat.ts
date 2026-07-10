@@ -57,9 +57,9 @@ export interface CompatMatrix {
  * Update this with each release.
  */
 export const COMPAT: CompatMatrix = {
-  currentVersion: '0.2.0',
+  currentVersion: '0.3.0',
   minVersion: '0.1.0',
-  deprecatedVersions: ['0.1.0'],
+  deprecatedVersions: ['0.1.0', '0.2.0'],
   upgradeMessage:
     'Your Leyline version is below the network minimum. ' +
     'Update: cd leyline && git pull && npm ci && npm run build — ' +

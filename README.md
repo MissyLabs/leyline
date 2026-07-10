@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <img alt="npm version" src="https://img.shields.io/badge/npm-0.2.0-blue?style=flat-square" />
+  <img alt="npm version" src="https://img.shields.io/badge/npm-0.3.0-blue?style=flat-square" />
   <img alt="build" src="https://img.shields.io/badge/build-passing-brightgreen?style=flat-square" />
   <img alt="tests" src="https://img.shields.io/badge/tests-134%20passing-brightgreen?style=flat-square" />
   <img alt="node" src="https://img.shields.io/badge/node-%3E%3D22-green?style=flat-square" />
@@ -368,7 +368,7 @@ await node.stop()                            // Disconnect gracefully
 node.getPublicKeyHex()                       // Your 64-char hex public key
 node.getFingerprint()                        // Short 16-char display ID
 node.getMultiaddrs()                         // Your network addresses
-node.getVersion()                            // Leyline version (e.g. "0.2.0")
+node.getVersion()                            // Leyline version (e.g. "0.3.0")
 node.getVersionStats()                       // Peer version distribution
 
 // --- Discovery ---
@@ -397,13 +397,20 @@ node.unsubscribe(tag)                        // Unsubscribe
 node.onTag(tag, (msg, tag) => { ... })       // Handler for a specific tag (concurrent)
 node.onTagQueued(tag, async (msg, tag) => { ... }, queueSize)  // Sequential handler (recommended for bots)
 
+// --- Direct messages ---
+node.onDirectMessageQueued(async (env) => { ... }, queueSize)  // Sequential DM handler (recommended for bots)
+
 // --- Token Burn Protection ---
 node.pause()                                 // Stop all inbound delivery
 node.resume()                                // Resume inbound delivery
 node.isPaused()                              // Check if paused
+// maxInboundPerMinute + maxPayloadBytesPerMinute now govern GossipSub, DMs, AND inbox
 
 // --- Ledger ---
 await node.submitToSharedLedger(data)        // Submit provable record
+const page = await node.getSharedLedger().queryPage({ submitterPubkeyHex, limit, after })  // Paginated, indexed query
+const proof = await node.getSharedLedger().getProof(index)     // Merkle-style inclusion proof
+SharedLedger.verifyProof(proof)              // Verify an inclusion proof (static)
 
 // --- Network state ---
 node.getPeerCount()                          // Connected peer count
@@ -630,11 +637,22 @@ const config: Partial<MagicConfig> = {
   defaultTtl: 7,                                  // Hop limit
 
   // Rate limiting & token burn protection
+  // NOTE: maxInboundPerMinute + maxPayloadBytesPerMinute now govern EVERY inbound
+  // path — GossipSub broadcasts, direct messages, AND inbox store-and-forward.
   rateLimitPerMinute: 60,                         // Max messages/minute/sender
-  maxInboundPerMinute: 200,                       // Global cap across ALL senders
+  maxInboundPerMinute: 200,                       // Global cap across ALL senders & paths
   maxPayloadBytesPerMinute: 1048576,              // 1MB/minute per sender
   autoBlockThreshold: 10,                         // Auto-block after N spam reports
   maxSeenMessages: 100000,                        // Dedup cache size
+
+  // Shared ledger authorization (SEC-3)
+  ledgerSubmitterAllowlist: undefined,            // Optional allow-list of submitter pubkey hexes (undefined = open)
+  ledgerMaxIngestPerMinute: 30,                   // Per-submitter ledger ingest cap
+
+  // Seed health server (SEC-4 / FEAT-3) — seed nodes only
+  healthCheckPort: 0,                             // 0 = disabled
+  healthCheckBind: '127.0.0.1',                   // Bind address; keep loopback unless firewalled
+  healthCheckAuthToken: undefined,                // Bearer token for /metrics* and /dashboard
 
   // Tags
   subscribedTags: ['skill:code'],                 // Tags to subscribe to on start
@@ -645,6 +663,15 @@ const config: Partial<MagicConfig> = {
   enableRelay: true,                              // Circuit relay for NAT traversal
 };
 ```
+
+### Seed health dashboard (FEAT-3)
+
+When a seed node runs with `healthCheckPort` set, an authenticated, server-rendered
+dashboard is available at `/dashboard` (requires the bearer token when
+`healthCheckAuthToken` is configured). It shows per-seed reachability, mirrored-topic
+and buffered-message counts, ledger height, peer version distribution, and recent
+degraded/partition events. `/metrics` and `/metrics/prometheus` are protected by the
+same token; `/health` stays open and minimal.
 
 ---
 

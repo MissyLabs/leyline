@@ -30,6 +30,7 @@ import {
 } from './service-registry.js';
 import { sign, verify, hexToPublicKey } from '../identity/keypair.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { StreamGate } from '../utils/stream-gate.js';
 import { Logger } from '../utils/logger.js';
 
 const MAX_RESULT_SERVICES = 100;
@@ -78,12 +79,87 @@ function encodeMsg(msg: DiscoveryWireMessage): Uint8Array {
   return new TextEncoder().encode(JSON.stringify(msg));
 }
 
-/** Decode UTF-8 JSON bytes back to a wire message with validation. */
+// SEC-5: field size/shape caps enforced at decode time, before any descriptor
+// or query object reaches the registry or verification. Advertised descriptors
+// are additionally gated on signature, but query objects and string fields must
+// be bounded here to prevent unbounded-size processing / memory abuse.
+const MAX_DISCOVERY_STRING = 512;
+const MAX_DISCOVERY_TAGS = 50;
+const MAX_DISCOVERY_TAG_LEN = 128;
+const MAX_DISCOVERY_MULTIADDRS = 20;
+const MAX_DISCOVERY_METADATA_KEYS = 50;
+
+function assertStr(value: unknown, field: string, max = MAX_DISCOVERY_STRING): void {
+  if (value !== undefined && (typeof value !== 'string' || value.length > max)) {
+    throw new TypeError(`Discovery field ${field} invalid or exceeds ${max} chars`);
+  }
+}
+
+function assertStringArray(value: unknown, field: string, maxItems: number, maxLen = MAX_DISCOVERY_TAG_LEN): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value) || value.length > maxItems) {
+    throw new TypeError(`Discovery field ${field} invalid or exceeds ${maxItems} items`);
+  }
+  for (const item of value) {
+    if (typeof item !== 'string' || item.length > maxLen) {
+      throw new TypeError(`Discovery field ${field} has an oversized/invalid element`);
+    }
+  }
+}
+
+function validateDescriptorShape(d: unknown): void {
+  if (typeof d !== 'object' || d === null) throw new TypeError('Malformed descriptor');
+  const desc = d as Record<string, unknown>;
+  assertStr(desc.id, 'descriptor.id');
+  assertStr(desc.name, 'descriptor.name');
+  assertStr(desc.description, 'descriptor.description');
+  assertStr(desc.providerPubkey, 'descriptor.providerPubkey');
+  assertStr(desc.providerPeerId, 'descriptor.providerPeerId');
+  assertStr(desc.signature, 'descriptor.signature');
+  assertStringArray(desc.tags, 'descriptor.tags', MAX_DISCOVERY_TAGS);
+  assertStringArray(desc.multiaddrs, 'descriptor.multiaddrs', MAX_DISCOVERY_MULTIADDRS, MAX_DISCOVERY_STRING);
+  if (desc.metadata !== undefined) {
+    if (typeof desc.metadata !== 'object' || desc.metadata === null) throw new TypeError('descriptor.metadata invalid');
+    const keys = Object.keys(desc.metadata as Record<string, unknown>);
+    if (keys.length > MAX_DISCOVERY_METADATA_KEYS) throw new TypeError('descriptor.metadata has too many keys');
+    for (const k of keys) {
+      assertStr(k, 'descriptor.metadata.key');
+      assertStr((desc.metadata as Record<string, unknown>)[k], 'descriptor.metadata.value');
+    }
+  }
+}
+
+function validateQueryShape(q: unknown): void {
+  if (typeof q !== 'object' || q === null) throw new TypeError('Malformed query');
+  const query = q as Record<string, unknown>;
+  assertStr(query.name, 'query.name');
+  assertStringArray(query.tags, 'query.tags', MAX_DISCOVERY_TAGS);
+  assertStringArray(query.excludeTags, 'query.excludeTags', MAX_DISCOVERY_TAGS);
+  assertStringArray(query.requiredMetadataKeys, 'query.requiredMetadataKeys', MAX_DISCOVERY_METADATA_KEYS);
+}
+
+/** Decode UTF-8 JSON bytes back to a wire message with validation (SEC-5). */
 function decodeMsg(data: Uint8Array): DiscoveryWireMessage {
   const parsed = JSON.parse(new TextDecoder().decode(data));
   if (typeof parsed.kind !== 'string') {
     throw new TypeError('Malformed DiscoveryWireMessage: missing kind');
   }
+
+  if (parsed.kind === 'query') {
+    validateQueryShape(parsed.query);
+  } else if (parsed.kind === 'advertisement') {
+    validateDescriptorShape(parsed.descriptor);
+  } else if (parsed.kind === 'result') {
+    if (parsed.result && Array.isArray(parsed.result.services)) {
+      if (parsed.result.services.length > MAX_RESULT_SERVICES) {
+        parsed.result.services = parsed.result.services.slice(0, MAX_RESULT_SERVICES);
+      }
+      for (const svc of parsed.result.services) {
+        validateDescriptorShape(svc);
+      }
+    }
+  }
+
   return parsed as DiscoveryWireMessage;
 }
 
@@ -151,6 +227,8 @@ export class DiscoveryProtocol {
   private readonly rateLimitConfig: Required<DiscoveryRateLimitConfig>;
   private readonly log = new Logger('DiscoveryProtocol');
   private readonly shutdownSignal?: AbortSignal;
+  /** Per-peer inbound stream concurrency cap (RL-4). */
+  private readonly streamGate = new StreamGate(32);
 
   constructor(
     libp2p: Libp2p,
@@ -241,7 +319,15 @@ export class DiscoveryProtocol {
   async start(): Promise<void> {
     await this.libp2p.handle(DISCOVERY_PROTOCOL, async ({ stream, connection }) => {
       const remotePeerId = connection.remotePeer.toString();
-      await this.handleIncoming(stream, remotePeerId);
+      if (!this.streamGate.tryAcquire(remotePeerId)) {
+        try { stream.close(); } catch { /* already closed */ }
+        return;
+      }
+      try {
+        await this.handleIncoming(stream, remotePeerId);
+      } finally {
+        this.streamGate.release(remotePeerId);
+      }
     });
 
     this.pruneTimer = setInterval(() => {
@@ -261,6 +347,7 @@ export class DiscoveryProtocol {
       this.pruneTimer = null;
     }
     this.peerRequestTimes.clear();
+    this.streamGate.clear();
 
     await this.libp2p.unhandle(DISCOVERY_PROTOCOL);
   }

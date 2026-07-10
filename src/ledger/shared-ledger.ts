@@ -12,6 +12,14 @@ export interface SharedLedgerEntry {
   timestamp: number;
   confirmations: number;
   confirmerPubkeys: Uint8Array[];
+  /**
+   * Ed25519 signatures over `confirm:{hash}`, parallel to `confirmerPubkeys`.
+   * Present when a confirmation was recorded with proof (from the ledger-sync
+   * confirm path). Enables downstream verification of confirmation counts so a
+   * peer cannot fabricate them (SEC-1). May be shorter than `confirmerPubkeys`
+   * for legacy/unproven confirmations.
+   */
+  confirmerSignatures: Uint8Array[];
 }
 
 interface StoredEntry {
@@ -24,6 +32,7 @@ interface StoredEntry {
   timestamp: number;
   confirmations: number;
   confirmerPubkeys: string[];
+  confirmerSignatures?: string[];
 }
 
 function toHex(arr: Uint8Array): string {
@@ -32,6 +41,31 @@ function toHex(arr: Uint8Array): string {
 
 function fromHex(hex: string): Uint8Array {
   return new Uint8Array(Buffer.from(hex, 'hex'));
+}
+
+/** Zero-pad a non-negative integer so keys sort lexicographically by value. */
+function padIndex(n: number): string {
+  return String(Math.max(0, Math.floor(n))).padStart(16, '0');
+}
+
+/** Time-bucket (hourly) for the timestamp secondary index. */
+function timeBucket(timestampMs: number): string {
+  return padIndex(Math.floor(timestampMs / 3_600_000));
+}
+
+/**
+ * Recompute the canonical hash for an entry from its preimage fields.
+ * Exported so consumers (e.g. the fork resolver) can verify a serialized
+ * entry's `hash` rather than trusting the value sent by a peer.
+ */
+export function computeEntryHash(entry: {
+  index: number;
+  prevHash: Uint8Array;
+  data: Uint8Array;
+  submitterPubkey: Uint8Array;
+  timestamp: number;
+}): Uint8Array {
+  return computeHash(entry.index, entry.prevHash, entry.data, entry.submitterPubkey, entry.timestamp);
 }
 
 function computeHash(
@@ -65,6 +99,7 @@ function serializeEntry(entry: SharedLedgerEntry): string {
     timestamp: entry.timestamp,
     confirmations: entry.confirmations,
     confirmerPubkeys: entry.confirmerPubkeys.map(toHex),
+    confirmerSignatures: entry.confirmerSignatures.map(toHex),
   };
   return JSON.stringify(stored);
 }
@@ -81,6 +116,7 @@ function deserializeEntry(json: string): SharedLedgerEntry {
     timestamp: stored.timestamp,
     confirmations: stored.confirmations,
     confirmerPubkeys: stored.confirmerPubkeys.map(fromHex),
+    confirmerSignatures: (stored.confirmerSignatures ?? []).map(fromHex),
   };
 }
 
@@ -98,6 +134,38 @@ export interface LedgerQueryFilter {
   minConfirmations?: number;
   /** Maximum number of results to return (default: unlimited) */
   limit?: number;
+  /** Cursor: only return entries with index strictly greater than this. */
+  after?: number;
+}
+
+/** A page of query results with an opaque forward cursor. */
+export interface LedgerQueryPage {
+  entries: SharedLedgerEntry[];
+  /** Pass as `after` to fetch the next page; null when exhausted. */
+  nextCursor: number | null;
+}
+
+/** One step of a hash-chain inclusion proof. */
+export interface LedgerProofStep {
+  index: number;
+  prevHash: string;
+  data: string;
+  submitterPubkey: string;
+  timestamp: number;
+  hash: string;
+}
+
+/**
+ * Inclusion proof that a given entry is part of the chain ending at
+ * `latestHash`. Contains the target entry plus every subsequent entry's
+ * hash-preimage fields, so an external verifier can recompute the hash chain
+ * from the target forward to the head without trusting any stored hash.
+ */
+export interface LedgerProof {
+  index: number;
+  latestIndex: number;
+  latestHash: string;
+  steps: LedgerProofStep[];
 }
 
 /**
@@ -187,12 +255,19 @@ export class SharedLedger {
       timestamp,
       confirmations: 0,
       confirmerPubkeys: [],
+      confirmerSignatures: [],
     };
 
-    await this.db.put(`entry:${index}`, serializeEntry(entry));
+    // Write the entry, its secondary indices, and the metadata pointer
+    // atomically so the indices can never drift from the primary store.
+    await this.db.batch([
+      { type: 'put', key: `entry:${index}`, value: serializeEntry(entry) },
+      { type: 'put', key: `idx:sub:${toHex(submitterPubkey)}:${padIndex(index)}`, value: '' },
+      { type: 'put', key: `idx:ts:${timeBucket(timestamp)}:${padIndex(index)}`, value: '' },
+      { type: 'put', key: 'meta:latest', value: JSON.stringify({ index, hash: toHex(hash) }) },
+    ]);
     this.currentIndex = index;
     this.latestHash = hash;
-    await this.db.put('meta:latest', JSON.stringify({ index, hash: toHex(hash) }));
 
     return entry;
   }
@@ -201,21 +276,25 @@ export class SharedLedger {
    * Add a peer confirmation to an existing entry.
    * Serialized via the same lock as submit() to prevent concurrent
    * read-modify-write races that could produce duplicate confirmers.
+   *
+   * @param signature - Optional Ed25519 signature over `confirm:{entryHash}` by
+   *                    the confirmer, stored so the confirmation can later be
+   *                    cryptographically verified (SEC-1).
    */
-  async addConfirmation(index: number, confirmerPubkey: Uint8Array): Promise<SharedLedgerEntry | null> {
+  async addConfirmation(index: number, confirmerPubkey: Uint8Array, signature?: Uint8Array): Promise<SharedLedgerEntry | null> {
     const prev = this.submitLock;
     let resolve!: () => void;
     this.submitLock = new Promise<void>((r) => { resolve = r; });
 
     try {
       await prev;
-      return await this.addConfirmationInner(index, confirmerPubkey);
+      return await this.addConfirmationInner(index, confirmerPubkey, signature);
     } finally {
       resolve();
     }
   }
 
-  private async addConfirmationInner(index: number, confirmerPubkey: Uint8Array): Promise<SharedLedgerEntry | null> {
+  private async addConfirmationInner(index: number, confirmerPubkey: Uint8Array, signature?: Uint8Array): Promise<SharedLedgerEntry | null> {
     const entry = await this.getEntry(index);
     if (!entry) return null;
 
@@ -224,6 +303,7 @@ export class SharedLedger {
     if (alreadyConfirmed) return entry;
 
     entry.confirmerPubkeys.push(confirmerPubkey);
+    entry.confirmerSignatures.push(signature ?? new Uint8Array(0));
     entry.confirmations = entry.confirmerPubkeys.length;
 
     await this.db.put(`entry:${index}`, serializeEntry(entry));
@@ -291,40 +371,132 @@ export class SharedLedger {
   /**
    * Query ledger entries with optional filter criteria.
    *
-   * Walks all entries in ascending index order and returns those that satisfy
-   * every specified filter field (AND semantics). Results are capped by
-   * `filter.limit` when provided.
+   * When `submitterPubkeyHex` is provided the submitter secondary index is used
+   * to avoid a full scan (IMP-1); otherwise entries are walked in ascending
+   * index order. Results are capped by `filter.limit`.
    *
    * @param filter - One or more filter criteria; omitted fields are ignored.
    * @returns Matching {@link SharedLedgerEntry} objects in ascending index order.
    */
   async query(filter: LedgerQueryFilter): Promise<SharedLedgerEntry[]> {
+    return (await this.queryPage(filter)).entries;
+  }
+
+  /**
+   * Cursor-paginated variant of {@link query}. Returns a page of matching
+   * entries and a `nextCursor` (the index to pass as `after` for the next
+   * page), or null when the ledger is exhausted.
+   */
+  async queryPage(filter: LedgerQueryFilter): Promise<LedgerQueryPage> {
     const results: SharedLedgerEntry[] = [];
     const limit = filter.limit ?? Infinity;
+    const after = filter.after ?? 0;
+    let lastIndexSeen = after;
+    let exhausted = true;
 
-    for (let i = 1; i <= this.currentIndex; i++) {
-      if (results.length >= limit) break;
-
-      const entry = await this.getEntry(i);
-      if (!entry) continue;
-
-      if (filter.submitterPubkeyHex !== undefined) {
-        if (toHex(entry.submitterPubkey) !== filter.submitterPubkeyHex) continue;
-      }
-
+    const matches = (entry: SharedLedgerEntry): boolean => {
       if (filter.timestampRange !== undefined) {
         const [minMs, maxMs] = filter.timestampRange;
-        if (entry.timestamp < minMs || entry.timestamp > maxMs) continue;
+        if (entry.timestamp < minMs || entry.timestamp > maxMs) return false;
       }
-
-      if (filter.minConfirmations !== undefined) {
-        if (entry.confirmations < filter.minConfirmations) continue;
+      if (filter.minConfirmations !== undefined && entry.confirmations < filter.minConfirmations) {
+        return false;
       }
+      return true;
+    };
 
-      results.push(entry);
+    if (filter.submitterPubkeyHex !== undefined) {
+      // Index-accelerated path: iterate only this submitter's entry indices.
+      const prefix = `idx:sub:${filter.submitterPubkeyHex}:`;
+      for await (const key of this.db.keys({ gt: `${prefix}${padIndex(after)}`, lt: `${prefix}~` })) {
+        const idx = Number(key.slice(prefix.length));
+        if (!Number.isFinite(idx)) continue;
+        if (results.length >= limit) { exhausted = false; break; }
+        const entry = await this.getEntry(idx);
+        if (!entry) continue;
+        lastIndexSeen = idx;
+        if (matches(entry)) results.push(entry);
+      }
+    } else {
+      for (let i = after + 1; i <= this.currentIndex; i++) {
+        if (results.length >= limit) { exhausted = false; break; }
+        const entry = await this.getEntry(i);
+        lastIndexSeen = i;
+        if (!entry) continue;
+        if (matches(entry)) results.push(entry);
+      }
     }
 
-    return results;
+    return {
+      entries: results,
+      nextCursor: exhausted ? null : lastIndexSeen,
+    };
+  }
+
+  /**
+   * Build a hash-chain inclusion proof for the entry at `index`.
+   *
+   * The proof contains the target entry plus every subsequent entry's
+   * hash-preimage fields up to the current head. A verifier can recompute the
+   * chain forward (see {@link SharedLedger.verifyProof}) and confirm the entry
+   * is included in the chain ending at the current `latestHash` — without
+   * trusting any stored hash value. Tampering with the target entry's `data`
+   * breaks the recomputed chain and invalidates the proof.
+   *
+   * @returns The proof, or null if the index is out of range.
+   */
+  async getProof(index: number): Promise<LedgerProof | null> {
+    if (index < 1 || index > this.currentIndex) return null;
+    const steps: LedgerProofStep[] = [];
+    for (let i = index; i <= this.currentIndex; i++) {
+      const entry = await this.getEntry(i);
+      if (!entry) return null;
+      steps.push({
+        index: entry.index,
+        prevHash: toHex(entry.prevHash),
+        data: toHex(entry.data),
+        submitterPubkey: toHex(entry.submitterPubkey),
+        timestamp: entry.timestamp,
+        hash: toHex(entry.hash),
+      });
+    }
+    return {
+      index,
+      latestIndex: this.currentIndex,
+      latestHash: toHex(this.latestHash),
+      steps,
+    };
+  }
+
+  /**
+   * Verify a {@link LedgerProof} produced by {@link getProof}. Recomputes each
+   * step's hash from its preimage fields, checks hash-chain linkage, and
+   * confirms the final hash matches `latestHash`. Returns false for any
+   * tampering or structural inconsistency.
+   */
+  static verifyProof(proof: LedgerProof): boolean {
+    if (!proof || !Array.isArray(proof.steps) || proof.steps.length === 0) return false;
+    if (proof.steps[0].index !== proof.index) return false;
+    if (proof.steps[proof.steps.length - 1].index !== proof.latestIndex) return false;
+
+    let expectedPrevHash: string | null = null;
+    for (let i = 0; i < proof.steps.length; i++) {
+      const step = proof.steps[i];
+      if (step.index !== proof.index + i) return false;
+      if (expectedPrevHash !== null && step.prevHash !== expectedPrevHash) return false;
+
+      const recomputed = toHex(computeHash(
+        step.index,
+        fromHex(step.prevHash),
+        fromHex(step.data),
+        fromHex(step.submitterPubkey),
+        step.timestamp,
+      ));
+      if (recomputed !== step.hash) return false;
+      expectedPrevHash = step.hash;
+    }
+
+    return proof.steps[proof.steps.length - 1].hash === proof.latestHash;
   }
 
   /**
@@ -351,7 +523,15 @@ export class SharedLedger {
 
     for (let i = this.currentIndex; i > targetIndex; i--) {
       try {
-        await this.db.del(`entry:${i}`);
+        // Read the entry first so we can drop its secondary index keys too,
+        // keeping the indices consistent with the primary store.
+        const entry = await this.getEntry(i);
+        const ops: Array<{ type: 'del'; key: string }> = [{ type: 'del', key: `entry:${i}` }];
+        if (entry) {
+          ops.push({ type: 'del', key: `idx:sub:${toHex(entry.submitterPubkey)}:${padIndex(i)}` });
+          ops.push({ type: 'del', key: `idx:ts:${timeBucket(entry.timestamp)}:${padIndex(i)}` });
+        }
+        await this.db.batch(ops);
       } catch {
         // Entry may already be missing
       }

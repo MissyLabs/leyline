@@ -6,6 +6,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { encryptPayload, decryptPayload } from '../crypto/envelope.js';
 import { hexToPublicKey, sign as edSign, verify as edVerify } from '../identity/keypair.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { StreamGate } from '../utils/stream-gate.js';
 
 /**
  * Direct Message Protocol for the Leyline network.
@@ -226,11 +227,37 @@ export class DirectMessageProtocol {
   private readonly shutdownSignal?: AbortSignal;
   /** Pending receipt callbacks keyed by receiptToken. */
   private readonly pendingReceipts = new Map<string, { expectedSender: string; resolve: (timestamp: number) => void }>();
+  /** Per-peer inbound stream concurrency cap (RL-4). */
+  private readonly streamGate = new StreamGate(32);
+  /** Receipt-emission rate limiting per requesting peer (SEC-6): peerId → timestamps. */
+  private readonly receiptEmitTimes = new Map<string, number[]>();
+  private static readonly MAX_RECEIPTS_PER_MINUTE = 30;
 
   constructor(libp2p: Libp2p, opts: DirectMessageOptions = {}, shutdownSignal?: AbortSignal) {
     this.libp2p = libp2p;
     this.opts = opts;
     this.shutdownSignal = shutdownSignal;
+  }
+
+  /**
+   * Rate-limit receipt emission to a requesting peer (SEC-6). Prevents a signed
+   * message with a receiptToken from being used as an amplification vector.
+   */
+  private canEmitReceipt(peerId: string): boolean {
+    const now = Date.now();
+    const cutoff = now - 60_000;
+    let times = this.receiptEmitTimes.get(peerId);
+    if (!times) { times = []; this.receiptEmitTimes.set(peerId, times); }
+    while (times.length > 0 && times[0] < cutoff) times.shift();
+    if (times.length >= DirectMessageProtocol.MAX_RECEIPTS_PER_MINUTE) return false;
+    times.push(now);
+    // Bound memory across many requesters.
+    if (this.receiptEmitTimes.size > 5_000) {
+      for (const [k, v] of this.receiptEmitTimes) {
+        if (v.length === 0 || v[v.length - 1] < cutoff) this.receiptEmitTimes.delete(k);
+      }
+    }
+    return true;
   }
 
   // --------------------------------------------------------------------------
@@ -242,8 +269,17 @@ export class DirectMessageProtocol {
    * receive incoming direct and relayed envelopes.
    */
   async start(): Promise<void> {
-    await this.libp2p.handle(DIRECT_MESSAGE_PROTOCOL, async ({ stream }) => {
-      await this.handleIncoming(stream);
+    await this.libp2p.handle(DIRECT_MESSAGE_PROTOCOL, async ({ stream, connection }) => {
+      const peerId = connection.remotePeer.toString();
+      if (!this.streamGate.tryAcquire(peerId)) {
+        try { stream.close(); } catch { /* already closed */ }
+        return;
+      }
+      try {
+        await this.handleIncoming(stream);
+      } finally {
+        this.streamGate.release(peerId);
+      }
     });
   }
 
@@ -252,6 +288,8 @@ export class DirectMessageProtocol {
     await this.libp2p.unhandle(DIRECT_MESSAGE_PROTOCOL);
     // Reject all pending receipt callbacks so callers don't hang indefinitely.
     this.pendingReceipts.clear();
+    this.streamGate.clear();
+    this.receiptEmitTimes.clear();
   }
 
   // --------------------------------------------------------------------------
@@ -611,7 +649,9 @@ export class DirectMessageProtocol {
 
               // If the sender requested a delivery receipt, send one back best-effort.
               // Sign the receipt so the sender can verify it came from us.
-              if (envelope.receiptToken && envelope.senderPeerId) {
+              // SEC-6: rate-limit receipt emission per requester to prevent
+              // amplification via receiptToken.
+              if (envelope.receiptToken && envelope.senderPeerId && this.canEmitReceipt(envelope.senderPeerId)) {
                 const receiptEnvelope: DirectEnvelope = {
                   payload: new Uint8Array(0),
                   targetPeerId: envelope.senderPeerId,

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { MagicNode } from '../src/node/magic-node.js';
+import { LEYLINE_VERSION } from '../src/config/compat.js';
 import { initProto } from '../src/messages/proto.js';
 import {
   createMessage,
@@ -182,7 +183,7 @@ describe('MagicNode — handleIncomingMessage pipeline', () => {
   });
 
   it('accessor methods return correct values', () => {
-    expect(node.getVersion()).toBe('0.2.0');
+    expect(node.getVersion()).toBe(LEYLINE_VERSION);
     expect(node.getPublicKeyHex()).toHaveLength(64);
     expect(node.getFingerprint()).toHaveLength(16);
     expect(node.getPeerCount()).toBe(0);

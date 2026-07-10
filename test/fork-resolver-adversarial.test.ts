@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { SharedLedger, type SharedLedgerEntry } from '../src/ledger/shared-ledger.js';
+import { SharedLedger, computeEntryHash, type SharedLedgerEntry } from '../src/ledger/shared-ledger.js';
 import { ForkResolver, type PeerChainQuerier } from '../src/ledger/fork-resolver.js';
+import { generateKeypair, sign } from '../src/identity/keypair.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -54,6 +55,41 @@ function makeFakeChain(entries: Array<{ index: number; hashFill: number; data: s
     const e = entries[i];
     const prevHash = i === 0 ? new Uint8Array(32).fill(0) : result[i - 1].hash;
     result.push(makeFakeEntry(e.index, e.hashFill, e.data, e.confirmations ?? 0, prevHash));
+  }
+  return result;
+}
+
+/**
+ * Cryptographically valid divergent chain: correct recomputed hashes, real
+ * submitter signatures, and verifiable confirmer signatures. Required for
+ * legitimate-reorg scenarios under SEC-1.
+ */
+async function makeSignedChain(
+  specs: Array<{ index: number; data: string; confirmations?: number }>,
+  prevHash: Uint8Array,
+): Promise<SharedLedgerEntry[]> {
+  const submitter = await generateKeypair();
+  const result: SharedLedgerEntry[] = [];
+  let prev = prevHash;
+  for (const spec of specs) {
+    const data = makeDummyData(spec.data);
+    const timestamp = Date.now();
+    const submitterPubkey = submitter.publicKey;
+    const hash = computeEntryHash({ index: spec.index, prevHash: prev, data, submitterPubkey, timestamp });
+    const signature = await sign(submitter.privateKey, data);
+    const confirmerPubkeys: Uint8Array[] = [];
+    const confirmerSignatures: Uint8Array[] = [];
+    const confirmData = new TextEncoder().encode(`confirm:${toHex(hash)}`);
+    for (let c = 0; c < (spec.confirmations ?? 0); c++) {
+      const ckp = await generateKeypair();
+      confirmerPubkeys.push(ckp.publicKey);
+      confirmerSignatures.push(await sign(ckp.privateKey, confirmData));
+    }
+    result.push({
+      index: spec.index, prevHash: prev, hash, data, submitterPubkey, signature,
+      timestamp, confirmations: confirmerPubkeys.length, confirmerPubkeys, confirmerSignatures,
+    });
+    prev = hash;
   }
   return result;
 }
@@ -285,10 +321,10 @@ describe('ForkResolver — adversarial peer scenarios', () => {
     const common = await buildChain(ledger, 3, 'common');
     await buildChain(ledger, 2, 'local');
 
-    const peerDivergent = makeFakeChain([
-      { index: 4, hashFill: 0xaa, data: 'peer-4', confirmations: 10 },
-      { index: 5, hashFill: 0xbb, data: 'peer-5', confirmations: 10 },
-    ]);
+    const peerDivergent = await makeSignedChain([
+      { index: 4, data: 'peer-4', confirmations: 10 },
+      { index: 5, data: 'peer-5', confirmations: 10 },
+    ], common[common.length - 1].hash);
     const peer = makeMockPeer(common, peerDivergent);
 
     const resolver = new ForkResolver(ledger);

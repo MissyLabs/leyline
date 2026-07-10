@@ -69,7 +69,7 @@ describe('checkCompat', () => {
   });
 
   it('current version is fully compatible', () => {
-    const result = checkCompat('0.2.0');
+    const result = checkCompat('0.3.0');
     expect(result.compatible).toBe(true);
     expect(result.deprecated).toBe(false);
     expect(result.message).toBe('OK');

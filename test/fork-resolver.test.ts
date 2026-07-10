@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { SharedLedger, type SharedLedgerEntry } from '../src/ledger/shared-ledger.js';
+import { SharedLedger, computeEntryHash, type SharedLedgerEntry } from '../src/ledger/shared-ledger.js';
 import { ForkResolver, type PeerChainQuerier } from '../src/ledger/fork-resolver.js';
+import { generateKeypair, sign } from '../src/identity/keypair.js';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -65,6 +66,43 @@ function makeFakeEntry(index: number, hashFill: number, data: string, confirmati
       ? Array.from({ length: confirmations }, (_, i) => new Uint8Array(32).fill(10 + i))
       : [],
   };
+}
+
+/**
+ * Build a cryptographically valid divergent chain: correct recomputed hashes,
+ * real submitter signatures over the data, and verifiable confirmer signatures
+ * over `confirm:{hash}`. SEC-1 requires a peer chain to pass full validation
+ * before it can be adopted, so legitimate-reorg scenarios must use this rather
+ * than the fabricated `makeFakeChain` entries.
+ */
+async function makeSignedChain(
+  specs: Array<{ index: number; data: string; confirmations?: number }>,
+  prevHash: Uint8Array,
+): Promise<SharedLedgerEntry[]> {
+  const submitter = await generateKeypair();
+  const result: SharedLedgerEntry[] = [];
+  let prev = prevHash;
+  for (const spec of specs) {
+    const data = makeDummyData(spec.data);
+    const timestamp = Date.now();
+    const submitterPubkey = submitter.publicKey;
+    const hash = computeEntryHash({ index: spec.index, prevHash: prev, data, submitterPubkey, timestamp });
+    const signature = await sign(submitter.privateKey, data);
+    const confirmerPubkeys: Uint8Array[] = [];
+    const confirmerSignatures: Uint8Array[] = [];
+    const confirmData = new TextEncoder().encode(`confirm:${toHex(hash)}`);
+    for (let c = 0; c < (spec.confirmations ?? 0); c++) {
+      const ckp = await generateKeypair();
+      confirmerPubkeys.push(ckp.publicKey);
+      confirmerSignatures.push(await sign(ckp.privateKey, confirmData));
+    }
+    result.push({
+      index: spec.index, prevHash: prev, hash, data, submitterPubkey, signature,
+      timestamp, confirmations: confirmerPubkeys.length, confirmerPubkeys, confirmerSignatures,
+    });
+    prev = hash;
+  }
+  return result;
 }
 
 function makeFakeChain(entries: Array<{ index: number; hashFill: number; data: string; confirmations?: number }>): SharedLedgerEntry[] {
@@ -276,10 +314,10 @@ describe('ForkResolver.resolve', () => {
     const common = await buildChain(ledger, 3, 'common');
     await buildChain(ledger, 2, 'local-diverge');
 
-    const peerDivergent = makeFakeChain([
-      { index: 4, hashFill: 0xaa, data: 'peer-4', confirmations: 3 },
-      { index: 5, hashFill: 0xbb, data: 'peer-5', confirmations: 3 },
-    ]);
+    const peerDivergent = await makeSignedChain([
+      { index: 4, data: 'peer-4', confirmations: 3 },
+      { index: 5, data: 'peer-5', confirmations: 3 },
+    ], common[common.length - 1].hash);
     const peer = makeMockPeer(common, peerDivergent);
 
     const resolver = new ForkResolver(ledger);
@@ -323,11 +361,11 @@ describe('ForkResolver.resolve', () => {
     const common = await buildChain(ledger, 3, 'common');
     await buildChain(ledger, 1, 'local-short');
 
-    const peerDivergent = makeFakeChain([
-      { index: 4, hashFill: 0xaa, data: 'peer-4' },
-      { index: 5, hashFill: 0xbb, data: 'peer-5' },
-      { index: 6, hashFill: 0xcc, data: 'peer-6' },
-    ]);
+    const peerDivergent = await makeSignedChain([
+      { index: 4, data: 'peer-4' },
+      { index: 5, data: 'peer-5' },
+      { index: 6, data: 'peer-6' },
+    ], common[common.length - 1].hash);
     const peer = makeMockPeer(common, peerDivergent);
 
     const resolver = new ForkResolver(ledger);
@@ -387,11 +425,11 @@ describe('ForkResolver.resolve', () => {
     const common = await buildChain(ledger, 5, 'common');
     await buildChain(ledger, 3, 'local-branch');
 
-    const peerDivergent = makeFakeChain([
-      { index: 6, hashFill: 0xaa, data: 'peer-6', confirmations: 5 },
-      { index: 7, hashFill: 0xbb, data: 'peer-7', confirmations: 5 },
-      { index: 8, hashFill: 0xcc, data: 'peer-8', confirmations: 5 },
-    ]);
+    const peerDivergent = await makeSignedChain([
+      { index: 6, data: 'peer-6', confirmations: 5 },
+      { index: 7, data: 'peer-7', confirmations: 5 },
+      { index: 8, data: 'peer-8', confirmations: 5 },
+    ], common[common.length - 1].hash);
     const peer = makeMockPeer(common, peerDivergent);
 
     const resolver = new ForkResolver(ledger);
@@ -403,7 +441,7 @@ describe('ForkResolver.resolve', () => {
   it('handles fork at genesis with peer winning', async () => {
     await buildChain(ledger, 1, 'local-genesis');
 
-    const peerDivergent = [makeFakeEntry(1, 0xff, 'peer-genesis', 3)];
+    const peerDivergent = await makeSignedChain([{ index: 1, data: 'peer-genesis', confirmations: 3 }], new Uint8Array(0));
     const peer = makeMockPeer([], peerDivergent);
 
     const resolver = new ForkResolver(ledger);

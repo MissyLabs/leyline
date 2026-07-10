@@ -21,6 +21,7 @@ import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { type BufferedMessage, type MessageBuffer } from './message-buffer.js';
 import { withTimeout, STREAM_TIMEOUT_MS } from '../utils/stream-timeout.js';
+import { StreamGate } from '../utils/stream-gate.js';
 import { Logger } from '../utils/logger.js';
 
 export const INBOX_PROTOCOL = '/leyline/inbox/1.0.0';
@@ -91,6 +92,8 @@ export class InboxServer {
   private readonly libp2p: Libp2p;
   private readonly buffer: MessageBuffer;
   private readonly log = new Logger('InboxServer');
+  /** Per-peer inbound stream concurrency cap (RL-4). */
+  private readonly streamGate = new StreamGate(32);
 
   constructor(libp2p: Libp2p, buffer: MessageBuffer) {
     this.libp2p = libp2p;
@@ -100,11 +103,20 @@ export class InboxServer {
   async start(): Promise<void> {
     await this.libp2p.handle(INBOX_PROTOCOL, async ({ stream, connection }) => {
       const remotePeerId = connection.remotePeer.toString();
-      await this.handleRequest(stream, remotePeerId);
+      if (!this.streamGate.tryAcquire(remotePeerId)) {
+        try { stream.close(); } catch { /* already closed */ }
+        return;
+      }
+      try {
+        await this.handleRequest(stream, remotePeerId);
+      } finally {
+        this.streamGate.release(remotePeerId);
+      }
     });
   }
 
   async stop(): Promise<void> {
+    this.streamGate.clear();
     await this.libp2p.unhandle(INBOX_PROTOCOL);
   }
 
@@ -220,6 +232,11 @@ export class InboxClient {
   private readonly shutdownSignal?: AbortSignal;
   /** Timestamp of the last message we received (for "since" requests). */
   private lastReceivedAt: number = 0;
+  /** Peers that returned "protocol not supported" — backed off temporarily. */
+  private readonly unsupportedUntil = new Map<string, number>();
+  private static readonly UNSUPPORTED_BACKOFF_MS = 5 * 60_000;
+  /** Max concurrent inbox fetches per poll cycle. */
+  private static readonly FETCH_CONCURRENCY = 5;
 
   constructor(libp2p: Libp2p, shutdownSignal?: AbortSignal) {
     this.libp2p = libp2p;
@@ -260,7 +277,10 @@ export class InboxClient {
     try {
       stream = await this.libp2p.dialProtocol(peerIdObj, INBOX_PROTOCOL, { signal: this.shutdownSignal });
     } catch {
-      return []; // Peer doesn't support inbox protocol
+      // Peer doesn't support inbox protocol (or is unreachable) — back off so we
+      // don't re-dial it every poll cycle (SCH-2).
+      this.unsupportedUntil.set(peerId, Date.now() + InboxClient.UNSUPPORTED_BACKOFF_MS);
+      return [];
     }
 
     const request: InboxRequest = {
@@ -312,19 +332,45 @@ export class InboxClient {
    * Deduplicates by message ID across responses.
    */
   async fetchFromAllPeers(topics: string[], since?: number): Promise<BufferedMessage[]> {
-    const peers = this.libp2p.getPeers();
+    return this.fetchFromPeers(topics, undefined, since);
+  }
+
+  /**
+   * Fetch missed messages from a specific set of peers (typically the connected
+   * seed nodes). When `peerIds` is omitted, falls back to all connected peers.
+   *
+   * Runs with bounded concurrency and skips peers currently backed off for not
+   * supporting the inbox protocol (SCH-2). Deduplicates by message ID.
+   */
+  async fetchFromPeers(topics: string[], peerIds?: string[], since?: number): Promise<BufferedMessage[]> {
+    const now = Date.now();
+    const candidates = (peerIds ?? this.libp2p.getPeers().map((p) => p.toString()))
+      .filter((id) => {
+        const until = this.unsupportedUntil.get(id);
+        if (until !== undefined && until > now) return false;
+        if (until !== undefined) this.unsupportedUntil.delete(id); // backoff expired
+        return true;
+      });
+
     const allMessages: BufferedMessage[] = [];
     const seenIds = new Set<string>();
 
-    for (const peer of peers) {
-      const messages = await this.fetch(peer.toString(), topics, since);
-      for (const msg of messages) {
-        if (!seenIds.has(msg.id)) {
-          seenIds.add(msg.id);
-          allMessages.push(msg);
+    // Bounded-concurrency worker pool over the candidate peers.
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < candidates.length) {
+        const peerId = candidates[cursor++];
+        const messages = await this.fetch(peerId, topics, since);
+        for (const msg of messages) {
+          if (!seenIds.has(msg.id)) {
+            seenIds.add(msg.id);
+            allMessages.push(msg);
+          }
         }
       }
-    }
+    };
+    const poolSize = Math.min(InboxClient.FETCH_CONCURRENCY, Math.max(1, candidates.length));
+    await Promise.all(Array.from({ length: poolSize }, () => worker()));
 
     // Sort chronologically
     allMessages.sort((a, b) => a.receivedAt - b.receivedAt);

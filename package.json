@@ -1,6 +1,6 @@
 {
   "name": "magic-network",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "P2P discovery and messaging network for agentic bots",
   "type": "module",
   "main": "dist/index.js",

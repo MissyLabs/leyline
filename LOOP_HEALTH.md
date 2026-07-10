@@ -143,3 +143,34 @@
 5. Fixed LocalLedger concurrency bug — added appendLock serialization (same pattern as SharedLedger)
 6. Added 68 new tests: fork resolver (22), ledger sync edge cases (21), message buffer edge cases (13), local ledger edge cases (12)
 7. Updated all report files
+
+## Session 8 — 2026-07-10 (Backlog: security, consistency, scheduling, rate-limits, features)
+
+| Metric | Value |
+|--------|-------|
+| Tests at start | 1072 (0 failing) |
+| Tests at end | 1107 (0 failing) |
+| TypeScript | Clean (0 errors) |
+| Build | Clean (`npm run build`) |
+| Version | Bumped 0.2.0 → 0.3.0 (package.json, compat, docs reconciled) |
+| Backlog items | 24/24 addressed (SEC-1..6, DC-1..4, SCH-1..3, RL-1..4, IMP-1..4, FEAT-1..3) |
+| Test files added | 7 (inbound-budget, addr-filter, stream-gate, ledger-proof-pagination, fork-resolver-sec1, health-auth, dm-budget) |
+| Test files updated | 4 (fork-resolver, fork-resolver-adversarial, compat, handshake-edge-cases, magic-node-pipeline — version + SEC-1 signed-chain fixtures) |
+
+### Session Timeline
+1. **SEC-1** — Fork resolver now verifies peer entry hashes + submitter signatures and counts only cryptographically-proven confirmations (`confirmerSignatures`) before any reorg.
+2. **SEC-2 / RL-1 / FEAT-2** — Extracted a shared `InboundBudget` (global cap + per-sender payload budget) and wired it into GossipSub, DM, and inbox paths; added `onDirectMessageQueued()` and a `budget.shed` metric.
+3. **SEC-3** — Ledger ingest gained an optional submitter allow-list + per-submitter ingest rate limit.
+4. **SEC-4** — Health server binds 127.0.0.1 by default + optional bearer-token auth on `/metrics*`.
+5. **SEC-5** — Re-added discovery decode-time field/size caps (M1 had regressed).
+6. **SEC-6** — Receipt-emission rate limiting; per-peer topic-mirror cap on seeds.
+7. **DC-1/DC-2/DC-4** — Seed connectivity tracked by configured PeerId (DNS-agnostic); real `uptime`; degraded keyed on seed reachability.
+8. **SCH-1/2/3** — Seed self-heal monitor now runs on seeds; inbox polling restricted to seeds with bounded concurrency + backoff; ±15% jitter on periodic timers.
+9. **RL-2/RL-3/RL-4** — Inbox ingest capped per cycle; peer chain length read from `totalEntries` (cached) instead of a binary probe storm; per-peer stream concurrency cap (`StreamGate`).
+10. **IMP-1/FEAT-1** — Secondary submitter+time indices, cursor pagination (`queryPage`), and Merkle-style hash-chain inclusion proofs (`getProof`/`verifyProof` + `/leyline/ledger-sync` proof-request).
+11. **IMP-4** — Announce filter now parses IPs and tests real private CIDRs (10/8, 172.16/12, 192.168/16, 100.64/10, 169.254/16, fc00::/7, fe80::/10).
+12. **IMP-2/IMP-3** — Version reconciled to 0.3.0; stray harness artifacts gitignored, scratch `_debug.ts` removed, genuine verify scripts + crypto test staged.
+13. Added 35 regression tests across 7 new files; updated version/SEC-1 fixtures in 5 existing files.
+
+### FEAT-3 — Seed-mesh & network health dashboard
+See `## Session 8 dashboard` note below — an authenticated server-rendered `/dashboard` on the health server showing per-seed reachability, mirrored-topic/buffered counts, ledger height, and version distribution.

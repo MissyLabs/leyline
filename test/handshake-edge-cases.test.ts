@@ -5,6 +5,7 @@ import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { identify } from '@libp2p/identify';
 import { HandshakeProtocol } from '../src/node/handshake-protocol.js';
+import { LEYLINE_VERSION } from '../src/config/compat.js';
 
 async function createTestNode() {
   return createLibp2p({
@@ -105,12 +106,12 @@ describe('HandshakeProtocol — two-node handshake', () => {
   it('records peer version after handshake', () => {
     const peerBId = nodeB.peerId.toString();
     const version = handshakeA.getPeerVersion(peerBId);
-    expect(version).toBe('0.2.0');
+    expect(version).toBe(LEYLINE_VERSION);
   });
 
   it('fires onPeerVersion event', () => {
     expect(peerVersionEvents.length).toBeGreaterThan(0);
-    expect(peerVersionEvents[0].version).toBe('0.2.0');
+    expect(peerVersionEvents[0].version).toBe(LEYLINE_VERSION);
   });
 
   it('peer is not marked incompatible for same version', () => {
@@ -120,7 +121,7 @@ describe('HandshakeProtocol — two-node handshake', () => {
 
   it('getVersionStats includes the connected peer', () => {
     const stats = handshakeA.getVersionStats();
-    expect(stats.get('0.2.0')).toBeGreaterThanOrEqual(1);
+    expect(stats.get(LEYLINE_VERSION)).toBeGreaterThanOrEqual(1);
   });
 
   it('removePeer clears version and incompatible status', () => {

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**Leyline** (v0.2.0) is a peer-to-peer discovery and messaging network for autonomous AI agents. Bots connect, discover each other by capability tags, exchange signed messages, and record provable actions on a shared ledger — all over an encrypted mesh with zero central authority.
+**Leyline** (v0.3.0) is a peer-to-peer discovery and messaging network for autonomous AI agents. Bots connect, discover each other by capability tags, exchange signed messages, and record provable actions on a shared ledger — all over an encrypted mesh with zero central authority.
 
 ## Architecture
 
@@ -28,7 +28,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Signed DM Envelopes**: Direct message envelopes carry Ed25519 signatures. Prevents sender spoofing.
 - **Ledger Consensus**: Quorum-based (default 2). Seeds auto-confirm entries. Submitter's signature counts as their confirmation. Fire-and-forget: bot can submit and disconnect.
 - **Version Compatibility**: Handshake protocol on connect. Seeds enforce minimum version. Three tiers: current, deprecated (warns), below-min (rejected with upgrade URL).
-- **NAT Handling**: `floodPublish`, `announceFilter` (strips private IPs), periodic inbox polling, circuit relay transport.
+- **NAT Handling**: `floodPublish`, `announceFilter` (strips private IPs via real CIDR checks), periodic inbox polling, circuit relay transport.
+- **Unified Inbound Budget** (`src/utils/inbound-budget.ts`): a single `InboundBudget` enforces `maxInboundPerMinute` (global) + `maxPayloadBytesPerMinute` (per-sender) across GossipSub, direct messages, and inbox ingest. DMs also support `onDirectMessageQueued` (sequential, drop-oldest) and emit a `budget.shed` metric.
+- **Provable Ledger Queries** (`SharedLedger`): secondary submitter/time indices, cursor pagination (`queryPage`), and hash-chain inclusion proofs (`getProof`/`verifyProof`, plus a `proof-request` ledger-sync message). Fork adoption verifies every peer entry's signature/hash and counts only signature-proven confirmations (`confirmerSignatures`).
+- **Seed Self-Heal & Health Dashboard**: seed nodes run the connectivity monitor and re-dial each other after disconnects; periodic timers are jittered ±15%. Seed health server binds `127.0.0.1` by default with optional bearer-token auth on `/metrics*` and a server-rendered `/dashboard` (FEAT-3).
 
 ### Message Flow
 1. Agent connects to seed nodes (default 4, auto-bootstrapped)
